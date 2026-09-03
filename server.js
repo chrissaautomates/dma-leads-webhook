@@ -23,7 +23,7 @@
 //                       mounted at /data)
 
 const express = require('express');
-const { upsertLead, db } = require('./db');
+const { upsertLead } = require('./db');
 const adminRouter = require('./admin');
 const { runFullSync } = require('./sync');
 
@@ -154,27 +154,6 @@ app.post('/webhook/google-ads-lead', (req, res) => {
   }
 
   res.status(200).json({});
-});
-
-// TEMPORARY — verifying the Meta Ads CSV mapping against the real
-// production database, not just a local test. Remove once confirmed.
-app.get('/debug/meta-ads-check', (req, res) => {
-  if (!checkSecret(req, res)) return;
-  const rows = db.prepare(
-    "SELECT id, date_received, name, email, phone, interest FROM leads WHERE source = 'Meta Ads' ORDER BY id"
-  ).all();
-  res.json({ count: rows.length, rows });
-});
-
-// TEMPORARY — one-time cleanup: rows already in production from before
-// this fix (and before the email-casing fix) are stuck broken/duplicated —
-// the UPDATE path never touches name/phone/interest, so a later corrected
-// sync can't repair them in place. Wipes Meta Ads rows so the next sync
-// repopulates cleanly from scratch. Remove once used.
-app.post('/debug/meta-ads-reset', (req, res) => {
-  if (!checkSecret(req, res)) return;
-  const info = db.prepare("DELETE FROM leads WHERE source = 'Meta Ads'").run();
-  res.json({ deleted: info.changes });
 });
 
 app.listen(PORT, () => console.log(`Leads webhook listening on ${PORT}`));

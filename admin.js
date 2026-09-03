@@ -197,6 +197,29 @@ function renderClampField(id, text) {
   return `<div class="clamp-text" id="${id}">${esc(text)}</div><button type="button" class="toggle-clamp" data-target="${id}">more</button>`;
 }
 
+function capitalizeFirst(v) {
+  return v ? v.charAt(0).toUpperCase() + v.slice(1) : '';
+}
+
+// CheckCherry's UTM tracking, shown as "Source / Medium" (e.g.
+// "Google / Organic"); campaign/content/term — often the longer, more
+// specific part — get the same clamp-and-toggle overflow handling as
+// Interest/Notes rather than a fixed-width truncation. Leads from
+// integrations that don't carry this data (GHL, Meta Ads, manual entries,
+// ...) render a plain em dash rather than something implying it's missing.
+function renderLeadOrigin(lead) {
+  const sourceMedium = [capitalizeFirst(lead.utm_source), capitalizeFirst(lead.utm_medium)]
+    .filter(Boolean).join(' / ');
+  const extra = [lead.utm_campaign, lead.utm_content, lead.utm_term].filter(Boolean).join(' | ');
+
+  if (!sourceMedium && !extra) return '<span class="subtext">&mdash;</span>';
+
+  const parts = [];
+  if (sourceMedium) parts.push(`<div>${esc(sourceMedium)}</div>`);
+  if (extra) parts.push(renderClampField(`origin-${lead.id}`, extra));
+  return parts.join('');
+}
+
 function renderRow(lead) {
   const options = STATUS_OPTIONS.map(
     (s) => `<option value="${esc(s)}" ${s === lead.status ? 'selected' : ''}>${esc(s)}</option>`
@@ -216,6 +239,7 @@ function renderRow(lead) {
       <form method="POST" action="/admin/update/${lead.id}">
         <td>${esc(lead.date_received)}</td>
         <td><span class="source-pill ${sourceClass(lead.source)}">${esc(lead.source)}</span></td>
+        <td class="origin-cell">${renderLeadOrigin(lead)}</td>
         <td>${leadLines.join('<br>')}</td>
         <td>${contactLines || '<span class="subtext">&mdash;</span>'}</td>
         <td class="wide-cell">${renderClampField(interestId, lead.interest)}</td>
@@ -301,6 +325,7 @@ function renderPage(target, leads) {
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: #f8f9fd; }
   .wide-cell { max-width: 260px; }
+  .origin-cell { max-width: 150px; }
   .subtext { color: var(--text-muted); font-size: 12px; }
 
   input, select, textarea { font-size: 13px; width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text); font-family: inherit; }
@@ -373,13 +398,13 @@ function renderPage(target, leads) {
       <thead>
         <tr>
           <th class="sortable" data-sort="date">Date<span class="sort-indicator" data-sort-indicator="date"></span></th>
-          <th>Source</th><th>Lead</th><th>Contact</th><th>Interest</th>
+          <th>Source</th><th>Lead Origin</th><th>Lead</th><th>Contact</th><th>Interest</th>
           <th class="sortable" data-sort="status">Status<span class="sort-indicator" data-sort-indicator="status"></span></th>
           <th>Owner</th><th>Notes</th><th>Follow-up</th><th></th>
         </tr>
       </thead>
       <tbody>
-        ${rows || '<tr><td colspan="10">No leads yet.</td></tr>'}
+        ${rows || '<tr><td colspan="11">No leads yet.</td></tr>'}
       </tbody>
     </table>
   </div>
@@ -518,7 +543,7 @@ router.post('/add', (req, res) => {
 router.get('/export.csv', (req, res) => {
   const target = req.query.target === 'BARR' ? 'BARR' : 'DMA';
   const leads = listLeads(target);
-  const cols = ['id', 'date_received', 'source', 'name', 'company', 'email', 'phone', 'location', 'interest', 'status', 'owner', 'notes', 'next_follow_up'];
+  const cols = ['id', 'date_received', 'source', 'name', 'company', 'email', 'phone', 'location', 'interest', 'status', 'owner', 'notes', 'next_follow_up', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
   const csvEscape = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
   const lines = [cols.join(',')].concat(
     leads.map((l) => cols.map((c) => csvEscape(l[c])).join(','))

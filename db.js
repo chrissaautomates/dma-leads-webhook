@@ -40,13 +40,32 @@ db.exec(`
 db.exec(`CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_leads_target ON leads(target);`);
 
+// Migration: adds CheckCherry's UTM tracking columns to a table that may
+// already exist and already hold real rows on the production volume — a
+// bare ALTER TABLE ADD COLUMN (checked against PRAGMA table_info first, so
+// it's a no-op on a DB that already has them) doesn't touch or rewrite any
+// existing row data, unlike a CREATE TABLE-based migration would.
+const UTM_COLUMNS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+const existingColumns = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
+UTM_COLUMNS.forEach((col) => {
+  if (!existingColumns.includes(col)) {
+    db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
+  }
+});
+
 const findByEmailAndTarget = db.prepare(
   `SELECT * FROM leads WHERE email = ? AND target = ? AND email != '' ORDER BY id DESC LIMIT 1`
 );
 
 const insertLead = db.prepare(`
-  INSERT INTO leads (target, date_received, source, name, company, email, phone, location, interest, status, owner, notes, next_follow_up)
-  VALUES (@target, @date_received, @source, @name, @company, @email, @phone, @location, @interest, @status, @owner, @notes, @next_follow_up)
+  INSERT INTO leads (
+    target, date_received, source, name, company, email, phone, location, interest,
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term
+  )
+  VALUES (
+    @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term
+  )
 `);
 
 const updateLeadFields = db.prepare(`
@@ -55,6 +74,11 @@ const updateLeadFields = db.prepare(`
     notes = COALESCE(NULLIF(@notes, ''), notes),
     next_follow_up = COALESCE(NULLIF(@next_follow_up, ''), next_follow_up),
     owner = COALESCE(NULLIF(@owner, ''), owner),
+    utm_source = COALESCE(NULLIF(@utm_source, ''), utm_source),
+    utm_medium = COALESCE(NULLIF(@utm_medium, ''), utm_medium),
+    utm_campaign = COALESCE(NULLIF(@utm_campaign, ''), utm_campaign),
+    utm_content = COALESCE(NULLIF(@utm_content, ''), utm_content),
+    utm_term = COALESCE(NULLIF(@utm_term, ''), utm_term),
     updated_at = datetime('now')
   WHERE id = @id
 `);
@@ -90,6 +114,15 @@ function upsertLead(data) {
       notes: data.notes || '',
       next_follow_up: data.nextFollowUp || '',
       owner: data.owner || '',
+      // Only overwritten when the new value is non-empty (see
+      // updateLeadFields' COALESCE/NULLIF above) — this is what lets a
+      // plain re-sync backfill UTM data onto a lead that predates this
+      // column existing, without needing a separate one-off script.
+      utm_source: data.utmSource || '',
+      utm_medium: data.utmMedium || '',
+      utm_campaign: data.utmCampaign || '',
+      utm_content: data.utmContent || '',
+      utm_term: data.utmTerm || '',
     });
     return { action: 'updated', id: existing.id, target };
   }
@@ -116,6 +149,11 @@ function upsertLead(data) {
     owner: data.owner || '',
     notes: data.notes || '',
     next_follow_up: data.nextFollowUp || 'Yes',
+    utm_source: data.utmSource || '',
+    utm_medium: data.utmMedium || '',
+    utm_campaign: data.utmCampaign || '',
+    utm_content: data.utmContent || '',
+    utm_term: data.utmTerm || '',
   });
   return { action: 'inserted', id: info.lastInsertRowid, target };
 }
@@ -158,6 +196,15 @@ function addLeadFromAdmin(fields) {
     owner: fields.owner || '',
     notes: fields.notes || '',
     next_follow_up: fields.next_follow_up || 'Yes',
+    // Manual entries don't have UTM data of their own, but the column still
+    // needs a value for the prepared statement — pass through whatever was
+    // given (matching this function's existing snake_case field naming),
+    // blank otherwise.
+    utm_source: fields.utm_source || '',
+    utm_medium: fields.utm_medium || '',
+    utm_campaign: fields.utm_campaign || '',
+    utm_content: fields.utm_content || '',
+    utm_term: fields.utm_term || '',
   });
   return info.lastInsertRowid;
 }

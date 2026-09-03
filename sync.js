@@ -78,6 +78,17 @@ function mapCheckCherryLead(record) {
     owner: attrs.owner || attrs.assigned_to || '',
     notes: attrs.notes || attrs.message || '',
     nextFollowUp: 'Yes',
+    // Confirmed against real leads on 2026-09-03 (pulled the raw API
+    // response directly, not assumed): CheckCherry's attributes object
+    // always carries these five keys, null when unset. utm_term came back
+    // null on every real lead seen so far, but the key is genuinely part
+    // of the schema, so it's captured the same as the others rather than
+    // left out on the assumption it doesn't exist.
+    utmSource: attrs.utm_source || '',
+    utmMedium: attrs.utm_medium || '',
+    utmCampaign: attrs.utm_campaign || '',
+    utmContent: attrs.utm_content || '',
+    utmTerm: attrs.utm_term || '',
   };
 }
 

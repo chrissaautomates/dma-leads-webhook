@@ -2,7 +2,7 @@
 // GHL API, and Google Sheets published-to-web CSVs (Meta Ads / Google Ads).
 // Each source is independent and best-effort.
 
-const { upsertLead } = require('./db');
+const { upsertLead, findLead, computeTarget } = require('./db');
 
 const status = {};
 
@@ -98,6 +98,100 @@ async function syncCheckCherry() {
   }
 }
 
+// GHL message timestamps aren't guaranteed to come back in a known order —
+// sort defensively by whichever timestamp field is present. Messages with
+// no recognizable timestamp keep their original relative order (stable
+// sort), which is the safest fallback if the API already returned them
+// oldest-to-newest.
+function sortMessagesOldestFirst(messages) {
+  return messages
+    .map((m, i) => ({
+      m,
+      i,
+      t: Date.parse(m.dateAdded || m.dateCreated || m.timestamp || m.createdAt || '') || 0,
+    }))
+    .sort((a, b) => a.t - b.t || a.i - b.i)
+    .map((x) => x.m);
+}
+
+const CHAT_TRANSCRIPT_MAX_MESSAGES = 40;
+const CHAT_TRANSCRIPT_MAX_CHARS = 6000;
+
+function buildChatTranscript(messages) {
+  const ordered = sortMessagesOldestFirst(messages).slice(-CHAT_TRANSCRIPT_MAX_MESSAGES);
+  const lines = ordered
+    .map((m) => {
+      const direction = m.direction === 'outbound' ? 'outbound' : 'inbound';
+      const body = (m.body || m.text || '').toString().trim();
+      return body ? `${direction}: ${body}` : '';
+    })
+    .filter(Boolean);
+  let transcript = lines.join('\n');
+  if (transcript.length > CHAT_TRANSCRIPT_MAX_CHARS) {
+    transcript = transcript.slice(-CHAT_TRANSCRIPT_MAX_CHARS); // keep the most recent context
+  }
+  return transcript;
+}
+
+async function fetchGhlChatMessages(apiKey, locationId, contactId) {
+  const searchUrl = `https://services.leadconnectorhq.com/conversations/search?locationId=${encodeURIComponent(locationId)}&contactId=${encodeURIComponent(contactId)}`;
+  const searchRes = await fetchWithTimeout(searchUrl, {
+    headers: { Authorization: `Bearer ${apiKey}`, Version: 'v3' },
+  });
+  if (!searchRes.ok) throw new Error(`GHL conversations/search HTTP ${searchRes.status}: ${(await searchRes.text()).slice(0, 300)}`);
+  const searchBody = await searchRes.json();
+  const conversations = searchBody.conversations || searchBody.data || [];
+  const conversationId = conversations[0] && conversations[0].id;
+  if (!conversationId) throw new Error('no conversation found for contact');
+
+  const messagesUrl = `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`;
+  const messagesRes = await fetchWithTimeout(messagesUrl, {
+    headers: { Authorization: `Bearer ${apiKey}`, Version: '2021-04-15' },
+  });
+  if (!messagesRes.ok) throw new Error(`GHL messages HTTP ${messagesRes.status}: ${(await messagesRes.text()).slice(0, 300)}`);
+  const messagesBody = await messagesRes.json();
+  const raw = messagesBody.messages;
+  return Array.isArray(raw) ? raw : (raw && Array.isArray(raw.messages) ? raw.messages : []);
+}
+
+async function summarizeChatTranscript(transcript) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+  if (!transcript) throw new Error('empty transcript');
+
+  const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: `Here is a chat conversation between a lead ("inbound") and us ("outbound"):\n\n${transcript}\n\nIn 2-3 sentences, summarize what the lead is interested in and any next steps discussed. Respond with only the summary as plain text — no heading, no markdown, no preamble.`,
+      }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  const body = await res.json();
+  const text = (body.content || []).map((block) => block.text || '').join(' ').trim();
+  if (!text) throw new Error('empty summary from Anthropic');
+  return text;
+}
+
+// Fetches a chat-lead's conversation and summarizes it into notes. Callers
+// are expected to wrap this in its own try/catch — a failure here (missing
+// conversation, GHL/Anthropic error, timeout) should never fail the rest of
+// the GHL sync.
+async function summarizeGhlChatLead(apiKey, locationId, contactId) {
+  const messages = await fetchGhlChatMessages(apiKey, locationId, contactId);
+  const transcript = buildChatTranscript(messages);
+  return summarizeChatTranscript(transcript);
+}
+
 async function syncGHL() {
   const apiKey = process.env.GHL_API_KEY;
   const locationId = process.env.GHL_LOCATION_ID;
@@ -117,17 +211,40 @@ async function syncGHL() {
         const name = c.contactName || [c.firstName, c.lastName].filter(Boolean).join(' ');
         const email = c.email || '';
         if (!email && !name) continue; // malformed/unmapped record — never write a junk row
+
+        const tags = (c.tags || []).map((t) => String(t).toLowerCase());
+        const isChatLead = tags.includes('chat-lead');
+        const source = isChatLead ? 'Chat Lead' : 'GHL';
+        const interest = (c.tags || []).join(', ');
+
+        let notes = '';
+        if (isChatLead) {
+          const target = computeTarget({ source, interest });
+          const existing = findLead(email, target);
+          if (existing && existing.notes) {
+            // Already captured this conversation — don't re-fetch/re-summarize.
+            notes = existing.notes;
+          } else {
+            try {
+              notes = await summarizeGhlChatLead(apiKey, locationId, c.id);
+            } catch (err) {
+              console.error(`Chat-lead summarize failed for GHL contact ${c.id}:`, err.message);
+              notes = '';
+            }
+          }
+        }
+
         upsertLead({
-          source: 'GHL',
+          source,
           name,
           company: c.companyName || '',
           email,
           phone: c.phone || '',
           location: c.city || '',
-          interest: (c.tags || []).join(', '),
+          interest,
           status: 'New',
           owner: '',
-          notes: '',
+          notes,
           nextFollowUp: 'Yes',
         });
         total++;

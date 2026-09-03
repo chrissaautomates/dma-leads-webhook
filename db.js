@@ -59,13 +59,29 @@ const updateLeadFields = db.prepare(`
   WHERE id = @id
 `);
 
-function upsertLead(data) {
-  const target = /humanoid|robot rental|buyandrentrobots/i.test(
+// Same DMA vs. BuyAndRentRobots routing upsertLead() has always used,
+// exposed so callers can compute the target a lead would land in before
+// they actually upsert it (e.g. to look up its current row first).
+function computeTarget(data) {
+  return /humanoid|robot rental|buyandrentrobots/i.test(
     (data.source || '') + ' ' + (data.interest || '')
   ) ? 'BARR' : 'DMA';
+}
 
+// Returns the existing lead row for a given email + target, or undefined if
+// there's no match — the same lookup upsertLead() does internally, exposed
+// so callers can check a lead's current state (e.g. its notes) before
+// deciding whether to do expensive work ahead of an upsert.
+function findLead(email, target) {
+  const normalizedEmail = (email || '').toString().trim().toLowerCase();
+  if (!normalizedEmail) return undefined;
+  return findByEmailAndTarget.get(normalizedEmail, target);
+}
+
+function upsertLead(data) {
+  const target = computeTarget(data);
   const email = (data.email || '').toString().trim().toLowerCase();
-  const existing = email ? findByEmailAndTarget.get(email, target) : undefined;
+  const existing = findLead(email, target);
 
   if (existing) {
     updateLeadFields.run({
@@ -141,6 +157,8 @@ function addLeadFromAdmin(fields) {
 module.exports = {
   db,
   upsertLead,
+  findLead,
+  computeTarget,
   listLeads,
   getLead,
   updateLeadFromAdmin,

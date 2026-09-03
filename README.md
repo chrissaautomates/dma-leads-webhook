@@ -33,17 +33,33 @@ CheckCherry, instead of anyone editing it by hand.
 
 ## One-time setup
 
-1. **Create a Google service account** (Google Cloud Console → IAM & Admin →
-   Service Accounts → Create → skip roles → Keys → Add key → JSON). Download
-   the JSON key file.
-2. **Enable the Google Sheets API** on that same GCP project.
-3. **Share both sheets** (Master Leads Tracker and the BuyAndRentRobots
-   companion sheet) with the service account's `client_email` (found inside
-   the JSON key) as **Editor**.
+This uses OAuth (your own Google account's login), not a service account —
+no JSON key file, no extra sharing step. The sheets just need to already be
+in the Google account you authorize with below (photoworkshops@gmail.com).
+
+1. **Create an OAuth 2.0 Client ID** in Google Cloud Console → APIs &
+   Services → Credentials → Create Credentials → OAuth client ID.
+   - Application type: **Web application**
+   - Authorized redirect URIs: add `https://developers.google.com/oauthplayground`
+   - Save it, then copy the **Client ID** and **Client Secret** it shows you.
+2. **Enable the Google Sheets API** on that same GCP project (APIs &
+   Services → Library → search "Google Sheets API" → Enable), if it isn't
+   already.
+3. **Get a refresh token** using Google's OAuth Playground
+   (https://developers.google.com/oauthplayground):
+   - Click the gear icon (top right) → check "Use your own OAuth
+     credentials" → paste in the Client ID and Client Secret from step 1.
+   - In Step 1 on the left, find and select the scope
+     `https://www.googleapis.com/auth/spreadsheets` → Authorize APIs.
+   - Sign in as **photoworkshops@gmail.com** (the account that owns/edits
+     the sheets) and accept.
+   - In Step 2, click **Exchange authorization code for tokens** → copy the
+     **Refresh token** it gives you.
 4. **Deploy this repo to Railway** (or wherever) and set these environment
    variables:
-   - `GOOGLE_SERVICE_ACCOUNT_JSON` — the entire JSON key file content, as one
-     line (e.g. `cat key.json | jq -c .` to collapse it)
+   - `GOOGLE_CLIENT_ID` — from step 1
+   - `GOOGLE_CLIENT_SECRET` — from step 1
+   - `GOOGLE_REFRESH_TOKEN` — from step 3
    - `MASTER_SHEET_ID` — the Drive file ID from the Master Tracker's URL
    - `MASTER_TAB_NAME` — `All DMA Leads`
    - `BARR_SHEET_ID` — the Drive file ID of the BuyAndRentRobots companion sheet
@@ -60,11 +76,16 @@ CheckCherry, instead of anyone editing it by hand.
    will likely differ — once you see a sample payload, this server's mapping
    in `server.js` can be adjusted to match.
 
+Note: a refresh token obtained this way keeps working indefinitely as long
+as it's used at least once every 6 months and access isn't revoked from the
+Google account's "Third-party apps & services" settings — no need to redo
+this setup periodically.
+
 ## Local test
 
 ```
 npm install
-GOOGLE_SERVICE_ACCOUNT_JSON='...' MASTER_SHEET_ID=... MASTER_TAB_NAME='All DMA Leads' BARR_SHEET_ID=... WEBHOOK_SECRET=test npm start
+GOOGLE_CLIENT_ID='...' GOOGLE_CLIENT_SECRET='...' GOOGLE_REFRESH_TOKEN='...' MASTER_SHEET_ID=... MASTER_TAB_NAME='All DMA Leads' BARR_SHEET_ID=... WEBHOOK_SECRET=test npm start
 curl -X POST localhost:3000/webhook/lead \
   -H 'content-type: application/json' -H 'x-webhook-secret: test' \
   -d '{"source":"GHL","email":"klein@example.com","name":"Klein","interest":"humanoid robot Chicago","status":"New"}'

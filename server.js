@@ -6,15 +6,20 @@
 // appending a new row when there's no match.
 //
 // Required environment variables (set these in Railway):
-//   GOOGLE_SERVICE_ACCOUNT_JSON  - full JSON key for a Google service account
-//                                  (Sheets API enabled), as a single-line string
-//   MASTER_SHEET_ID              - Drive file ID of "DMA & BuyAndRentRobots — Master Leads Tracker"
-//   MASTER_TAB_NAME               - tab name inside that file holding DMA leads (e.g. "All DMA Leads")
-//   BARR_SHEET_ID                - Drive file ID of the "BuyAndRentRobots — Leads" companion sheet
-//   WEBHOOK_SECRET                - shared secret; incoming requests must send header x-webhook-secret
+//   GOOGLE_CLIENT_ID      - OAuth 2.0 Client ID (Google Cloud Console -> Credentials)
+//   GOOGLE_CLIENT_SECRET  - OAuth 2.0 Client Secret for that same client
+//   GOOGLE_REFRESH_TOKEN  - refresh token obtained once via Google's OAuth
+//                           Playground, authorizing the
+//                           https://www.googleapis.com/auth/spreadsheets scope
+//                           as the Google account that owns/edits the sheets
+//   MASTER_SHEET_ID       - Drive file ID of "DMA & BuyAndRentRobots — Master Leads Tracker"
+//   MASTER_TAB_NAME       - tab name inside that file holding DMA leads (e.g. "All DMA Leads")
+//   BARR_SHEET_ID         - Drive file ID of the "BuyAndRentRobots — Leads" companion sheet
+//   WEBHOOK_SECRET        - shared secret; incoming requests must send header x-webhook-secret
 //
-// Both sheets must be shared (Editor) with the service account's
-// client_email — grab that from the JSON key.
+// Because auth is just the Google account's own OAuth token, both sheets
+// only need to already be accessible to (owned by / shared with) that same
+// Google account — no service account or extra sharing step required.
 
 const express = require('express');
 const { google } = require('googleapis');
@@ -25,18 +30,16 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 
 function getAuth() {
-  const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  return new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    ['https://www.googleapis.com/auth/spreadsheets']
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
   );
+  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+  return oauth2Client;
 }
 
 async function getSheetsClient() {
   const auth = getAuth();
-  await auth.authorize();
   return google.sheets({ version: 'v4', auth });
 }
 

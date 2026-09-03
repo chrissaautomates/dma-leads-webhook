@@ -226,7 +226,10 @@ function renderRow(lead) {
         <td class="wide-cell">
           <div class="clamp-text notes-preview" id="${notesPreviewId}">${esc(lead.notes)}</div>
           <textarea name="notes" class="notes-edit" id="${notesEditId}" hidden>${esc(lead.notes)}</textarea>
-          <button type="button" class="toggle-clamp notes-toggle" data-preview="${notesPreviewId}" data-edit="${notesEditId}">edit</button>
+          <div class="notes-controls">
+            <button type="button" class="toggle-clamp" data-target="${notesPreviewId}">more</button>
+            <button type="button" class="notes-edit-toggle" data-preview="${notesPreviewId}" data-edit="${notesEditId}">Edit</button>
+          </div>
         </td>
         <td><input type="text" name="next_follow_up" value="${esc(lead.next_follow_up)}"></td>
         <td><button type="submit" class="save-btn">Save</button></td>
@@ -328,6 +331,9 @@ function renderPage(target, leads) {
   .clamp-text.expanded { display: block; -webkit-line-clamp: unset; overflow: visible; }
   .toggle-clamp { display: none; background: none; border: none; padding: 2px 0 0; color: var(--accent); font-size: 11.5px; font-weight: 600; }
   .notes-edit { margin-top: 4px; }
+  .notes-controls { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+  .notes-controls .toggle-clamp { padding: 0; }
+  .notes-edit-toggle { background: none; border: none; padding: 0; color: var(--accent); font-size: 11.5px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -381,42 +387,55 @@ function renderPage(target, leads) {
 
 <script>
 (function () {
-  // --- clamp "more"/"edit" toggles: only shown when text actually overflows ---
-  document.querySelectorAll('.clamp-text').forEach(function (el) {
-    var isNotes = el.classList.contains('notes-preview');
-    var btn = isNotes
-      ? document.querySelector('.notes-toggle[data-preview="' + el.id + '"]')
-      : document.querySelector('.toggle-clamp[data-target="' + el.id + '"]');
-    if (!btn) return;
-    if (el.scrollHeight > el.clientHeight + 1) {
+  // --- clamp "more"/"less" toggles (Interest, and Notes' read-only preview):
+  // only shown when the text actually overflows its 2-line clamp. Shared by
+  // both columns — Notes' preview <div> is marked up exactly like Interest's,
+  // so one loop handles both.
+  document.querySelectorAll('.toggle-clamp').forEach(function (btn) {
+    var target = document.getElementById(btn.dataset.target);
+    if (!target) return;
+    if (target.scrollHeight > target.clientHeight + 1) {
       btn.style.display = 'inline-block';
     }
-  });
-
-  document.querySelectorAll('.toggle-clamp:not(.notes-toggle)').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var target = document.getElementById(btn.dataset.target);
       var expanded = target.classList.toggle('expanded');
       btn.textContent = expanded ? 'less' : 'more';
     });
   });
 
-  document.querySelectorAll('.notes-toggle').forEach(function (btn) {
+  // --- Notes "Edit"/"Done": swaps the read-only preview for a textarea.
+  // Separate control from the more/less toggle above and independent of it —
+  // expanding via "more" never enters edit mode. Entering/leaving edit mode
+  // hides the preview + its more/less button via inline style.display, but
+  // saves each one's existing style.display first and restores exactly that
+  // (not a hardcoded value) on "Done" — the preview's clamp/expanded class
+  // rule sets its own explicit display, and the hidden attribute does not
+  // reliably win over that (verified in-browser), so a plain hidden=true/
+  // false toggle silently left the preview visible during edit.
+  document.querySelectorAll('.notes-edit-toggle').forEach(function (btn) {
     var preview = document.getElementById(btn.dataset.preview);
     var editEl = document.getElementById(btn.dataset.edit);
-    btn.style.display = 'inline-block'; // notes are always editable, regardless of overflow
+    var moreBtn = document.querySelector('.toggle-clamp[data-target="' + preview.id + '"]');
     btn.addEventListener('click', function () {
       var editing = !editEl.hidden;
       if (editing) {
+        // "Done"
         preview.textContent = editEl.value;
         editEl.hidden = true;
-        preview.style.display = '-webkit-box';
-        btn.textContent = 'edit';
+        preview.style.display = preview.dataset.savedDisplay || '';
+        if (moreBtn) moreBtn.style.display = moreBtn.dataset.savedDisplay || '';
+        btn.textContent = 'Edit';
       } else {
-        editEl.hidden = false;
+        // "Edit"
+        preview.dataset.savedDisplay = preview.style.display;
         preview.style.display = 'none';
+        if (moreBtn) {
+          moreBtn.dataset.savedDisplay = moreBtn.style.display;
+          moreBtn.style.display = 'none';
+        }
+        editEl.hidden = false;
         editEl.focus();
-        btn.textContent = 'done';
+        btn.textContent = 'Done';
       }
     });
   });

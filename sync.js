@@ -16,14 +16,26 @@ function getSyncStatus() {
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
-// Shared by every sync function below so one slow/unresponsive source can't
-// hang the whole runFullSync() Promise.allSettled forever with no error and
-// no log line.
+// Shared by every outbound call in this file so one slow/unresponsive
+// source can't hang the whole runFullSync() Promise.allSettled forever with
+// no error and no log line.
+//
+// IMPORTANT: this reads the full response body here too, inside the same
+// timeout window. fetch() resolving only means response headers arrived —
+// a stalled/slow-streaming body would otherwise hang forever *after* that,
+// because the abort timer was already cleared as soon as fetch() itself
+// resolved, leaving res.json()/res.text() completely unprotected. (Verified
+// this directly: a server that sends headers immediately but never
+// completes the body left res.json() still pending 5+ seconds past a
+// 1000ms timeout.) Returns a Response-like object ({ok, status, text(),
+// json()}) so existing call sites don't need to change.
 async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text: () => text, json: () => JSON.parse(text) };
   } catch (err) {
     if (err.name === 'AbortError') {
       throw new Error(`Request to ${url} timed out after ${timeoutMs}ms`);
@@ -70,6 +82,7 @@ function mapCheckCherryLead(record) {
 }
 
 async function syncCheckCherry() {
+  console.log('syncCheckCherry: starting');
   const apiKey = process.env.CHECKCHERRY_API_KEY;
   if (!apiKey) return recordStatus('CheckCherry', { ok: null, error: 'not configured', count: 0 });
   try {
@@ -93,6 +106,7 @@ async function syncCheckCherry() {
       if (page > 50) break;
     }
     recordStatus('CheckCherry', { ok: true, count: total });
+    console.log(`syncCheckCherry: done (${total} leads)`);
   } catch (err) {
     recordStatus('CheckCherry', { ok: false, error: err.message, count: 0 });
   }
@@ -135,30 +149,35 @@ function buildChatTranscript(messages) {
 
 async function fetchGhlChatMessages(apiKey, locationId, contactId) {
   const searchUrl = `https://services.leadconnectorhq.com/conversations/search?locationId=${encodeURIComponent(locationId)}&contactId=${encodeURIComponent(contactId)}`;
+  console.log(`GHL chat-lead ${contactId}: calling conversations/search`);
   const searchRes = await fetchWithTimeout(searchUrl, {
     headers: { Authorization: `Bearer ${apiKey}`, Version: 'v3' },
   });
-  if (!searchRes.ok) throw new Error(`GHL conversations/search HTTP ${searchRes.status}: ${(await searchRes.text()).slice(0, 300)}`);
+  console.log(`GHL chat-lead ${contactId}: conversations/search returned ${searchRes.status}`);
+  if (!searchRes.ok) throw new Error(`GHL conversations/search HTTP ${searchRes.status}: ${searchRes.text().slice(0, 300)}`);
   const searchBody = await searchRes.json();
   const conversations = searchBody.conversations || searchBody.data || [];
   const conversationId = conversations[0] && conversations[0].id;
   if (!conversationId) throw new Error('no conversation found for contact');
 
   const messagesUrl = `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`;
+  console.log(`GHL chat-lead ${contactId}: calling conversations/${conversationId}/messages`);
   const messagesRes = await fetchWithTimeout(messagesUrl, {
     headers: { Authorization: `Bearer ${apiKey}`, Version: '2021-04-15' },
   });
-  if (!messagesRes.ok) throw new Error(`GHL messages HTTP ${messagesRes.status}: ${(await messagesRes.text()).slice(0, 300)}`);
+  console.log(`GHL chat-lead ${contactId}: messages returned ${messagesRes.status}`);
+  if (!messagesRes.ok) throw new Error(`GHL messages HTTP ${messagesRes.status}: ${messagesRes.text().slice(0, 300)}`);
   const messagesBody = await messagesRes.json();
   const raw = messagesBody.messages;
   return Array.isArray(raw) ? raw : (raw && Array.isArray(raw.messages) ? raw.messages : []);
 }
 
-async function summarizeChatTranscript(transcript) {
+async function summarizeChatTranscript(transcript, contactId) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
   if (!transcript) throw new Error('empty transcript');
 
+  console.log(`GHL chat-lead ${contactId}: calling Anthropic`);
   const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -175,7 +194,8 @@ async function summarizeChatTranscript(transcript) {
       }],
     }),
   });
-  if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  console.log(`GHL chat-lead ${contactId}: Anthropic returned ${res.status}`);
+  if (!res.ok) throw new Error(`Anthropic HTTP ${res.status}: ${res.text().slice(0, 300)}`);
   const body = await res.json();
   const text = (body.content || []).map((block) => block.text || '').join(' ').trim();
   if (!text) throw new Error('empty summary from Anthropic');
@@ -189,10 +209,11 @@ async function summarizeChatTranscript(transcript) {
 async function summarizeGhlChatLead(apiKey, locationId, contactId) {
   const messages = await fetchGhlChatMessages(apiKey, locationId, contactId);
   const transcript = buildChatTranscript(messages);
-  return summarizeChatTranscript(transcript);
+  return summarizeChatTranscript(transcript, contactId);
 }
 
 async function syncGHL() {
+  console.log('syncGHL: starting');
   const apiKey = process.env.GHL_API_KEY;
   const locationId = process.env.GHL_LOCATION_ID;
   if (!apiKey || !locationId) return recordStatus('GHL', { ok: null, error: 'not configured', count: 0 });
@@ -254,6 +275,7 @@ async function syncGHL() {
       url = `https://services.leadconnectorhq.com/contacts/?locationId=${encodeURIComponent(locationId)}&limit=100&startAfterId=${nextId}`;
     }
     recordStatus('GHL', { ok: true, count: total });
+    console.log(`syncGHL: done (${total} contacts)`);
   } catch (err) {
     recordStatus('GHL', { ok: false, error: err.message, count: 0 });
   }
@@ -295,6 +317,7 @@ function pick(obj, aliases) {
 }
 
 async function syncCsvSheet(envVar, sourceName) {
+  console.log(`syncCsvSheet(${sourceName}): starting`);
   const url = process.env[envVar];
   if (!url) return recordStatus(sourceName, { ok: null, error: 'not configured', count: 0 });
   try {
@@ -327,12 +350,14 @@ async function syncCsvSheet(envVar, sourceName) {
       total++;
     }
     recordStatus(sourceName, { ok: true, count: total });
+    console.log(`syncCsvSheet(${sourceName}): done (${total} rows)`);
   } catch (err) {
     recordStatus(sourceName, { ok: false, error: err.message, count: 0 });
   }
 }
 
 async function runFullSync() {
+  console.log('runFullSync: starting');
   await Promise.allSettled([
     syncCheckCherry(),
     syncGHL(),

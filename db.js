@@ -103,7 +103,12 @@ function upsertLead(data) {
     source: data.source || '',
     name: data.name || '',
     company: data.company || '',
-    email: data.email || '',
+    // Stored lowercased/trimmed to match how findLead() queries — email is
+    // compared with a plain SQL "=" (no COLLATE NOCASE), so a mixed-case
+    // email that isn't also normalized at write time silently fails to
+    // match itself on a later sync, producing a duplicate row instead of
+    // an update.
+    email,
     phone: data.phone || '',
     location: data.location || '',
     interest: data.interest || '',
@@ -145,7 +150,7 @@ function addLeadFromAdmin(fields) {
     source: fields.source || 'Manual entry',
     name: fields.name || '',
     company: fields.company || '',
-    email: fields.email || '',
+    email: (fields.email || '').toString().trim().toLowerCase(),
     phone: fields.phone || '',
     location: fields.location || '',
     interest: fields.interest || '',

@@ -166,6 +166,17 @@ app.get('/debug/meta-ads-check', (req, res) => {
   res.json({ count: rows.length, rows });
 });
 
+// TEMPORARY — one-time cleanup: rows already in production from before
+// this fix (and before the email-casing fix) are stuck broken/duplicated —
+// the UPDATE path never touches name/phone/interest, so a later corrected
+// sync can't repair them in place. Wipes Meta Ads rows so the next sync
+// repopulates cleanly from scratch. Remove once used.
+app.post('/debug/meta-ads-reset', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const info = db.prepare("DELETE FROM leads WHERE source = 'Meta Ads'").run();
+  res.json({ deleted: info.changes });
+});
+
 app.listen(PORT, () => console.log(`Leads webhook listening on ${PORT}`));
 
 // runFullSync() was previously never actually wired up to run anywhere in

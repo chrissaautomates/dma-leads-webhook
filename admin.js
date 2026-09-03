@@ -106,13 +106,32 @@ const STATUS_CLASSES = {
 };
 const SUMMARY_STATUS_ORDER = ['New', 'Contacted', 'Proposal Sent', 'Negotiating', 'Won', 'Lost'];
 
-// Same reasoning for sources: known ones get their own tile; anything else
-// (custom manual-entry sources, a future integration) still counts, under
-// "Other", instead of vanishing from the total.
-const SUMMARY_SOURCE_ORDER = ['CheckCherry', 'GHL', 'Chat Lead', 'Meta Ads', 'Google Ads'];
+// Drives both the summary bar's per-source tiles and the source pill's
+// color in the table — same principle as STATUS_CLASSES above, and the
+// same object is the single source of truth for both the color and the
+// known-sources list, so they can't drift apart.
+const SOURCE_CLASSES = {
+  CheckCherry: 'source-checkcherry',
+  GHL: 'source-ghl',
+  'Chat Lead': 'source-chatlead',
+  'Meta Ads': 'source-metaads',
+  'Google Ads': 'source-googleads',
+  'BuyAndRentRobots Website': 'source-barr',
+};
+const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES);
 
 function statusClass(status) {
   return STATUS_CLASSES[status] || 'status-other';
+}
+
+// Manual entries (e.g. "Manual entry", "Manual entry - inbound inquiry")
+// get their own color; anything else unrecognized falls back to a neutral
+// color rather than being silently uncolored — same "Other" principle
+// already used for status and for the summary bar's counts.
+function sourceClass(source) {
+  if (SOURCE_CLASSES[source]) return SOURCE_CLASSES[source];
+  if (/^manual/i.test(source || '')) return 'source-manual';
+  return 'source-other';
 }
 
 function computeSummary(leads) {
@@ -156,10 +175,10 @@ function renderSummaryBar(leads) {
   const otherStatusTile = otherStatusCount > 0 ? statTile(otherStatusCount, 'Other', 'status-other') : '';
 
   const sourceTiles = SUMMARY_SOURCE_ORDER
-    .map((s) => statTile(sourceCounts[s] || 0, s))
+    .map((s) => statTile(sourceCounts[s] || 0, s, sourceClass(s)))
     .join('');
-  const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual') : '';
-  const otherSourceTile = otherSourceCount > 0 ? statTile(otherSourceCount, 'Other') : '';
+  const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual', 'source-manual') : '';
+  const otherSourceTile = otherSourceCount > 0 ? statTile(otherSourceCount, 'Other', 'source-other') : '';
 
   return `
     <div class="summary-bar">
@@ -196,7 +215,7 @@ function renderRow(lead) {
     <tr data-search="${searchKey}" data-date="${esc(lead.date_received)}" data-status="${esc(lead.status)}">
       <form method="POST" action="/admin/update/${lead.id}">
         <td>${esc(lead.date_received)}</td>
-        <td><span class="source-pill">${esc(lead.source)}</span></td>
+        <td><span class="source-pill ${sourceClass(lead.source)}">${esc(lead.source)}</span></td>
         <td>${leadLines.join('<br>')}</td>
         <td>${contactLines || '<span class="subtext">&mdash;</span>'}</td>
         <td class="wide-cell">${renderClampField(interestId, lead.interest)}</td>
@@ -287,7 +306,15 @@ function renderPage(target, leads) {
   .save-btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 7px 12px; font-weight: 600; font-size: 12.5px; }
   .save-btn:hover { background: var(--accent-dark); }
 
-  .source-pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: #eef0fd; color: #3730a3; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .source-pill { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .source-checkcherry { background-color: #e0f2fe; color: #075985; border-color: #bae6fd; }
+  .source-ghl { background-color: #ccfbf1; color: #115e59; border-color: #99f6e4; }
+  .source-chatlead { background-color: #fae8ff; color: #86198f; border-color: #f5d0fe; }
+  .source-metaads { background-color: #fce7f3; color: #9d174d; border-color: #fbcfe8; }
+  .source-googleads { background-color: #ffedd5; color: #9a3412; border-color: #fed7aa; }
+  .source-barr { background-color: #cffafe; color: #155e75; border-color: #a5f3fc; }
+  .source-manual { background-color: #f5f5f4; color: #57534e; border-color: #e7e5e4; }
+  .source-other { background-color: #e5e7eb; color: #4b5563; border-color: #d1d5db; }
 
   .status-select { appearance: none; -webkit-appearance: none; border-radius: 999px; font-weight: 700; font-size: 12px; text-align: left; padding: 6px 26px 6px 10px; border-width: 1px; border-style: solid; background-repeat: no-repeat; background-position: right 8px center; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23667085'/%3E%3C/svg%3E"); min-width: 128px; width: auto; }
   .status-new { background-color: #dbeafe; color: #1e40af; border-color: #bfdbfe; }

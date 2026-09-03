@@ -23,9 +23,9 @@
 //                       mounted at /data)
 
 const express = require('express');
-const { upsertLead, listLeads } = require('./db');
+const { upsertLead } = require('./db');
 const adminRouter = require('./admin');
-const { runFullSync, getSyncStatus } = require('./sync');
+const { runFullSync } = require('./sync');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -61,17 +61,6 @@ app.post('/webhook/lead', (req, res) => {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
   }
-});
-
-// TEMPORARY — for confirming this fix against the real production DB on the
-// real Railway volume, not a local/scratch copy. Remove once confirmed.
-app.get('/debug/sync-check', (req, res) => {
-  if (!checkSecret(req, res)) return;
-  res.json({
-    now: new Date().toISOString(),
-    syncStatus: getSyncStatus(),
-    counts: { DMA: listLeads('DMA').length, BARR: listLeads('BARR').length },
-  });
 });
 
 app.listen(PORT, () => console.log(`Leads webhook listening on ${PORT}`));

@@ -1,7 +1,7 @@
 {
   "name": "dma-leads-webhook",
-  "version": "1.0.0",
-  "description": "Webhook receiver that keeps the DMA & BuyAndRentRobots Master Leads Tracker (Google Sheets) in sync with GHL and CheckCherry",
+  "version": "2.0.0",
+  "description": "Webhook receiver + admin page for DMA Events and BuyAndRentRobots leads, backed by a local SQLite database on Railway",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "better-sqlite3": "^11.3.0",
     "express": "^4.19.2"
   }
 }

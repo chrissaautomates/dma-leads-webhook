@@ -1,8 +1,17 @@
-# DMA Leads Webhook
+# DMA Leads Webhook + Admin
 
-Keeps the "DMA & BuyAndRentRobots — Master Leads Tracker" Google Sheet (and its
-BuyAndRentRobots companion sheet) updated automatically from GHL and
-CheckCherry, instead of anyone editing it by hand.
+Receives leads from GHL, CheckCherry, and anywhere else, stores them in a
+local database on this service, and gives Christine/Richard a password-
+protected admin page to view, edit, and manually add leads — no Google
+Sheets, no Apps Script, no external auth of any kind.
+
+This replaced an earlier design that forwarded every lead to a Google Apps
+Script Web App bound to a spreadsheet. That path was unreliable in practice
+— Apps Script would often run successfully but the HTTP response back to
+this server got mangled, and every code change needed a manual copy/paste +
+redeploy cycle in the Apps Script editor. This version has no such moving
+parts: leads write straight into this service's own SQLite database on a
+Railway Volume.
 
 ## What it does
 
@@ -24,57 +33,44 @@ CheckCherry, instead of anyone editing it by hand.
 }
 ```
 
-This service checks the shared secret and forwards the data to a Google Apps
-Script Web App bound to the spreadsheet. The Apps Script does the actual
-writing:
+- If a lead with that email already exists (within the same DMA/BuyAndRentRobots bucket), its Status / Notes / Next Follow-up / Owner are updated in place.
+- Otherwise a new lead row is inserted.
+- Leads whose `source` or `interest` mentions "humanoid", "robot rental", or "buyandrentrobots" are filed under BuyAndRentRobots; everything else under DMA.
 
-- If a row with that email already exists in the target sheet, it patches
-  Status / Notes / Next Follow-up / Owner in place.
-- If not, it appends a brand new row — so every new lead lands automatically
-  too, not just status changes.
-- Leads that look robot/BuyAndRentRobots-related route to the companion
-  sheet; everything else goes to the DMA tab.
-
-There's no Google OAuth client, service account, or refresh token anywhere in
-this service — Apps Script runs as whoever deployed it, using their own
-already-authorized Google session, so there's nothing for this server to
-authenticate as.
+`GET /admin` (HTTP Basic Auth) shows both lists as editable tables — change
+a status, add notes, or use "Add a lead manually" for a phone-in or walk-up
+lead. `GET /admin/export.csv?target=DMA` (or `target=BARR`) downloads a CSV
+snapshot at any time — hand that to anyone who wants an Excel/Sheets copy.
 
 ## One-time setup
 
-1. **Set up the Apps Script side** (do this once, in the spreadsheet itself):
-   - Open the Master Leads Tracker in Google Sheets, as an account that can
-     edit it (e.g. chrissaautomates@gmail.com).
-   - Extensions → Apps Script. Delete any starter code, paste in the contents
-     of `leads_webhook.gs` from this repo.
-   - Deploy → New deployment → type **Web app** → Execute as: **Me** → Who
-     has access: **Anyone** → Deploy. Authorize when prompted (a normal
-     one-click consent for your own script, not a third-party OAuth app).
-   - Copy the Web app URL it gives you.
-   - To push a change to the script later without the URL changing: Deploy →
-     Manage deployments → pencil icon → Version: New version → Deploy.
-2. **Deploy this repo to Railway** (or wherever) and set these environment
-   variables:
-   - `APPS_SCRIPT_URL` — the Web app URL from step 1
-   - `WEBHOOK_SECRET` — any random string; callers must send it back as the
-     `x-webhook-secret` header
-3. **Generate a public domain** for the service (Railway → service → Settings
-   → Networking → Generate Domain).
-4. **In GHL**: on the workflow(s) that change contact/opportunity status, add
-   a Webhook action → POST to `https://<your-domain>/webhook/lead` with the
-   `x-webhook-secret` header set, and map GHL fields into the JSON shape
+1. **Add a Railway Volume** mounted at `/data` on this service (Settings →
+   Volumes → New Volume, mount path `/data`). This is where `leads.db`
+   lives — without it, data is wiped on every redeploy.
+2. **Set environment variables** in Railway:
+   - `WEBHOOK_SECRET` — random string; callers must send it back as the `x-webhook-secret` header
+   - `ADMIN_PASSWORD` — password for `/admin`
+   - `ADMIN_USER` — username for `/admin` (optional, defaults to `admin`)
+   - `DB_PATH` — optional, defaults to `/data/leads.db`
+3. **Generate a public domain** for the service (Settings → Networking →
+   Generate Domain) if it doesn't have one already.
+4. **In GHL**: on the workflow(s) that change contact/opportunity status,
+   add a Webhook action → POST to `https://<your-domain>/webhook/lead` with
+   the `x-webhook-secret` header set, and map GHL fields into the JSON shape
    above.
 5. **In CheckCherry**: check Settings → Integrations for an outgoing webhook
-   option and point it at the same URL. CheckCherry's payload field names
-   will likely differ — once you see a sample payload, the mapping in
-   `leads_webhook.gs` can be adjusted to match.
+   option and point it at the same URL. If CheckCherry only offers a pull
+   API (no outgoing webhooks), that's a separate polling job — ask about
+   that when you're ready to wire it up.
+6. **Bookmark `https://<your-domain>/admin`** — that's the leads page.
 
 ## Local test
 
 ```
 npm install
-APPS_SCRIPT_URL='...' WEBHOOK_SECRET=test npm start
+DB_PATH=./leads.db WEBHOOK_SECRET=test ADMIN_PASSWORD=test npm start
 curl -X POST localhost:3000/webhook/lead \
   -H 'content-type: application/json' -H 'x-webhook-secret: test' \
   -d '{"source":"GHL","email":"klein@example.com","name":"Klein","interest":"humanoid robot Chicago","status":"New"}'
+# then open http://localhost:3000/admin (user: admin, password: test)
 ```

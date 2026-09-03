@@ -212,67 +212,125 @@ async function summarizeGhlChatLead(apiKey, locationId, contactId) {
   return summarizeChatTranscript(transcript, contactId);
 }
 
+// Only chat-lead contacts created on or after this date are pulled from
+// GHL. This replaced pulling and importing GHL's entire contact list
+// (~15,844 contacts) on every single sync run, which was the real driver of
+// multi-minute sync times — that's no longer the intent at all, not just an
+// optimization. Change this (e.g. further back) if a historical backfill is
+// ever wanted.
+const CHAT_LEAD_SYNC_START = '2026-09-03T00:00:00Z';
+
+// Verified against real data on 2026-09-03 via GET/POST calls directly
+// against the live API (not from docs — GHL's request-body field names
+// don't match its response field names, and error messages are
+// inconsistent enough that this needed hands-on checking):
+//   - Endpoint is POST /contacts/search (not GET /contacts/), header
+//     Version: v3, body { locationId, pageLimit, filters, searchAfter }.
+//   - filters is an array of { field, operator, value }. Tag filtering:
+//     { field: 'tags', operator: 'contains', value: 'chat-lead' }.
+//   - Date filtering on dateAdded rejects gt/gte/lt/lte/eq/range-as-string
+//     (400/422 depending which) — the working form is
+//     { field: 'dateAdded', operator: 'range', value: { gte: '<ISO date>' } }.
+//   - Response is { contacts: [...], total }. Each contact carries its own
+//     searchAfter: [timestamp, id] — pass the last contact's searchAfter
+//     back as the top-level searchAfter to get the next page.
+//   - Confirmed correct against known data: tags-only filter returned
+//     exactly the 2 known chat-lead contacts from earlier testing; a
+//     dateAdded>=2026-07-01 + tags filter returned exactly the 6 contacts
+//     independently predicted from an unfiltered listing; the real
+//     production cutoff (2026-09-03) correctly returned 0 (no chat-leads
+//     created yet today); and paginating via searchAfter produced two
+//     non-overlapping pages.
+async function fetchGhlChatLeadContacts(apiKey, locationId) {
+  const contacts = [];
+  let searchAfter;
+  let page = 1;
+  for (;;) {
+    const requestBody = {
+      locationId,
+      pageLimit: 100,
+      filters: [
+        { field: 'tags', operator: 'contains', value: 'chat-lead' },
+        { field: 'dateAdded', operator: 'range', value: { gte: CHAT_LEAD_SYNC_START } },
+      ],
+    };
+    if (searchAfter) requestBody.searchAfter = searchAfter;
+
+    console.log(`syncGHL: fetching chat-lead contacts page ${page}`);
+    const res = await fetchWithTimeout('https://services.leadconnectorhq.com/contacts/search', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, Version: 'v3', 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    if (!res.ok) throw new Error(`GHL contacts/search HTTP ${res.status}: ${res.text().slice(0, 300)}`);
+    const body = await res.json();
+    const pageContacts = body.contacts || [];
+    console.log(`syncGHL: page ${page} returned ${pageContacts.length} contacts (total matching: ${body.total})`);
+    if (!pageContacts.length) break;
+    contacts.push(...pageContacts);
+    if (pageContacts.length < 100) break;
+
+    const last = pageContacts[pageContacts.length - 1];
+    if (!last.searchAfter) break;
+    searchAfter = last.searchAfter;
+    page++;
+    if (page > 50) break; // safety cap, matching the pattern used elsewhere in this file
+  }
+  return contacts;
+}
+
 async function syncGHL() {
   console.log('syncGHL: starting');
   const apiKey = process.env.GHL_API_KEY;
   const locationId = process.env.GHL_LOCATION_ID;
   if (!apiKey || !locationId) return recordStatus('GHL', { ok: null, error: 'not configured', count: 0 });
   try {
-    let url = `https://services.leadconnectorhq.com/contacts/?locationId=${encodeURIComponent(locationId)}&limit=100`;
+    const contacts = await fetchGhlChatLeadContacts(apiKey, locationId);
     let total = 0;
-    for (;;) {
-      const res = await fetchWithTimeout(url, {
-        headers: { Authorization: `Bearer ${apiKey}`, Version: '2021-07-28' },
-      });
-      if (!res.ok) throw new Error(`GHL HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const body = await res.json();
-      const contacts = body.contacts || [];
-      if (!contacts.length) break;
-      for (const c of contacts) {
-        const name = c.contactName || [c.firstName, c.lastName].filter(Boolean).join(' ');
-        const email = c.email || '';
-        if (!email && !name) continue; // malformed/unmapped record — never write a junk row
+    for (const c of contacts) {
+      // Defense-in-depth: the server-side filters above are verified
+      // correct (see notes on fetchGhlChatLeadContacts), but don't trust a
+      // remote API unconditionally — re-check locally before importing.
+      const tags = (c.tags || []).map((t) => String(t).toLowerCase());
+      if (!tags.includes('chat-lead')) continue;
+      if (!c.dateAdded || Date.parse(c.dateAdded) < Date.parse(CHAT_LEAD_SYNC_START)) continue;
 
-        const tags = (c.tags || []).map((t) => String(t).toLowerCase());
-        const isChatLead = tags.includes('chat-lead');
-        const source = isChatLead ? 'Chat Lead' : 'GHL';
-        const interest = (c.tags || []).join(', ');
+      const name = c.contactName || [c.firstName, c.lastName].filter(Boolean).join(' ');
+      const email = c.email || '';
+      if (!email && !name) continue; // malformed/unmapped record — never write a junk row
 
-        let notes = '';
-        if (isChatLead) {
-          const target = computeTarget({ source, interest });
-          const existing = findLead(email, target);
-          if (existing && existing.notes) {
-            // Already captured this conversation — don't re-fetch/re-summarize.
-            notes = existing.notes;
-          } else {
-            try {
-              notes = await summarizeGhlChatLead(apiKey, locationId, c.id);
-            } catch (err) {
-              console.error(`Chat-lead summarize failed for GHL contact ${c.id}:`, err.message);
-              notes = '';
-            }
-          }
+      const source = 'Chat Lead';
+      const interest = (c.tags || []).join(', ');
+
+      const target = computeTarget({ source, interest });
+      const existing = findLead(email, target);
+      let notes;
+      if (existing && existing.notes) {
+        // Already captured this conversation — don't re-fetch/re-summarize.
+        notes = existing.notes;
+      } else {
+        try {
+          notes = await summarizeGhlChatLead(apiKey, locationId, c.id);
+        } catch (err) {
+          console.error(`Chat-lead summarize failed for GHL contact ${c.id}:`, err.message);
+          notes = '';
         }
-
-        upsertLead({
-          source,
-          name,
-          company: c.companyName || '',
-          email,
-          phone: c.phone || '',
-          location: c.city || '',
-          interest,
-          status: 'New',
-          owner: '',
-          notes,
-          nextFollowUp: 'Yes',
-        });
-        total++;
       }
-      const nextId = body.meta && body.meta.startAfterId;
-      if (!nextId || contacts.length < 100) break;
-      url = `https://services.leadconnectorhq.com/contacts/?locationId=${encodeURIComponent(locationId)}&limit=100&startAfterId=${nextId}`;
+
+      upsertLead({
+        source,
+        name,
+        company: c.companyName || '',
+        email,
+        phone: c.phone || '',
+        location: c.city || '',
+        interest,
+        status: 'New',
+        owner: '',
+        notes,
+        nextFollowUp: 'Yes',
+      });
+      total++;
     }
     recordStatus('GHL', { ok: true, count: total });
     console.log(`syncGHL: done (${total} contacts)`);

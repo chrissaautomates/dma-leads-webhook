@@ -365,13 +365,105 @@ function parseCSV(text) {
   return rows;
 }
 
+// Same normalization flattenUserColumnData() uses for the Google Ads
+// webhook (lowercase, non-alphanumeric stripped) — column headers with
+// punctuation/casing variance (e.g. "what_services_are_you_interested_in?")
+// won't reliably exact-match a hardcoded alias list otherwise.
+function normalizeKey(k) {
+  return String(k || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 function pick(obj, aliases) {
-  const keys = Object.keys(obj);
+  const normalized = {};
+  Object.keys(obj).forEach((k) => { normalized[normalizeKey(k)] = obj[k]; });
   for (const alias of aliases) {
-    const key = keys.find((k) => k.trim().toLowerCase() === alias);
-    if (key && obj[key]) return obj[key];
+    const value = normalized[normalizeKey(alias)];
+    if (value) return value;
   }
   return '';
+}
+
+// Meta's "Send Test Data" placeholder marker, and the id prefix its own
+// test rows use — either one means skip, never import.
+function isMetaTestRow(rowObj) {
+  const id = pick(rowObj, ['id']);
+  if (/^test/i.test(id)) return true;
+  return Object.values(rowObj).some((v) => String(v).includes('<test lead:'));
+}
+
+// Meta appends its own "p:" prefix to phone numbers in this export.
+function stripPhonePrefix(v) {
+  return String(v || '').replace(/^p:/i, '');
+}
+
+// Meta's created_time isn't in a confirmed single format — parse
+// defensively and only use it if it actually parses to a real date;
+// otherwise let upsertLead() fall back to today rather than storing
+// garbage.
+function parseDateReceived(v) {
+  if (!v) return undefined;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) return undefined;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// Meta Ads' real export header doesn't match the generic CSV mapping below
+// (that mapping was written against a simplified test fixture, not this
+// sheet) — no single "name" or "interest" column, phone has a literal "p:"
+// prefix, and there's no combined free-text field. lead_status / Synced /
+// CheckCherry Lead ID / Synced At / Sync Error belong to a separate,
+// human-managed CheckCherry workflow and are ignored here entirely.
+// Returns null for a row that should be skipped (a test submission).
+function mapMetaAdsRow(rowObj) {
+  if (isMetaTestRow(rowObj)) return null;
+
+  const name = pick(rowObj, ['name', 'full name'])
+    || [pick(rowObj, ['first_name']), pick(rowObj, ['last_name'])].filter(Boolean).join(' ');
+  const email = pick(rowObj, ['email']);
+  if (!email && !name) return null; // malformed/unmapped record — never write a junk row
+
+  // Three separate free-text columns each carry real signal — combine all
+  // three rather than picking one and losing the other two.
+  const interestParts = [
+    ['Services', pick(rowObj, ['what_services_are_you_interested_in?'])],
+    ['Planning', pick(rowObj, ['what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)'])],
+    ['Goal', pick(rowObj, ['tell_us_about_your_event_goal?'])],
+  ].filter(([, v]) => v);
+  const interest = interestParts.map(([label, v]) => `${label}: ${v}`).join(' | ');
+
+  return {
+    source: 'Meta Ads',
+    name,
+    company: '',
+    email,
+    phone: stripPhonePrefix(pick(rowObj, ['phone'])),
+    location: '',
+    interest,
+    status: 'New',
+    owner: '',
+    notes: '',
+    nextFollowUp: 'Yes',
+    dateReceived: parseDateReceived(pick(rowObj, ['created_time'])),
+  };
+}
+
+function mapGenericCsvRow(rowObj, sourceName) {
+  const email = pick(rowObj, ['email', 'email address']);
+  const name = pick(rowObj, ['name', 'full name', 'full_name']);
+  if (!email && !name) return null; // malformed/unmapped record — never write a junk row
+  return {
+    source: sourceName,
+    name,
+    company: pick(rowObj, ['company', 'company name', 'business name']),
+    email,
+    phone: pick(rowObj, ['phone', 'phone number']),
+    location: pick(rowObj, ['location', 'city']),
+    interest: pick(rowObj, ['interest', 'message', 'what are you interested in?', 'request']),
+    status: 'New',
+    owner: '',
+    notes: '',
+    nextFollowUp: 'Yes',
+  };
 }
 
 async function syncCsvSheet(envVar, sourceName) {
@@ -389,22 +481,13 @@ async function syncCsvSheet(envVar, sourceName) {
     for (let i = 1; i < rows.length; i++) {
       const rowObj = {};
       header.forEach((h, idx) => { rowObj[h] = rows[i][idx] || ''; });
-      const email = pick(rowObj, ['email', 'email address']);
-      const name = pick(rowObj, ['name', 'full name', 'full_name']);
-      if (!email && !name) continue; // malformed/unmapped record — never write a junk row
-      upsertLead({
-        source: sourceName,
-        name,
-        company: pick(rowObj, ['company', 'company name', 'business name']),
-        email,
-        phone: pick(rowObj, ['phone', 'phone number']),
-        location: pick(rowObj, ['location', 'city']),
-        interest: pick(rowObj, ['interest', 'message', 'what are you interested in?', 'request']),
-        status: 'New',
-        owner: '',
-        notes: '',
-        nextFollowUp: 'Yes',
-      });
+
+      const lead = sourceName === 'Meta Ads'
+        ? mapMetaAdsRow(rowObj)
+        : mapGenericCsvRow(rowObj, sourceName);
+      if (!lead) continue;
+
+      upsertLead(lead);
       total++;
     }
     recordStatus(sourceName, { ok: true, count: total });

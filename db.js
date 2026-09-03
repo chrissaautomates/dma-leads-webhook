@@ -96,7 +96,10 @@ function upsertLead(data) {
 
   const info = insertLead.run({
     target,
-    date_received: new Date().toISOString().slice(0, 10),
+    // Callers can pass an explicit dateReceived (e.g. a CSV backfill's real
+    // created_time) to preserve the lead's actual received date instead of
+    // defaulting to today — used by the Meta Ads sync for historical rows.
+    date_received: data.dateReceived || new Date().toISOString().slice(0, 10),
     source: data.source || '',
     name: data.name || '',
     company: data.company || '',

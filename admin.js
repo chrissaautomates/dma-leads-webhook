@@ -1,11 +1,61 @@
 // Simple server-rendered admin page for viewing/editing leads directly —
 // no Google Sheets, no Apps Script. Protected with HTTP Basic Auth using
-// ADMIN_USER / ADMIN_PASSWORD env vars.
+// ADMIN_USER / ADMIN_PASSWORD env vars, plus a magic-link cookie login:
+// visit /admin/login?key=<ADMIN_PASSWORD> once and a long-lived cookie logs
+// you in on every visit after that, without the browser's Basic Auth popup.
 
+const crypto = require('crypto');
 const express = require('express');
 const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin } = require('./db');
 
 const router = express.Router();
+const SESSION_COOKIE_NAME = 'dma_admin_session';
+
+// The cookie's value is a hash derived from ADMIN_PASSWORD, not the raw
+// password itself — deterministic (same password -> same token), so it
+// isn't a per-session secret and can't be individually revoked without
+// rotating ADMIN_PASSWORD, but it does mean the password itself is never
+// sitting in a cookie readable via document.cookie or a browser history
+// entry.
+function sessionToken() {
+  const pass = process.env.ADMIN_PASSWORD || '';
+  return crypto.createHash('sha256').update(`dma-leads-admin-session:${pass}`).digest('hex');
+}
+
+// Express has no cookie-parsing middleware installed (no cookie-parser
+// dependency) — parse the raw Cookie header directly rather than add one
+// just for this.
+function parseCookies(req) {
+  const header = req.get('cookie') || '';
+  const out = {};
+  header.split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return;
+    const key = part.slice(0, idx).trim();
+    if (!key) return;
+    out[key] = decodeURIComponent(part.slice(idx + 1).trim());
+  });
+  return out;
+}
+
+// Registered before router.use(basicAuth) below so the login route itself
+// isn't gated by the auth it's meant to grant.
+router.get('/login', (req, res) => {
+  const pass = process.env.ADMIN_PASSWORD;
+  if (!pass) {
+    return res.status(500).send('ADMIN_PASSWORD is not set on the server.');
+  }
+  if (req.query.key !== pass) {
+    return res.status(401).send('Wrong key.');
+  }
+  // ~1 year, HttpOnly (not readable from JS), SameSite=Lax (still sent on a
+  // plain top-level navigation to this link, but not on cross-site POSTs).
+  res.set(
+    'Set-Cookie',
+    `${SESSION_COOKIE_NAME}=${sessionToken()}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Lax`
+  );
+  res.redirect('/admin');
+});
 
 function basicAuth(req, res, next) {
   const user = process.env.ADMIN_USER || 'admin';
@@ -13,6 +63,13 @@ function basicAuth(req, res, next) {
   if (!pass) {
     return res.status(500).send('ADMIN_PASSWORD is not set on the server.');
   }
+
+  // Session cookie from a prior /login visit, checked first.
+  const cookies = parseCookies(req);
+  if (cookies[SESSION_COOKIE_NAME] && cookies[SESSION_COOKIE_NAME] === sessionToken()) {
+    return next();
+  }
+
   const header = req.get('authorization') || '';
   const [scheme, encoded] = header.split(' ');
   if (scheme === 'Basic' && encoded) {

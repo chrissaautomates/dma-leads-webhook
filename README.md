@@ -24,6 +24,10 @@ CheckCherry, instead of anyone editing it by hand.
 }
 ```
 
+This service checks the shared secret and forwards the data to a Google Apps
+Script Web App bound to the spreadsheet. The Apps Script does the actual
+writing:
+
 - If a row with that email already exists in the target sheet, it patches
   Status / Notes / Next Follow-up / Owner in place.
 - If not, it appends a brand new row — so every new lead lands automatically
@@ -31,61 +35,45 @@ CheckCherry, instead of anyone editing it by hand.
 - Leads that look robot/BuyAndRentRobots-related route to the companion
   sheet; everything else goes to the DMA tab.
 
+There's no Google OAuth client, service account, or refresh token anywhere in
+this service — Apps Script runs as whoever deployed it, using their own
+already-authorized Google session, so there's nothing for this server to
+authenticate as.
+
 ## One-time setup
 
-This uses OAuth (your own Google account's login), not a service account —
-no JSON key file, no extra sharing step. The sheets just need to already be
-in the Google account you authorize with below (photoworkshops@gmail.com).
-
-1. **Create an OAuth 2.0 Client ID** in Google Cloud Console → APIs &
-   Services → Credentials → Create Credentials → OAuth client ID.
-   - Application type: **Web application**
-   - Authorized redirect URIs: add `https://developers.google.com/oauthplayground`
-   - Save it, then copy the **Client ID** and **Client Secret** it shows you.
-2. **Enable the Google Sheets API** on that same GCP project (APIs &
-   Services → Library → search "Google Sheets API" → Enable), if it isn't
-   already.
-3. **Get a refresh token** using Google's OAuth Playground
-   (https://developers.google.com/oauthplayground):
-   - Click the gear icon (top right) → check "Use your own OAuth
-     credentials" → paste in the Client ID and Client Secret from step 1.
-   - In Step 1 on the left, find and select the scope
-     `https://www.googleapis.com/auth/spreadsheets` → Authorize APIs.
-   - Sign in as **photoworkshops@gmail.com** (the account that owns/edits
-     the sheets) and accept.
-   - In Step 2, click **Exchange authorization code for tokens** → copy the
-     **Refresh token** it gives you.
-4. **Deploy this repo to Railway** (or wherever) and set these environment
+1. **Set up the Apps Script side** (do this once, in the spreadsheet itself):
+   - Open the Master Leads Tracker in Google Sheets, as an account that can
+     edit it (e.g. chrissaautomates@gmail.com).
+   - Extensions → Apps Script. Delete any starter code, paste in the contents
+     of `leads_webhook.gs` from this repo.
+   - Deploy → New deployment → type **Web app** → Execute as: **Me** → Who
+     has access: **Anyone** → Deploy. Authorize when prompted (a normal
+     one-click consent for your own script, not a third-party OAuth app).
+   - Copy the Web app URL it gives you.
+   - To push a change to the script later without the URL changing: Deploy →
+     Manage deployments → pencil icon → Version: New version → Deploy.
+2. **Deploy this repo to Railway** (or wherever) and set these environment
    variables:
-   - `GOOGLE_CLIENT_ID` — from step 1
-   - `GOOGLE_CLIENT_SECRET` — from step 1
-   - `GOOGLE_REFRESH_TOKEN` — from step 3
-   - `MASTER_SHEET_ID` — the Drive file ID from the Master Tracker's URL
-   - `MASTER_TAB_NAME` — `All DMA Leads`
-   - `BARR_SHEET_ID` — the Drive file ID of the BuyAndRentRobots companion sheet
+   - `APPS_SCRIPT_URL` — the Web app URL from step 1
    - `WEBHOOK_SECRET` — any random string; callers must send it back as the
      `x-webhook-secret` header
-5. **Generate a public domain** for the service (Railway → service → Settings
+3. **Generate a public domain** for the service (Railway → service → Settings
    → Networking → Generate Domain).
-6. **In GHL**: on the workflow(s) that change contact/opportunity status, add
+4. **In GHL**: on the workflow(s) that change contact/opportunity status, add
    a Webhook action → POST to `https://<your-domain>/webhook/lead` with the
    `x-webhook-secret` header set, and map GHL fields into the JSON shape
    above.
-7. **In CheckCherry**: check Settings → Integrations for an outgoing webhook
+5. **In CheckCherry**: check Settings → Integrations for an outgoing webhook
    option and point it at the same URL. CheckCherry's payload field names
-   will likely differ — once you see a sample payload, this server's mapping
-   in `server.js` can be adjusted to match.
-
-Note: a refresh token obtained this way keeps working indefinitely as long
-as it's used at least once every 6 months and access isn't revoked from the
-Google account's "Third-party apps & services" settings — no need to redo
-this setup periodically.
+   will likely differ — once you see a sample payload, the mapping in
+   `leads_webhook.gs` can be adjusted to match.
 
 ## Local test
 
 ```
 npm install
-GOOGLE_CLIENT_ID='...' GOOGLE_CLIENT_SECRET='...' GOOGLE_REFRESH_TOKEN='...' MASTER_SHEET_ID=... MASTER_TAB_NAME='All DMA Leads' BARR_SHEET_ID=... WEBHOOK_SECRET=test npm start
+APPS_SCRIPT_URL='...' WEBHOOK_SECRET=test npm start
 curl -X POST localhost:3000/webhook/lead \
   -H 'content-type: application/json' -H 'x-webhook-secret: test' \
   -d '{"source":"GHL","email":"klein@example.com","name":"Klein","interest":"humanoid robot Chicago","status":"New"}'

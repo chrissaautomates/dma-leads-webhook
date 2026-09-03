@@ -90,27 +90,127 @@ function esc(v) {
 
 const STATUS_OPTIONS = ['New', 'Contacted', 'Proposal Sent', 'Negotiating', 'Won', 'Lost', 'NEEDS DETAILS'];
 
+// Drives both the summary bar's per-status tiles and the status pill's
+// color. Statuses not listed here (a stray custom value, or the
+// less-common "NEEDS DETAILS") still get a pill via the 'status-other'
+// fallback and still count toward an "Other" summary tile, rather than
+// being silently dropped.
+const STATUS_CLASSES = {
+  New: 'status-new',
+  Contacted: 'status-warn',
+  'Proposal Sent': 'status-warn',
+  Negotiating: 'status-warn',
+  Won: 'status-won',
+  Lost: 'status-lost',
+  'NEEDS DETAILS': 'status-alert',
+};
+const SUMMARY_STATUS_ORDER = ['New', 'Contacted', 'Proposal Sent', 'Negotiating', 'Won', 'Lost'];
+
+// Same reasoning for sources: known ones get their own tile; anything else
+// (custom manual-entry sources, a future integration) still counts, under
+// "Other", instead of vanishing from the total.
+const SUMMARY_SOURCE_ORDER = ['CheckCherry', 'GHL', 'Chat Lead', 'Meta Ads', 'Google Ads'];
+
+function statusClass(status) {
+  return STATUS_CLASSES[status] || 'status-other';
+}
+
+function computeSummary(leads) {
+  const statusCounts = {};
+  const sourceCounts = {};
+  let otherStatusCount = 0;
+  let manualSourceCount = 0;
+  let otherSourceCount = 0;
+
+  leads.forEach((lead) => {
+    const status = lead.status || 'New';
+    if (SUMMARY_STATUS_ORDER.includes(status)) {
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    } else {
+      otherStatusCount += 1;
+    }
+
+    const source = lead.source || '';
+    if (SUMMARY_SOURCE_ORDER.includes(source)) {
+      sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+    } else if (/^manual/i.test(source)) {
+      manualSourceCount += 1;
+    } else {
+      otherSourceCount += 1;
+    }
+  });
+
+  return { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount };
+}
+
+function statTile(count, label, extraClass) {
+  return `<div class="stat-tile ${extraClass || ''}"><div class="stat-value">${count}</div><div class="stat-label">${esc(label)}</div></div>`;
+}
+
+function renderSummaryBar(leads) {
+  const { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount } = computeSummary(leads);
+
+  const statusTiles = SUMMARY_STATUS_ORDER
+    .map((s) => statTile(statusCounts[s] || 0, s, statusClass(s)))
+    .join('');
+  const otherStatusTile = otherStatusCount > 0 ? statTile(otherStatusCount, 'Other', 'status-other') : '';
+
+  const sourceTiles = SUMMARY_SOURCE_ORDER
+    .map((s) => statTile(sourceCounts[s] || 0, s))
+    .join('');
+  const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual') : '';
+  const otherSourceTile = otherSourceCount > 0 ? statTile(otherSourceCount, 'Other') : '';
+
+  return `
+    <div class="summary-bar">
+      ${statTile(leads.length, 'Total Leads', 'stat-total')}
+      <div class="stat-divider"></div>
+      ${statusTiles}${otherStatusTile}
+      <div class="stat-divider"></div>
+      ${sourceTiles}${manualTile}${otherSourceTile}
+    </div>`;
+}
+
+// A long interest/notes value gets a clamped 2-line preview plus a toggle
+// (client-side JS shows the toggle only when the text actually overflows)
+// instead of ballooning the row to its full height.
+function renderClampField(id, text) {
+  return `<div class="clamp-text" id="${id}">${esc(text)}</div><button type="button" class="toggle-clamp" data-target="${id}">more</button>`;
+}
+
 function renderRow(lead) {
   const options = STATUS_OPTIONS.map(
     (s) => `<option value="${esc(s)}" ${s === lead.status ? 'selected' : ''}>${esc(s)}</option>`
   ).join('');
+
+  const searchKey = esc([lead.name, lead.email, lead.company].filter(Boolean).join(' ').toLowerCase());
+  const contactLines = [esc(lead.email), esc(lead.phone), esc(lead.location)].filter(Boolean).join('<br>');
+  const leadLines = [esc(lead.name)];
+  if (lead.company) leadLines.push(`<span class="subtext">${esc(lead.company)}</span>`);
+
+  const notesPreviewId = `notes-preview-${lead.id}`;
+  const notesEditId = `notes-edit-${lead.id}`;
+  const interestId = `interest-${lead.id}`;
+
   return `
-    <tr>
+    <tr data-search="${searchKey}" data-date="${esc(lead.date_received)}" data-status="${esc(lead.status)}">
       <form method="POST" action="/admin/update/${lead.id}">
-        <td>${lead.id}</td>
         <td>${esc(lead.date_received)}</td>
-        <td>${esc(lead.source)}</td>
-        <td>${esc(lead.name)}</td>
-        <td>${esc(lead.company)}</td>
-        <td>${esc(lead.email)}</td>
-        <td>${esc(lead.phone)}</td>
-        <td>${esc(lead.location)}</td>
-        <td style="max-width:220px">${esc(lead.interest)}</td>
-        <td><select name="status">${options}</select></td>
-        <td><input type="text" name="owner" value="${esc(lead.owner)}" size="10"></td>
-        <td><textarea name="notes" rows="2" cols="24">${esc(lead.notes)}</textarea></td>
-        <td><input type="text" name="next_follow_up" value="${esc(lead.next_follow_up)}" size="8"></td>
-        <td><button type="submit">Save</button></td>
+        <td><span class="source-pill">${esc(lead.source)}</span></td>
+        <td>${leadLines.join('<br>')}</td>
+        <td>${contactLines || '<span class="subtext">&mdash;</span>'}</td>
+        <td class="wide-cell">${renderClampField(interestId, lead.interest)}</td>
+        <td>
+          <select name="status" class="status-select ${statusClass(lead.status)}">${options}</select>
+        </td>
+        <td><input type="text" name="owner" value="${esc(lead.owner)}"></td>
+        <td class="wide-cell">
+          <div class="clamp-text notes-preview" id="${notesPreviewId}">${esc(lead.notes)}</div>
+          <textarea name="notes" class="notes-edit" id="${notesEditId}" hidden>${esc(lead.notes)}</textarea>
+          <button type="button" class="toggle-clamp notes-toggle" data-preview="${notesPreviewId}" data-edit="${notesEditId}">edit</button>
+        </td>
+        <td><input type="text" name="next_follow_up" value="${esc(lead.next_follow_up)}"></td>
+        <td><button type="submit" class="save-btn">Save</button></td>
       </form>
     </tr>`;
 }
@@ -118,9 +218,9 @@ function renderRow(lead) {
 function renderPage(target, leads) {
   const tabs = ['DMA', 'BARR'].map((t) => {
     const label = t === 'DMA' ? 'DMA Leads' : 'BuyAndRentRobots Leads';
-    const active = t === target ? 'style="font-weight:bold;text-decoration:underline"' : '';
-    return `<a href="/admin?target=${t}" ${active}>${label}</a>`;
-  }).join(' &nbsp;|&nbsp; ');
+    const active = t === target ? ' active' : '';
+    return `<a class="tab${active}" href="/admin?target=${t}">${label}</a>`;
+  }).join('');
 
   const rows = leads.map(renderRow).join('\n');
 
@@ -130,24 +230,88 @@ function renderPage(target, leads) {
 <meta charset="utf-8">
 <title>DMA Leads Admin</title>
 <style>
-  body { font-family: -apple-system, Arial, sans-serif; margin: 20px; background: #f7f7f8; color: #1a1a1a; }
-  h1 { font-size: 20px; }
-  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; }
-  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
-  th { background: #f0f0f2; position: sticky; top: 0; }
-  tr:nth-child(even) { background: #fafafa; }
-  input, select, textarea { font-size: 12px; width: 100%; box-sizing: border-box; }
+  :root {
+    --bg: #eef1f8;
+    --card: #ffffff;
+    --border: #dde3ee;
+    --text: #1e2432;
+    --text-muted: #667085;
+    --accent: #4f46e5;
+    --accent-dark: #4338ca;
+    --header-bg: #eef0fd;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; padding: 24px 28px 60px; background: var(--bg); color: var(--text); font-size: 15px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  a { color: var(--accent); }
+
+  .tabs { margin-bottom: 16px; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .tab { padding: 7px 14px; border-radius: 8px; text-decoration: none; color: var(--text-muted); font-weight: 600; font-size: 13px; }
+  .tab.active { background: var(--accent); color: #fff; }
+  .tab:not(.active):hover { background: var(--card); }
+  .export-link { margin-left: auto; font-size: 13px; font-weight: 600; }
+
+  .summary-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; align-items: stretch; }
+  .stat-tile { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; min-width: 84px; box-shadow: 0 1px 2px rgba(16,24,40,0.04); border-top: 3px solid var(--border); }
+  .stat-tile.stat-total { border-top-color: var(--accent); }
+  .stat-value { font-size: 20px; font-weight: 700; line-height: 1.1; }
+  .stat-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; }
+  .stat-divider { width: 1px; background: var(--border); margin: 2px 4px; }
+
+  .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .search-box { flex: 0 1 320px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; background: var(--card); }
+  .search-box:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #noResults { display: none; color: var(--text-muted); padding: 16px; text-align: center; }
+
+  .addform { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 18px; }
+  .addform summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+  .addform label { display: block; font-size: 11px; color: var(--text-muted); margin-top: 8px; margin-bottom: 3px; }
+  .addform input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; width: 100%; box-sizing: border-box; }
+  .addform-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px 16px; margin-top: 10px; }
+  .addform button { margin-top: 12px; }
+
+  .table-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: auto; box-shadow: 0 1px 2px rgba(16,24,40,0.04); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+  th { background: var(--header-bg); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted); font-weight: 700; position: sticky; top: 0; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--accent); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8f9fd; }
+  .wide-cell { max-width: 260px; }
+  .subtext { color: var(--text-muted); font-size: 12px; }
+
+  input, select, textarea { font-size: 13px; width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text); font-family: inherit; }
+  textarea { resize: vertical; }
   button { cursor: pointer; }
-  .nav { margin-bottom: 14px; }
-  .addform { background: #fff; border: 1px solid #ddd; padding: 12px; margin-bottom: 20px; }
-  .addform label { display: block; font-size: 11px; color: #555; margin-top: 6px; }
-  .addform input, .addform select { padding: 4px; }
-  .addform-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 16px; }
+  .save-btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 7px 12px; font-weight: 600; font-size: 12.5px; }
+  .save-btn:hover { background: var(--accent-dark); }
+
+  .source-pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: #eef0fd; color: #3730a3; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+
+  .status-select { appearance: none; -webkit-appearance: none; border-radius: 999px; font-weight: 700; font-size: 12px; text-align: left; padding: 6px 26px 6px 10px; border-width: 1px; border-style: solid; background-repeat: no-repeat; background-position: right 8px center; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23667085'/%3E%3C/svg%3E"); min-width: 128px; width: auto; }
+  .status-new { background-color: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
+  .status-warn { background-color: #fef3c7; color: #92400e; border-color: #fde68a; }
+  .status-won { background-color: #dcfce7; color: #166534; border-color: #bbf7d0; }
+  .status-lost { background-color: #e5e7eb; color: #4b5563; border-color: #d1d5db; }
+  .status-alert { background-color: #fee2e2; color: #991b1b; border-color: #fecaca; }
+  .status-other { background-color: #ede9fe; color: #5b21b6; border-color: #ddd6fe; }
+
+  .clamp-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; line-height: 1.35; }
+  .clamp-text.expanded { display: block; -webkit-line-clamp: unset; overflow: visible; }
+  .toggle-clamp { display: none; background: none; border: none; padding: 2px 0 0; color: var(--accent); font-size: 11.5px; font-weight: 600; }
+  .notes-edit { margin-top: 4px; }
 </style>
 </head>
 <body>
   <h1>DMA &amp; BuyAndRentRobots — Leads Admin</h1>
-  <div class="nav">${tabs} &nbsp;|&nbsp; <a href="/admin/export.csv?target=${target}">Export CSV</a></div>
+
+  <div class="tabs">
+    ${tabs}
+    <a class="export-link" href="/admin/export.csv?target=${target}">Export CSV</a>
+  </div>
+
+  ${renderSummaryBar(leads)}
 
   <details class="addform">
     <summary>Add a lead manually (phone-in, walk-up, etc.)</summary>
@@ -163,22 +327,120 @@ function renderPage(target, leads) {
         <div><label>Interest / Request</label><input name="interest"></div>
         <div><label>Owner</label><input name="owner"></div>
       </div>
-      <div style="margin-top:10px"><button type="submit">Add lead</button></div>
+      <button type="submit" class="save-btn">Add lead</button>
     </form>
   </details>
 
-  <table>
-    <thead>
-      <tr>
-        <th>ID</th><th>Date</th><th>Source</th><th>Name</th><th>Company</th>
-        <th>Email</th><th>Phone</th><th>Location</th><th>Interest</th>
-        <th>Status</th><th>Owner</th><th>Notes</th><th>Next Follow-up</th><th></th>
-      </tr>
-    </thead>
-    <tbody>
-      ${rows || '<tr><td colspan="14">No leads yet.</td></tr>'}
-    </tbody>
-  </table>
+  <div class="toolbar">
+    <input type="text" id="searchBox" class="search-box" placeholder="Search name, email, company…">
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable" data-sort="date">Date<span class="sort-indicator" data-sort-indicator="date"></span></th>
+          <th>Source</th><th>Lead</th><th>Contact</th><th>Interest</th>
+          <th class="sortable" data-sort="status">Status<span class="sort-indicator" data-sort-indicator="status"></span></th>
+          <th>Owner</th><th>Notes</th><th>Follow-up</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || '<tr><td colspan="10">No leads yet.</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+  <div id="noResults">No leads match your search.</div>
+
+<script>
+(function () {
+  // --- clamp "more"/"edit" toggles: only shown when text actually overflows ---
+  document.querySelectorAll('.clamp-text').forEach(function (el) {
+    var isNotes = el.classList.contains('notes-preview');
+    var btn = isNotes
+      ? document.querySelector('.notes-toggle[data-preview="' + el.id + '"]')
+      : document.querySelector('.toggle-clamp[data-target="' + el.id + '"]');
+    if (!btn) return;
+    if (el.scrollHeight > el.clientHeight + 1) {
+      btn.style.display = 'inline-block';
+    }
+  });
+
+  document.querySelectorAll('.toggle-clamp:not(.notes-toggle)').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var target = document.getElementById(btn.dataset.target);
+      var expanded = target.classList.toggle('expanded');
+      btn.textContent = expanded ? 'less' : 'more';
+    });
+  });
+
+  document.querySelectorAll('.notes-toggle').forEach(function (btn) {
+    var preview = document.getElementById(btn.dataset.preview);
+    var editEl = document.getElementById(btn.dataset.edit);
+    btn.style.display = 'inline-block'; // notes are always editable, regardless of overflow
+    btn.addEventListener('click', function () {
+      var editing = !editEl.hidden;
+      if (editing) {
+        preview.textContent = editEl.value;
+        editEl.hidden = true;
+        preview.style.display = '-webkit-box';
+        btn.textContent = 'edit';
+      } else {
+        editEl.hidden = false;
+        preview.style.display = 'none';
+        editEl.focus();
+        btn.textContent = 'done';
+      }
+    });
+  });
+
+  // --- status pill recolors immediately on selection, before save ---
+  var STATUS_CLASSES = ${JSON.stringify(STATUS_CLASSES)};
+  document.querySelectorAll('.status-select').forEach(function (sel) {
+    sel.addEventListener('change', function () {
+      sel.className = 'status-select ' + (STATUS_CLASSES[sel.value] || 'status-other');
+    });
+  });
+
+  // --- live search filter (name / email / company) ---
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tbody tr[data-search]'));
+  var searchBox = document.getElementById('searchBox');
+  var noResults = document.getElementById('noResults');
+  if (searchBox) {
+    searchBox.addEventListener('input', function () {
+      var q = searchBox.value.trim().toLowerCase();
+      var visibleCount = 0;
+      rows.forEach(function (tr) {
+        var match = tr.dataset.search.indexOf(q) !== -1;
+        tr.style.display = match ? '' : 'none';
+        if (match) visibleCount++;
+      });
+      noResults.style.display = (q && visibleCount === 0) ? 'block' : 'none';
+    });
+  }
+
+  // --- click Date / Status headers to sort ---
+  var sortState = { key: null, dir: 1 };
+  function updateIndicators(activeKey, dir) {
+    document.querySelectorAll('.sort-indicator').forEach(function (el) {
+      el.textContent = el.dataset.sortIndicator === activeKey ? (dir === 1 ? ' \\u25B2' : ' \\u25BC') : '';
+    });
+  }
+  document.querySelectorAll('th.sortable').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var key = th.dataset.sort;
+      var tbody = document.querySelector('table tbody');
+      if (sortState.key === key) { sortState.dir *= -1; } else { sortState.key = key; sortState.dir = 1; }
+      rows.slice().sort(function (a, b) {
+        var va = a.dataset[key] || '';
+        var vb = b.dataset[key] || '';
+        return va.localeCompare(vb) * sortState.dir;
+      }).forEach(function (tr) { tbody.appendChild(tr); });
+      updateIndicators(key, sortState.dir);
+    });
+  });
+})();
+</script>
 </body>
 </html>`;
 }

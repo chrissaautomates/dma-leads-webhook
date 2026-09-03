@@ -23,8 +23,9 @@
 //                       mounted at /data)
 
 const express = require('express');
-const { upsertLead } = require('./db');
+const { upsertLead, listLeads } = require('./db');
 const adminRouter = require('./admin');
+const { runFullSync, getSyncStatus } = require('./sync');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -62,4 +63,30 @@ app.post('/webhook/lead', (req, res) => {
   }
 });
 
+// TEMPORARY — for confirming this fix against the real production DB on the
+// real Railway volume, not a local/scratch copy. Remove once confirmed.
+app.get('/debug/sync-check', (req, res) => {
+  if (!checkSecret(req, res)) return;
+  res.json({
+    now: new Date().toISOString(),
+    syncStatus: getSyncStatus(),
+    counts: { DMA: listLeads('DMA').length, BARR: listLeads('BARR').length },
+  });
+});
+
 app.listen(PORT, () => console.log(`Leads webhook listening on ${PORT}`));
+
+// runFullSync() was previously never actually wired up to run anywhere in
+// production — no automatic trigger here, and no manual trigger in the
+// admin UI either. It only ever ran via local `railway run` invocations
+// against local/scratch DB_PATH files during development, which is why the
+// real database on the Railway volume stayed empty despite those runs
+// looking successful. This is what actually triggers it against the real
+// database now.
+const SYNC_INTERVAL_MS = (Number(process.env.SYNC_INTERVAL_MINUTES) || 15) * 60 * 1000;
+setTimeout(() => {
+  runFullSync().then((status) => console.log('Initial sync:', JSON.stringify(status)));
+}, 5000);
+setInterval(() => {
+  runFullSync().then((status) => console.log('Scheduled sync:', JSON.stringify(status)));
+}, SYNC_INTERVAL_MS);

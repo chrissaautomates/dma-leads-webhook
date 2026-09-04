@@ -6,7 +6,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin } = require('./db');
+const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -220,7 +220,7 @@ function renderLeadOrigin(lead) {
   return parts.join('');
 }
 
-function renderRow(lead) {
+function renderRow(lead, rowNumber) {
   const options = STATUS_OPTIONS.map(
     (s) => `<option value="${esc(s)}" ${s === lead.status ? 'selected' : ''}>${esc(s)}</option>`
   ).join('');
@@ -237,6 +237,7 @@ function renderRow(lead) {
   return `
     <tr data-search="${searchKey}" data-date="${esc(lead.date_received)}" data-status="${esc(lead.status)}">
       <form method="POST" action="/admin/update/${lead.id}">
+        <td class="row-num">${rowNumber}</td>
         <td>${esc(lead.date_received)}</td>
         <td><span class="source-pill ${sourceClass(lead.source)}">${esc(lead.source)}</span></td>
         <td class="origin-cell">${renderLeadOrigin(lead)}</td>
@@ -256,7 +257,11 @@ function renderRow(lead) {
           </div>
         </td>
         <td><input type="text" name="next_follow_up" value="${esc(lead.next_follow_up)}"></td>
-        <td><button type="submit" class="save-btn">Save</button></td>
+        <td class="actions-cell">
+          <button type="submit" class="save-btn">Save</button>
+          <button type="submit" class="delete-btn" formaction="/admin/delete/${lead.id}" formnovalidate
+            data-confirm="Delete this lead${lead.name ? ' (' + esc(lead.name) + ')' : ''}? This cannot be undone.">Delete</button>
+        </td>
       </form>
     </tr>`;
 }
@@ -268,7 +273,7 @@ function renderPage(target, leads) {
     return `<a class="tab${active}" href="/admin?target=${t}">${label}</a>`;
   }).join('');
 
-  const rows = leads.map(renderRow).join('\n');
+  const rows = leads.map((lead, i) => renderRow(lead, i + 1)).join('\n');
 
   return `<!doctype html>
 <html>
@@ -326,6 +331,7 @@ function renderPage(target, leads) {
   tr:hover td { background: #f8f9fd; }
   .wide-cell { max-width: 260px; }
   .origin-cell { max-width: 150px; }
+  .row-num { color: var(--text-muted); text-align: right; }
   .subtext { color: var(--text-muted); font-size: 12px; }
 
   input, select, textarea { font-size: 13px; width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text); font-family: inherit; }
@@ -333,6 +339,9 @@ function renderPage(target, leads) {
   button { cursor: pointer; }
   .save-btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 7px 12px; font-weight: 600; font-size: 12.5px; }
   .save-btn:hover { background: var(--accent-dark); }
+  .actions-cell { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .delete-btn { background: #fff; color: #b91c1c; border: 1px solid #fecaca; border-radius: 6px; padding: 7px 12px; font-weight: 600; font-size: 12.5px; }
+  .delete-btn:hover { background: #fef2f2; border-color: #fca5a5; }
 
   .source-pill { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
   .source-checkcherry { background-color: #e0f2fe; color: #075985; border-color: #bae6fd; }
@@ -397,6 +406,7 @@ function renderPage(target, leads) {
     <table>
       <thead>
         <tr>
+          <th>#</th>
           <th class="sortable" data-sort="date">Date<span class="sort-indicator" data-sort-indicator="date"></span></th>
           <th>Source</th><th>Lead Origin</th><th>Lead</th><th>Contact</th><th>Interest</th>
           <th class="sortable" data-sort="status">Status<span class="sort-indicator" data-sort-indicator="status"></span></th>
@@ -404,7 +414,7 @@ function renderPage(target, leads) {
         </tr>
       </thead>
       <tbody>
-        ${rows || '<tr><td colspan="11">No leads yet.</td></tr>'}
+        ${rows || '<tr><td colspan="12">No leads yet.</td></tr>'}
       </tbody>
     </table>
   </div>
@@ -461,6 +471,16 @@ function renderPage(target, leads) {
         editEl.hidden = false;
         editEl.focus();
         btn.textContent = 'Done';
+      }
+    });
+  });
+
+  // --- delete button: confirm before submitting (formaction points the
+  // shared row <form> at /admin/delete/:id instead of /admin/update/:id) ---
+  document.querySelectorAll('.delete-btn').forEach(function (btn) {
+    btn.addEventListener('click', function (e) {
+      if (!confirm(btn.dataset.confirm || 'Delete this lead? This cannot be undone.')) {
+        e.preventDefault();
       }
     });
   });
@@ -531,6 +551,13 @@ router.post('/update/:id', (req, res) => {
     notes: req.body.notes || '',
     next_follow_up: req.body.next_follow_up || '',
   });
+  res.redirect('/admin?target=' + lead.target);
+});
+
+router.post('/delete/:id', (req, res) => {
+  const lead = getLead(req.params.id);
+  if (!lead) return res.status(404).send('Lead not found');
+  deleteLead(req.params.id);
   res.redirect('/admin?target=' + lead.target);
 });
 

@@ -181,6 +181,10 @@ function updateLeadFromAdmin(id, fields) {
   `).run({ id, ...fields });
 }
 
+function deleteLead(id) {
+  db.prepare(`DELETE FROM leads WHERE id = ?`).run(id);
+}
+
 function addLeadFromAdmin(fields) {
   const info = insertLead.run({
     target: fields.target || 'DMA',
@@ -218,5 +222,6 @@ module.exports = {
   getLead,
   updateLeadFromAdmin,
   addLeadFromAdmin,
+  deleteLead,
   DB_PATH,
 };

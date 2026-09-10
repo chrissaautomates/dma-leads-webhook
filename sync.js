@@ -78,6 +78,16 @@ function mapCheckCherryLead(record) {
     owner: attrs.owner || attrs.assigned_to || '',
     notes: attrs.notes || attrs.message || '',
     nextFollowUp: 'Yes',
+    // Real field, verified against live /leads data on 2026-09-10 (same
+    // field mapCheckCherryProposalEvent() below already uses for /events).
+    // Without this, upsertLead()'s insert path fell back to "today" —
+    // whatever day the sync happened to first see the lead — and since
+    // date_received is only ever set on insert, never corrected on a
+    // later update, that stamped every CheckCherry lead with its sync
+    // date instead of its real creation date permanently. See
+    // scripts/backfill-checkcherry-dates.js for the one-time correction
+    // this needed on rows already inserted before this fix existed.
+    dateReceived: attrs.created_at ? attrs.created_at.slice(0, 10) : undefined,
     // Confirmed against real leads on 2026-09-03 (pulled the raw API
     // response directly, not assumed): CheckCherry's attributes object
     // always carries these five keys, null when unset. utm_term came back

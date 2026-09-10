@@ -141,11 +141,23 @@ async function syncCheckCherry() {
 // "assigned_event_read_pricing"/"unassigned_event_read_pricing" permission
 // before GET /events stopped 403'ing) by pulling all 1,060 events and
 // cross-checking their emails against every /leads record ever returned:
-// of the 25 still-open proposals created since 2026-01-01, only 10 had
-// created_via "convert_from_lead" (i.e. already exist as a real lead, and
-// are already covered by syncCheckCherry() above) — the other 15
-// ("quick_add" x13, "duplicate" x1, "mobile_app" x1) had no matching /leads
-// row at all, confirming the gap.
+// of the still-open proposals created since 2026-01-01, the ones with
+// created_via "quick_add"/"duplicate"/"mobile_app" had no matching /leads
+// row at all, confirming the gap for those.
+//
+// created_via "convert_from_lead" ones were originally assumed to already
+// be covered by syncCheckCherry()'s /leads sync above, since they started
+// out as a real lead — but cross-checking CheckCherry's own reporting API
+// (GET /api/v1/reporting/lead_count_summary, verified against real data on
+// 2026-09-10) revealed that assumption was wrong: /leads only ever returns
+// currently-open, unconverted leads — the moment one converts to a
+// proposal/event it disappears from that endpoint for good. Confirmed
+// directly: all 14 real convert_from_lead events created since 2026-01-01
+// (4 of them already 'confirmed' — real won business) had zero matching
+// row anywhere in the leads table. So convert_from_lead is now imported
+// here too, at every status including 'confirmed' (see
+// isRelevantProposalEvent()/initialStatusFor() below) — it's the only
+// place these ever show up once the originating lead has converted.
 //
 // Event objects carry no lead_id/lead relationship — matching is by email
 // only (same as upsertLead() already does). customer_names/_emails/_phones
@@ -156,16 +168,34 @@ function firstOf(commaJoinedList) {
 }
 
 // The only status values CheckCherry's API has ever returned (checked
-// across all 1,060 events, not just recent ones): 'confirmed' (booked —
-// already won business, not a lead-stage proposal) plus these three
-// pre-booking stages. canceled/archived/postponed are separate boolean
-// flags on the same object, checked independently below.
+// across all 1,060 events, not just recent ones): 'confirmed' (booked)
+// plus these three pre-booking stages. canceled/archived/postponed are
+// separate boolean flags on the same object, checked independently below.
 const OPEN_PROPOSAL_STATUSES = ['proposal_date_open', 'proposal_date_reserved', 'awaiting_signature'];
 
-function isOpenProposalEvent(attrs) {
-  return OPEN_PROPOSAL_STATUSES.includes(attrs.status)
-    && attrs.created_via !== 'convert_from_lead' // already covered by syncCheckCherry()'s /leads sync
-    && !attrs.canceled && !attrs.archived && !attrs.postponed;
+function isRelevantProposalEvent(attrs) {
+  if (attrs.canceled || attrs.archived || attrs.postponed) return false;
+  if (attrs.created_via === 'convert_from_lead') {
+    // These originated as a real /leads record that has since converted
+    // and vanished from that live endpoint entirely — this is the only
+    // place left to ever see them, so import at any status, 'confirmed'
+    // included (real won business that would otherwise never show up
+    // anywhere in this system at all).
+    return OPEN_PROPOSAL_STATUSES.includes(attrs.status) || attrs.status === 'confirmed';
+  }
+  // quick_add/duplicate/mobile_app: unchanged from the original scope —
+  // still-open proposals only. A confirmed one of these never had an
+  // originating lead record to begin with, so there's no continuity gap
+  // to fix by importing it too.
+  return OPEN_PROPOSAL_STATUSES.includes(attrs.status);
+}
+
+// The status a newly-inserted row from this sync should start at. Real
+// won business (a converted lead whose event is already 'confirmed')
+// should read as 'Won', not 'Proposal Sent' — everything else keeps the
+// existing 'Proposal Sent' treatment.
+function initialStatusFor(attrs) {
+  return attrs.status === 'confirmed' ? 'Won' : 'Proposal Sent';
 }
 
 function mapCheckCherryProposalEvent(record) {
@@ -216,7 +246,7 @@ async function syncCheckCherryProposals() {
       if (!records.length) break;
       for (const record of records) {
         const attrs = (record && record.attributes) || {};
-        if (!isOpenProposalEvent(attrs)) continue;
+        if (!isRelevantProposalEvent(attrs)) continue;
         const lead = mapCheckCherryProposalEvent(record);
         // Unlike syncCheckCherry() above (which tolerates a name-only lead),
         // this path requires an email: findLead()/upsertLead() dedupe by
@@ -229,15 +259,30 @@ async function syncCheckCherryProposals() {
         // one does.
         if (!lead.email) continue;
 
-        // Stamp 'Proposal Sent' only the first time this contact is seen —
-        // once it's a row in the leads table, staff manage its status from
-        // /admin like any other lead. Re-passing 'Proposal Sent' on every
-        // sync cycle (this runs every 15 min) would silently stomp a
-        // manual status change (e.g. to "Contacted" or "Won") right back
-        // to "Proposal Sent" the next time it ran.
+        // Stamp the initial status only the first time this contact is
+        // seen — once it's a row in the leads table, staff manage its
+        // status from /admin like any other lead. Re-passing a status on
+        // every sync cycle (this runs every 15 min) would silently stomp
+        // a manual status change (e.g. to "Contacted") right back to
+        // whatever this sync would otherwise set it to.
+        //
+        // One deliberate exception: a convert_from_lead event reaching
+        // 'confirmed' whose row already exists here (captured earlier by
+        // syncCheckCherry() while the lead was still open, still sitting
+        // at the sync's own default of 'New' — nobody has manually
+        // triaged it) gets promoted to 'Won' rather than staying stuck at
+        // 'New' forever despite being real, confirmed business. Any other
+        // existing status — including a status a human actually set — is
+        // left untouched exactly as before.
         const target = computeTarget(lead);
         const existing = findLead(lead.email, target);
-        upsertLead({ ...lead, status: existing ? '' : 'Proposal Sent' });
+        let status = '';
+        if (!existing) {
+          status = initialStatusFor(attrs);
+        } else if (attrs.status === 'confirmed' && existing.status === 'New') {
+          status = 'Won';
+        }
+        upsertLead({ ...lead, status });
         total++;
       }
       if (records.length < 100) break;

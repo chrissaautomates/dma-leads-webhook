@@ -657,6 +657,29 @@ function renderAnalyticsTable(title, rowsData, previousYear, currentYear, subtit
   </div>`;
 }
 
+// The Lead Volume/Active Leads tables only ever show Jan-through-current-
+// month for previousYear/currentYear — a real chunk of CheckCherry's
+// historical data (proposals with a genuine creation date well before
+// 2025, or falling in previousYear after the cutoff month) never lands in
+// either window and would otherwise vanish from this tab silently. Counts
+// every target=CHECKCHERRY row NOT captured by that window — as the
+// complement of what's displayed, not a second hardcoded date range, so
+// this can't drift out of sync with the table above it (including the
+// edge case of a malformed/blank date_received, which computeMonthlyCounts()
+// already excludes from every bucket — that row wouldn't match either
+// window here either, so it still gets counted as "not shown above").
+// Verified against production on 2026-09-10: 75.
+function countCheckCherryOutsideWindow(leads, previousYear, currentYear, currentMonthIndex) {
+  const endMonth = String(currentMonthIndex + 1).padStart(2, '0');
+  const ccLeads = leads.filter((lead) => lead.target === 'CHECKCHERRY');
+  const inWindow = ccLeads.filter((lead) => {
+    const month = (lead.date_received || '').slice(0, 7);
+    return (month >= `${previousYear}-01` && month <= `${previousYear}-${endMonth}`)
+        || (month >= `${currentYear}-01` && month <= `${currentYear}-${endMonth}`);
+  }).length;
+  return ccLeads.length - inWindow;
+}
+
 // No lead list here, just aggregate counts — January through the current
 // month, this year vs. the same month last year (computed from the current
 // date, not hardcoded, so this doesn't need a manual edit every January).
@@ -681,6 +704,7 @@ function renderAnalyticsPage() {
     volumeRows.push({ month, yPrev: totals[keyPrev] || 0, yCurrent: totals[keyCurrent] || 0 });
     activeRows.push({ month, yPrev: active[keyPrev] || 0, yCurrent: active[keyCurrent] || 0 });
   }
+  const outsideWindowCount = countCheckCherryOutsideWindow(leads, previousYear, currentYear, currentMonthIndex);
 
   return `<!doctype html>
 <html>
@@ -697,6 +721,8 @@ function renderAnalyticsPage() {
   <p class="subtext">All leads across every tab (DMA, BuyAndRentRobots, CheckCherry, and Chat Lead combined), grouped by the month each lead was received. The current month is still in progress.</p>
 
   ${renderAnalyticsTable('Lead Volume by Month', volumeRows, previousYear, currentYear)}
+  <p class="subtext" style="margin: -10px 0 20px;">Plus ${outsideWindowCount} additional CheckCherry lead${outsideWindowCount === 1 ? '' : 's'} from outside the window shown above (before ${previousYear}, or after ${MONTH_NAMES[currentMonthIndex]} in either year), not included in the monthly breakdown.</p>
+
   ${renderAnalyticsTable('Active Leads by Month', activeRows, previousYear, currentYear, 'Leads not yet marked Proposal Sent, Won, or Lost.')}
 </body>
 </html>`;

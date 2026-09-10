@@ -19,7 +19,7 @@ db.pragma('journal_mode = WAL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    target TEXT NOT NULL DEFAULT 'DMA',      -- 'DMA', 'BARR' (BuyAndRentRobots), or 'CHECKCHERRY'
+    target TEXT NOT NULL DEFAULT 'DMA',      -- 'DMA', 'BARR' (BuyAndRentRobots), 'CHECKCHERRY', or 'CHATLEAD'
     date_received TEXT NOT NULL,
     source TEXT,
     name TEXT,
@@ -65,6 +65,44 @@ UTM_COLUMNS.forEach((col) => {
 // one-off script.
 db.exec(`UPDATE leads SET target = 'CHECKCHERRY' WHERE source = 'CheckCherry' AND target != 'CHECKCHERRY'`);
 
+// Same fixup, same reasoning, for GHL's Chat Lead rows: computeTarget()
+// below now routes source = 'Chat Lead' to 'CHATLEAD', so reclassify
+// anything already sitting on DMA/BARR from before that tab existed.
+// Scoped to source = 'Chat Lead' exactly, so CheckCherry/BuyAndRentRobots/
+// Meta Ads/Google Ads/Wix rows are untouched. Idempotent, runs harmlessly
+// on every boot.
+//
+// Also scoped to date_received >= 2026-01-01 — matching computeTarget()'s
+// own date check below and the CHATLEAD tab's own date-filtered display
+// query (listChatLeadLeads() in this file) — on purpose: that tab never
+// shows anything older, so a pre-2026 Chat Lead row migrated to CHATLEAD
+// would vanish from every /admin tab entirely (not DMA/BARR, since its
+// target changed away from them; not CHATLEAD, since the date filter
+// excludes it). Leaving older rows on DMA/BARR instead means they keep
+// showing up exactly where they always have.
+//
+// Logs before/after DMA/BARR/CHATLEAD counts so the migration is
+// verifiable straight from deploy logs, without needing a separate ad-hoc
+// query.
+const chatLeadMigrationBefore = {
+  DMA: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'DMA'`).get().n,
+  BARR: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'BARR'`).get().n,
+  CHATLEAD: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'CHATLEAD'`).get().n,
+};
+db.exec(`
+  UPDATE leads SET target = 'CHATLEAD'
+  WHERE source = 'Chat Lead' AND date_received >= '2026-01-01' AND target != 'CHATLEAD'
+`);
+const chatLeadMigrationAfter = {
+  DMA: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'DMA'`).get().n,
+  BARR: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'BARR'`).get().n,
+  CHATLEAD: db.prepare(`SELECT COUNT(*) n FROM leads WHERE target = 'CHATLEAD'`).get().n,
+};
+console.log(
+  'Chat Lead target migration — before:', JSON.stringify(chatLeadMigrationBefore),
+  'after:', JSON.stringify(chatLeadMigrationAfter)
+);
+
 const findByEmailAndTarget = db.prepare(
   `SELECT * FROM leads WHERE email = ? AND target = ? AND email != '' ORDER BY id DESC LIMIT 1`
 );
@@ -98,15 +136,30 @@ const updateLeadFields = db.prepare(`
 // Exposed so callers can compute the target a lead would land in before
 // they actually upsert it (e.g. to look up its current row first).
 //
-// CheckCherry gets its own tab: a source of exactly 'CheckCherry' routes
-// there regardless of what the interest text says, taking priority over
-// the DMA/BARR content-keyword check below. This is a source check, not a
-// broader pattern match, so GHL's 'Chat Lead' rows are unaffected and keep
-// routing to DMA/BARR by content same as before.
+// CheckCherry and GHL's Chat Lead each get their own tab: a source of
+// exactly 'CheckCherry' or 'Chat Lead' routes there regardless of what the
+// interest text says, taking priority over the DMA/BARR content-keyword
+// check below. These are exact source checks, not a broader pattern match,
+// so CheckCherry/BuyAndRentRobots/Meta Ads/Google Ads/Wix routing is
+// unaffected and keeps going by content same as before.
+//
+// The Chat Lead tab only ever displays date_received >= 2026-01-01 (see
+// listChatLeadLeads() below), so that check is gated the same way here:
+// an older Chat Lead row keeps routing to DMA/BARR by content instead of
+// CHATLEAD, where it would otherwise vanish from every /admin tab (not
+// DMA/BARR, since it's no longer their target; not CHATLEAD, since its
+// date filter would exclude it). In practice every real Chat Lead synced
+// so far is well within 2026, so this only matters for a manually-added
+// or backdated one.
 function computeTarget(data) {
-  if ((data.source || '') === 'CheckCherry') return 'CHECKCHERRY';
+  const source = data.source || '';
+  if (source === 'CheckCherry') return 'CHECKCHERRY';
+  if (source === 'Chat Lead') {
+    const dateReceived = data.dateReceived || new Date().toISOString().slice(0, 10);
+    if (dateReceived >= '2026-01-01') return 'CHATLEAD';
+  }
   return /humanoid|robot rental|buyandrentrobots/i.test(
-    (data.source || '') + ' ' + (data.interest || '')
+    source + ' ' + (data.interest || '')
   ) ? 'BARR' : 'DMA';
 }
 
@@ -183,6 +236,17 @@ function listLeads(target) {
   return db.prepare(`SELECT * FROM leads ORDER BY id DESC`).all();
 }
 
+// Powers the /admin GHL tab: unlike DMA/BARR/CheckCherry (which show every
+// row for their target regardless of date), this tab is explicitly scoped
+// to dateReceived >= 2026-01-01 — anything older is left off. Queries by
+// source rather than target so it stays correct even if some historical
+// Chat Lead row's target were ever out of sync with its source.
+function listChatLeadLeads() {
+  return db.prepare(
+    `SELECT * FROM leads WHERE source = 'Chat Lead' AND date_received >= '2026-01-01' ORDER BY id DESC`
+  ).all();
+}
+
 function getLead(id) {
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
 }
@@ -237,6 +301,7 @@ module.exports = {
   findLead,
   computeTarget,
   listLeads,
+  listChatLeadLeads,
   getLead,
   updateLeadFromAdmin,
   addLeadFromAdmin,

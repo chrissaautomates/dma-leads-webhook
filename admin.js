@@ -6,7 +6,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
+const { listLeads, listChatLeadLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -118,11 +118,11 @@ const SOURCE_CLASSES = {
   'Google Ads': 'source-googleads',
   'BuyAndRentRobots Website': 'source-barr',
 };
-// DMA/BARR tabs only: CheckCherry now always routes to its own tab (see
-// computeTarget()'s source-based override in db.js), so it can never show
-// up on DMA/BARR anymore — omit it here instead of the tiles always
-// showing a permanent "CheckCherry: 0".
-const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES).filter((s) => s !== 'CheckCherry');
+// DMA/BARR tabs only: CheckCherry and Chat Lead now always route to their
+// own tabs (see computeTarget()'s source-based overrides in db.js), so
+// neither can show up on DMA/BARR anymore — omit both here instead of the
+// tiles always showing a permanent "CheckCherry: 0" / "Chat Lead: 0".
+const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES).filter((s) => s !== 'CheckCherry' && s !== 'Chat Lead');
 
 function statusClass(status) {
   return STATUS_CLASSES[status] || 'status-other';
@@ -281,11 +281,11 @@ function renderRow(lead, rowNumber, returnView) {
     </tr>`;
 }
 
-// Tabs shown in the /admin nav, in order. DMA/BARR/CHECKCHERRY are real
-// `target` values leads are stored under (see computeTarget() in db.js);
-// ANALYTICS is a pseudo-tab — renderAnalyticsPage() below has no
+// Tabs shown in the /admin nav, in order. DMA/BARR/CHECKCHERRY/CHATLEAD are
+// real `target` values leads are stored under (see computeTarget() in
+// db.js); ANALYTICS is a pseudo-tab — renderAnalyticsPage() below has no
 // corresponding leads at all, just aggregate counts.
-const TAB_LABELS = { DMA: 'DMA Leads', BARR: 'BuyAndRentRobots Leads', CHECKCHERRY: 'CheckCherry', ANALYTICS: 'Analytics' };
+const TAB_LABELS = { DMA: 'DMA Leads', BARR: 'BuyAndRentRobots Leads', CHECKCHERRY: 'CheckCherry', CHATLEAD: 'Chat Lead', ANALYTICS: 'Analytics' };
 
 // Shared by renderPage() and renderAnalyticsPage() so every tab gets the
 // same nav bar. The CSV export only makes sense for an actual leads list,
@@ -403,16 +403,17 @@ const PAGE_STYLES = `
   .pct-flat { background-color: #e5e7eb; color: #4b5563; }
 `;
 
+// Tabs that are single-source by construction (see computeTarget()'s
+// source-based overrides in db.js) — every row on them is already synced
+// from that one integration, so the manual-add form and the per-source
+// summary tiles (which would just show one redundant tile matching the
+// total) are both skipped, same as CheckCherry started doing.
+const SINGLE_SOURCE_TABS = ['CHECKCHERRY', 'CHATLEAD'];
+
 function renderPage(target, leads) {
   const rows = leads.map((lead, i) => renderRow(lead, i + 1, target)).join('\n');
-  // CheckCherry leads are entirely synced from the API — the manual-add
-  // form (phone-in/walk-up leads) doesn't belong on that tab, same
-  // reasoning the old Email List tab used.
-  const showAddForm = target !== 'CHECKCHERRY';
-  // CheckCherry's tab is single-source by construction (see
-  // computeTarget()'s override in db.js) — skip the source-tiles section
-  // entirely there rather than show a redundant one-tile breakdown.
-  const summarySourceOrder = target === 'CHECKCHERRY' ? null : SUMMARY_SOURCE_ORDER;
+  const showAddForm = !SINGLE_SOURCE_TABS.includes(target);
+  const summarySourceOrder = SINGLE_SOURCE_TABS.includes(target) ? null : SUMMARY_SOURCE_ORDER;
 
   return `<!doctype html>
 <html>
@@ -693,7 +694,7 @@ function renderAnalyticsPage() {
 
   ${renderTabsNav('ANALYTICS')}
 
-  <p class="subtext">All leads across every tab (DMA, BuyAndRentRobots, and CheckCherry combined), grouped by the month each lead was received. The current month is still in progress.</p>
+  <p class="subtext">All leads across every tab (DMA, BuyAndRentRobots, CheckCherry, and Chat Lead combined), grouped by the month each lead was received. The current month is still in progress.</p>
 
   ${renderAnalyticsTable('Lead Volume by Month', volumeRows, previousYear, currentYear)}
   ${renderAnalyticsTable('Active Leads by Month', activeRows, previousYear, currentYear, 'Leads not yet marked Proposal Sent, Won, or Lost.')}
@@ -708,21 +709,31 @@ function resolveView(value) {
   return Object.keys(TAB_LABELS).includes(value) ? value : 'DMA';
 }
 
+// The Chat Lead tab is the one lead-list tab with its own query (date-
+// filtered — see listChatLeadLeads() in db.js) rather than a plain
+// listLeads(target); centralized here so the page route and CSV export
+// route can't drift apart on which tab uses which.
+function leadsForTab(target) {
+  return target === 'CHATLEAD' ? listChatLeadLeads() : listLeads(target);
+}
+
 router.get('/', (req, res) => {
   const target = resolveView(req.query.target);
   if (target === 'ANALYTICS') {
     return res.type('html').send(renderAnalyticsPage());
   }
-  res.type('html').send(renderPage(target, listLeads(target)));
+  res.type('html').send(renderPage(target, leadsForTab(target)));
 });
 
 // Both routes redirect back to whichever tab the edit was made from
 // (return_view, a hidden field on each row's form) rather than always the
 // lead's own target. Every lead-list tab's target now equals a real,
-// resolveView()-valid tab (DMA/BARR/CHECKCHERRY), so in practice this
-// already agrees with lead.target — return_view is what future-proofs
-// that (e.g. a tab that, like the old Email List one, shows leads that
-// don't all share one real target).
+// resolveView()-valid tab (DMA/BARR/CHECKCHERRY/CHATLEAD), so in practice
+// this already agrees with lead.target — computeTarget() only ever assigns
+// CHATLEAD to a row that also passes listChatLeadLeads()'s own date filter
+// (see db.js), so that agreement holds for CHATLEAD too. return_view is
+// what future-proofs this generally (e.g. a tab that, like the old Email
+// List one, shows leads that don't all share one real target).
 router.post('/update/:id', (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send('Lead not found');
@@ -750,7 +761,7 @@ router.post('/add', (req, res) => {
 
 router.get('/export.csv', (req, res) => {
   const target = resolveView(req.query.target);
-  const leads = target === 'ANALYTICS' ? [] : listLeads(target);
+  const leads = target === 'ANALYTICS' ? [] : leadsForTab(target);
   const cols = ['id', 'date_received', 'source', 'name', 'company', 'email', 'phone', 'location', 'interest', 'status', 'owner', 'notes', 'next_follow_up', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
   const csvEscape = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
   const lines = [cols.join(',')].concat(

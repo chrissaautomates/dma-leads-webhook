@@ -46,6 +46,14 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
   }
 }
 
+// Every status mapCheckCherryLead() below can produce entirely on its own,
+// driven purely by CheckCherry's own boolean flags — never a human's
+// manual triage from /admin. Referenced by syncCheckCherryProposals()'s
+// convert_from_lead 'Won' promotion: a row still sitting at any of these
+// hasn't been touched by a person yet, so it's safe to promote; anything
+// else means someone already took it over, and is left alone.
+const SYNC_ONLY_STATUSES = ['New', 'Converted', 'Spam', 'Archived'];
+
 // CheckCherry wraps each lead as { id, type, attributes: {...} } (JSON:API
 // style) — the real fields live under attributes, not on the record itself.
 // Falls back to the record itself in case the shape ever comes back flat.
@@ -267,19 +275,22 @@ async function syncCheckCherryProposals() {
         // whatever this sync would otherwise set it to.
         //
         // One deliberate exception: a convert_from_lead event reaching
-        // 'confirmed' whose row already exists here (captured earlier by
-        // syncCheckCherry() while the lead was still open, still sitting
-        // at the sync's own default of 'New' — nobody has manually
-        // triaged it) gets promoted to 'Won' rather than staying stuck at
-        // 'New' forever despite being real, confirmed business. Any other
-        // existing status — including a status a human actually set — is
-        // left untouched exactly as before.
+        // 'confirmed' whose row already exists here gets promoted to
+        // 'Won' — but only if its current status is one mapCheckCherryLead()
+        // could have set entirely on its own (see SYNC_ONLY_STATUSES),
+        // never a status a human actually chose. Without this, a lead
+        // captured while e.g. converted_to_event was already true (so
+        // mapCheckCherryLead() stamped it 'Converted', not 'New') would
+        // fail the original New-only check and stay stuck at 'Converted'
+        // forever even once really confirmed/won — silently defeating the
+        // whole point of this promotion for exactly the rows it's
+        // supposed to help.
         const target = computeTarget(lead);
         const existing = findLead(lead.email, target);
         let status = '';
         if (!existing) {
           status = initialStatusFor(attrs);
-        } else if (attrs.status === 'confirmed' && existing.status === 'New') {
+        } else if (attrs.status === 'confirmed' && SYNC_ONLY_STATUSES.includes(existing.status)) {
           status = 'Won';
         }
         upsertLead({ ...lead, status });

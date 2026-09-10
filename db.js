@@ -165,6 +165,17 @@ function listLeads(target) {
   return db.prepare(`SELECT * FROM leads ORDER BY id DESC`).all();
 }
 
+// Powers the /admin "Email List" tab: every CheckCherry or Chat Lead row
+// received on/after 2026-01-01, across both DMA and BARR targets. Plain
+// WHERE + no GROUP BY on purpose — this must show every matching row as-is,
+// never collapsing rows that happen to share an email across the two
+// sources.
+function listEmailListLeads() {
+  return db.prepare(
+    `SELECT * FROM leads WHERE source IN ('CheckCherry', 'Chat Lead') AND date_received >= '2026-01-01' ORDER BY id DESC`
+  ).all();
+}
+
 function getLead(id) {
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
 }
@@ -219,6 +230,7 @@ module.exports = {
   findLead,
   computeTarget,
   listLeads,
+  listEmailListLeads,
   getLead,
   updateLeadFromAdmin,
   addLeadFromAdmin,

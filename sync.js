@@ -511,9 +511,7 @@ async function syncCsvSheet(envVar, sourceName) {
 async function runFullSync() {
   console.log('runFullSync: starting');
   await Promise.allSettled([
-    // CheckCherry removed from the dashboard (leads deleted, sync disabled).
-    // syncCheckCherry() is left in place unused in case this needs to come
-    // back later.
+    syncCheckCherry(),
     syncGHL(),
     syncCsvSheet('META_ADS_CSV_URL', 'Meta Ads'),
     syncCsvSheet('GOOGLE_ADS_CSV_URL', 'Google Ads'),

@@ -6,7 +6,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
+const { listLeads, listEmailListLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -120,6 +120,12 @@ const SOURCE_CLASSES = {
 };
 const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES);
 
+// The Email List tab only ever contains these two sources (see
+// listEmailListLeads()'s WHERE clause in db.js) — its summary bar restricts
+// the per-source tiles to just these, in this order, instead of the full
+// SUMMARY_SOURCE_ORDER used by the DMA/BARR tabs.
+const EMAIL_LIST_SOURCE_ORDER = ['CheckCherry', 'Chat Lead'];
+
 function statusClass(status) {
   return STATUS_CLASSES[status] || 'status-other';
 }
@@ -134,7 +140,7 @@ function sourceClass(source) {
   return 'source-other';
 }
 
-function computeSummary(leads) {
+function computeSummary(leads, sourceOrder) {
   const statusCounts = {};
   const sourceCounts = {};
   let otherStatusCount = 0;
@@ -150,7 +156,7 @@ function computeSummary(leads) {
     }
 
     const source = lead.source || '';
-    if (SUMMARY_SOURCE_ORDER.includes(source)) {
+    if (sourceOrder.includes(source)) {
       sourceCounts[source] = (sourceCounts[source] || 0) + 1;
     } else if (/^manual/i.test(source)) {
       manualSourceCount += 1;
@@ -166,15 +172,16 @@ function statTile(count, label, extraClass) {
   return `<div class="stat-tile ${extraClass || ''}"><div class="stat-value">${count}</div><div class="stat-label">${esc(label)}</div></div>`;
 }
 
-function renderSummaryBar(leads) {
-  const { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount } = computeSummary(leads);
+function renderSummaryBar(leads, sourceOrder) {
+  sourceOrder = sourceOrder || SUMMARY_SOURCE_ORDER;
+  const { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount } = computeSummary(leads, sourceOrder);
 
   const statusTiles = SUMMARY_STATUS_ORDER
     .map((s) => statTile(statusCounts[s] || 0, s, statusClass(s)))
     .join('');
   const otherStatusTile = otherStatusCount > 0 ? statTile(otherStatusCount, 'Other', 'status-other') : '';
 
-  const sourceTiles = SUMMARY_SOURCE_ORDER
+  const sourceTiles = sourceOrder
     .map((s) => statTile(sourceCounts[s] || 0, s, sourceClass(s)))
     .join('');
   const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual', 'source-manual') : '';
@@ -220,7 +227,7 @@ function renderLeadOrigin(lead) {
   return parts.join('');
 }
 
-function renderRow(lead, rowNumber) {
+function renderRow(lead, rowNumber, returnView) {
   const options = STATUS_OPTIONS.map(
     (s) => `<option value="${esc(s)}" ${s === lead.status ? 'selected' : ''}>${esc(s)}</option>`
   ).join('');
@@ -237,6 +244,7 @@ function renderRow(lead, rowNumber) {
   return `
     <tr data-search="${searchKey}" data-date="${esc(lead.date_received)}" data-status="${esc(lead.status)}">
       <form method="POST" action="/admin/update/${lead.id}">
+        <input type="hidden" name="return_view" value="${esc(returnView)}">
         <td class="row-num">${rowNumber}</td>
         <td>${esc(lead.date_received)}</td>
         <td><span class="source-pill ${sourceClass(lead.source)}">${esc(lead.source)}</span></td>
@@ -266,14 +274,21 @@ function renderRow(lead, rowNumber) {
     </tr>`;
 }
 
+const TAB_LABELS = { DMA: 'DMA Leads', BARR: 'BuyAndRentRobots Leads', EMAIL: 'Email List' };
+
 function renderPage(target, leads) {
-  const tabs = ['DMA', 'BARR'].map((t) => {
-    const label = t === 'DMA' ? 'DMA Leads' : 'BuyAndRentRobots Leads';
+  const tabs = Object.keys(TAB_LABELS).map((t) => {
     const active = t === target ? ' active' : '';
-    return `<a class="tab${active}" href="/admin?target=${t}">${label}</a>`;
+    return `<a class="tab${active}" href="/admin?target=${t}">${TAB_LABELS[t]}</a>`;
   }).join('');
 
-  const rows = leads.map((lead, i) => renderRow(lead, i + 1)).join('\n');
+  const rows = leads.map((lead, i) => renderRow(lead, i + 1, target)).join('\n');
+  // Email List is a cross-source, cross-target view — it isn't itself a
+  // valid `target` a manually-added lead could be filed under (the
+  // underlying leads table only knows DMA/BARR), so the manual-add form
+  // (which needs a real target to file the new lead into) doesn't apply here.
+  const showAddForm = target !== 'EMAIL';
+  const summarySourceOrder = target === 'EMAIL' ? EMAIL_LIST_SOURCE_ORDER : SUMMARY_SOURCE_ORDER;
 
   return `<!doctype html>
 <html>
@@ -378,8 +393,9 @@ function renderPage(target, leads) {
     <a class="export-link" href="/admin/export.csv?target=${target}">Export CSV</a>
   </div>
 
-  ${renderSummaryBar(leads)}
+  ${renderSummaryBar(leads, summarySourceOrder)}
 
+  ${showAddForm ? `
   <details class="addform">
     <summary>Add a lead manually (phone-in, walk-up, etc.)</summary>
     <form method="POST" action="/admin/add">
@@ -396,7 +412,7 @@ function renderPage(target, leads) {
       </div>
       <button type="submit" class="save-btn">Add lead</button>
     </form>
-  </details>
+  </details>` : ''}
 
   <div class="toolbar">
     <input type="text" id="searchBox" class="search-box" placeholder="Search name, email, company…">
@@ -536,12 +552,24 @@ function renderPage(target, leads) {
 </html>`;
 }
 
+// Resolves the `target` query/body param to one of the three tabs this
+// admin page knows about — anything else (missing, stray value) falls back
+// to DMA, same as before EMAIL existed.
+function resolveView(value) {
+  return ['DMA', 'BARR', 'EMAIL'].includes(value) ? value : 'DMA';
+}
+
 router.get('/', (req, res) => {
-  const target = req.query.target === 'BARR' ? 'BARR' : 'DMA';
-  const leads = listLeads(target);
+  const target = resolveView(req.query.target);
+  const leads = target === 'EMAIL' ? listEmailListLeads() : listLeads(target);
   res.type('html').send(renderPage(target, leads));
 });
 
+// Both routes redirect back to whichever tab the edit was made from
+// (return_view, a hidden field on each row's form) rather than always the
+// lead's own DMA/BARR target — otherwise saving/deleting a row from the
+// Email List tab would silently kick you back to the DMA tab, since a
+// CheckCherry/Chat Lead row's real `target` is DMA or BARR, never EMAIL.
 router.post('/update/:id', (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send('Lead not found');
@@ -551,14 +579,14 @@ router.post('/update/:id', (req, res) => {
     notes: req.body.notes || '',
     next_follow_up: req.body.next_follow_up || '',
   });
-  res.redirect('/admin?target=' + lead.target);
+  res.redirect('/admin?target=' + resolveView(req.body.return_view || lead.target));
 });
 
 router.post('/delete/:id', (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send('Lead not found');
   deleteLead(req.params.id);
-  res.redirect('/admin?target=' + lead.target);
+  res.redirect('/admin?target=' + resolveView(req.body.return_view || lead.target));
 });
 
 router.post('/add', (req, res) => {
@@ -568,8 +596,8 @@ router.post('/add', (req, res) => {
 });
 
 router.get('/export.csv', (req, res) => {
-  const target = req.query.target === 'BARR' ? 'BARR' : 'DMA';
-  const leads = listLeads(target);
+  const target = resolveView(req.query.target);
+  const leads = target === 'EMAIL' ? listEmailListLeads() : listLeads(target);
   const cols = ['id', 'date_received', 'source', 'name', 'company', 'email', 'phone', 'location', 'interest', 'status', 'owner', 'notes', 'next_follow_up', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
   const csvEscape = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
   const lines = [cols.join(',')].concat(

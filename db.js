@@ -19,7 +19,7 @@ db.pragma('journal_mode = WAL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    target TEXT NOT NULL DEFAULT 'DMA',      -- 'DMA' or 'BARR' (BuyAndRentRobots)
+    target TEXT NOT NULL DEFAULT 'DMA',      -- 'DMA', 'BARR' (BuyAndRentRobots), or 'CHECKCHERRY'
     date_received TEXT NOT NULL,
     source TEXT,
     name TEXT,
@@ -53,6 +53,18 @@ UTM_COLUMNS.forEach((col) => {
   }
 });
 
+// One-time fixup: rows synced before CheckCherry got its own tab were
+// routed to DMA/BARR by content keywords alone (the only rule that existed
+// at the time), even though their source is 'CheckCherry'. computeTarget()
+// below now routes any CheckCherry-sourced lead to 'CHECKCHERRY' regardless
+// of content — reclassify whatever's already in the table so it actually
+// shows up on the new tab instead of silently staying put forever. Scoped
+// to source = 'CheckCherry' exactly, so GHL's 'Chat Lead' rows are
+// untouched. Idempotent (only touches rows not already CHECKCHERRY), so
+// this runs harmlessly on every boot rather than needing a separate
+// one-off script.
+db.exec(`UPDATE leads SET target = 'CHECKCHERRY' WHERE source = 'CheckCherry' AND target != 'CHECKCHERRY'`);
+
 const findByEmailAndTarget = db.prepare(
   `SELECT * FROM leads WHERE email = ? AND target = ? AND email != '' ORDER BY id DESC LIMIT 1`
 );
@@ -83,10 +95,16 @@ const updateLeadFields = db.prepare(`
   WHERE id = @id
 `);
 
-// Same DMA vs. BuyAndRentRobots routing upsertLead() has always used,
-// exposed so callers can compute the target a lead would land in before
+// Exposed so callers can compute the target a lead would land in before
 // they actually upsert it (e.g. to look up its current row first).
+//
+// CheckCherry gets its own tab: a source of exactly 'CheckCherry' routes
+// there regardless of what the interest text says, taking priority over
+// the DMA/BARR content-keyword check below. This is a source check, not a
+// broader pattern match, so GHL's 'Chat Lead' rows are unaffected and keep
+// routing to DMA/BARR by content same as before.
 function computeTarget(data) {
+  if ((data.source || '') === 'CheckCherry') return 'CHECKCHERRY';
   return /humanoid|robot rental|buyandrentrobots/i.test(
     (data.source || '') + ' ' + (data.interest || '')
   ) ? 'BARR' : 'DMA';
@@ -165,17 +183,6 @@ function listLeads(target) {
   return db.prepare(`SELECT * FROM leads ORDER BY id DESC`).all();
 }
 
-// Powers the /admin "Email List" tab: every CheckCherry or Chat Lead row
-// received on/after 2026-01-01, across both DMA and BARR targets. Plain
-// WHERE + no GROUP BY on purpose — this must show every matching row as-is,
-// never collapsing rows that happen to share an email across the two
-// sources.
-function listEmailListLeads() {
-  return db.prepare(
-    `SELECT * FROM leads WHERE source IN ('CheckCherry', 'Chat Lead') AND date_received >= '2026-01-01' ORDER BY id DESC`
-  ).all();
-}
-
 function getLead(id) {
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id);
 }
@@ -230,7 +237,6 @@ module.exports = {
   findLead,
   computeTarget,
   listLeads,
-  listEmailListLeads,
   getLead,
   updateLeadFromAdmin,
   addLeadFromAdmin,

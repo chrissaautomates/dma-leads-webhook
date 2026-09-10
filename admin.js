@@ -6,7 +6,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, listEmailListLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
+const { listLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -118,13 +118,11 @@ const SOURCE_CLASSES = {
   'Google Ads': 'source-googleads',
   'BuyAndRentRobots Website': 'source-barr',
 };
-const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES);
-
-// The Email List tab only ever contains these two sources (see
-// listEmailListLeads()'s WHERE clause in db.js) — its summary bar restricts
-// the per-source tiles to just these, in this order, instead of the full
-// SUMMARY_SOURCE_ORDER used by the DMA/BARR tabs.
-const EMAIL_LIST_SOURCE_ORDER = ['CheckCherry', 'Chat Lead'];
+// DMA/BARR tabs only: CheckCherry now always routes to its own tab (see
+// computeTarget()'s source-based override in db.js), so it can never show
+// up on DMA/BARR anymore — omit it here instead of the tiles always
+// showing a permanent "CheckCherry: 0".
+const SUMMARY_SOURCE_ORDER = Object.keys(SOURCE_CLASSES).filter((s) => s !== 'CheckCherry');
 
 function statusClass(status) {
   return STATUS_CLASSES[status] || 'status-other';
@@ -172,28 +170,37 @@ function statTile(count, label, extraClass) {
   return `<div class="stat-tile ${extraClass || ''}"><div class="stat-value">${count}</div><div class="stat-label">${esc(label)}</div></div>`;
 }
 
+// sourceOrder is one of three things: undefined (use the default
+// DMA/BARR source list), an array (restrict the per-source tiles to just
+// those sources), or null (skip the source-tiles section entirely — used
+// by the CheckCherry tab, where every lead is already the same source, so
+// a source breakdown would be redundant with the total).
 function renderSummaryBar(leads, sourceOrder) {
-  sourceOrder = sourceOrder || SUMMARY_SOURCE_ORDER;
-  const { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount } = computeSummary(leads, sourceOrder);
+  if (sourceOrder === undefined) sourceOrder = SUMMARY_SOURCE_ORDER;
+  const { statusCounts, otherStatusCount, sourceCounts, manualSourceCount, otherSourceCount } =
+    computeSummary(leads, sourceOrder || []);
 
   const statusTiles = SUMMARY_STATUS_ORDER
     .map((s) => statTile(statusCounts[s] || 0, s, statusClass(s)))
     .join('');
   const otherStatusTile = otherStatusCount > 0 ? statTile(otherStatusCount, 'Other', 'status-other') : '';
 
-  const sourceTiles = sourceOrder
-    .map((s) => statTile(sourceCounts[s] || 0, s, sourceClass(s)))
-    .join('');
-  const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual', 'source-manual') : '';
-  const otherSourceTile = otherSourceCount > 0 ? statTile(otherSourceCount, 'Other', 'source-other') : '';
+  let sourceSection = '';
+  if (sourceOrder) {
+    const sourceTiles = sourceOrder
+      .map((s) => statTile(sourceCounts[s] || 0, s, sourceClass(s)))
+      .join('');
+    const manualTile = manualSourceCount > 0 ? statTile(manualSourceCount, 'Manual', 'source-manual') : '';
+    const otherSourceTile = otherSourceCount > 0 ? statTile(otherSourceCount, 'Other', 'source-other') : '';
+    sourceSection = `<div class="stat-divider"></div>${sourceTiles}${manualTile}${otherSourceTile}`;
+  }
 
   return `
     <div class="summary-bar">
       ${statTile(leads.length, 'Total Leads', 'stat-total')}
       <div class="stat-divider"></div>
       ${statusTiles}${otherStatusTile}
-      <div class="stat-divider"></div>
-      ${sourceTiles}${manualTile}${otherSourceTile}
+      ${sourceSection}
     </div>`;
 }
 
@@ -274,28 +281,31 @@ function renderRow(lead, rowNumber, returnView) {
     </tr>`;
 }
 
-const TAB_LABELS = { DMA: 'DMA Leads', BARR: 'BuyAndRentRobots Leads', EMAIL: 'Email List' };
+// Tabs shown in the /admin nav, in order. DMA/BARR/CHECKCHERRY are real
+// `target` values leads are stored under (see computeTarget() in db.js);
+// ANALYTICS is a pseudo-tab — renderAnalyticsPage() below has no
+// corresponding leads at all, just aggregate counts.
+const TAB_LABELS = { DMA: 'DMA Leads', BARR: 'BuyAndRentRobots Leads', CHECKCHERRY: 'CheckCherry', ANALYTICS: 'Analytics' };
 
-function renderPage(target, leads) {
+// Shared by renderPage() and renderAnalyticsPage() so every tab gets the
+// same nav bar. The CSV export only makes sense for an actual leads list,
+// so it's omitted on the Analytics tab.
+function renderTabsNav(target) {
   const tabs = Object.keys(TAB_LABELS).map((t) => {
     const active = t === target ? ' active' : '';
     return `<a class="tab${active}" href="/admin?target=${t}">${TAB_LABELS[t]}</a>`;
   }).join('');
+  const exportLink = target === 'ANALYTICS'
+    ? ''
+    : `<a class="export-link" href="/admin/export.csv?target=${target}">Export CSV</a>`;
+  return `<div class="tabs">${tabs}${exportLink}</div>`;
+}
 
-  const rows = leads.map((lead, i) => renderRow(lead, i + 1, target)).join('\n');
-  // Email List is a cross-source, cross-target view — it isn't itself a
-  // valid `target` a manually-added lead could be filed under (the
-  // underlying leads table only knows DMA/BARR), so the manual-add form
-  // (which needs a real target to file the new lead into) doesn't apply here.
-  const showAddForm = target !== 'EMAIL';
-  const summarySourceOrder = target === 'EMAIL' ? EMAIL_LIST_SOURCE_ORDER : SUMMARY_SOURCE_ORDER;
-
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>DMA Leads Admin</title>
-<style>
+// Shared <style> body — both renderPage() (DMA/BARR/CheckCherry) and
+// renderAnalyticsPage() wrap this in their own <style> tag, so page layout,
+// tabs, table, and pill/badge colors stay visually identical across every
+// tab without duplicating the CSS.
+const PAGE_STYLES = `
   :root {
     --bg: #eef1f8;
     --card: #ffffff;
@@ -383,15 +393,38 @@ function renderPage(target, leads) {
   .notes-controls { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
   .notes-controls .toggle-clamp { padding: 0; }
   .notes-edit-toggle { background: none; border: none; padding: 0; color: var(--accent); font-size: 11.5px; font-weight: 600; }
-</style>
+
+  .analytics-section { margin-bottom: 24px; }
+  .analytics-section h2 { font-size: 15px; margin: 0 0 4px; }
+  .analytics-section .subtext { display: block; margin-bottom: 10px; }
+  .pct-badge { display: inline-flex; align-items: center; gap: 3px; padding: 3px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 700; white-space: nowrap; }
+  .pct-up { background-color: #dcfce7; color: #166534; }
+  .pct-down { background-color: #fee2e2; color: #991b1b; }
+  .pct-flat { background-color: #e5e7eb; color: #4b5563; }
+`;
+
+function renderPage(target, leads) {
+  const rows = leads.map((lead, i) => renderRow(lead, i + 1, target)).join('\n');
+  // CheckCherry leads are entirely synced from the API — the manual-add
+  // form (phone-in/walk-up leads) doesn't belong on that tab, same
+  // reasoning the old Email List tab used.
+  const showAddForm = target !== 'CHECKCHERRY';
+  // CheckCherry's tab is single-source by construction (see
+  // computeTarget()'s override in db.js) — skip the source-tiles section
+  // entirely there rather than show a redundant one-tile breakdown.
+  const summarySourceOrder = target === 'CHECKCHERRY' ? null : SUMMARY_SOURCE_ORDER;
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DMA Leads Admin</title>
+<style>${PAGE_STYLES}</style>
 </head>
 <body>
   <h1>DMA &amp; BuyAndRentRobots — Leads Admin</h1>
 
-  <div class="tabs">
-    ${tabs}
-    <a class="export-link" href="/admin/export.csv?target=${target}">Export CSV</a>
-  </div>
+  ${renderTabsNav(target)}
 
   ${renderSummaryBar(leads, summarySourceOrder)}
 
@@ -552,24 +585,144 @@ function renderPage(target, leads) {
 </html>`;
 }
 
-// Resolves the `target` query/body param to one of the three tabs this
-// admin page knows about — anything else (missing, stray value) falls back
-// to DMA, same as before EMAIL existed.
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+// "Active" = not yet dispositioned one way or the other. Matches the
+// Analytics tab's brief exactly: everything except these three counts as
+// active (New, Contacted, Negotiating, NEEDS DETAILS, and any stray custom
+// status).
+const ACTIVE_EXCLUDED_STATUSES = ['Proposal Sent', 'Won', 'Lost'];
+
+// Buckets every lead by the 'YYYY-MM' of its date_received, across all
+// targets/sources — the Analytics tab's brief is explicitly "all leads in
+// the database (all sources combined)". Returns two parallel maps so a
+// single pass over the leads list produces both the Lead Volume and Active
+// Leads tables.
+function computeMonthlyCounts(leads) {
+  const totals = {};
+  const active = {};
+  leads.forEach((lead) => {
+    const month = (lead.date_received || '').slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return; // malformed/blank date — don't let it skew a bucket
+    totals[month] = (totals[month] || 0) + 1;
+    if (!ACTIVE_EXCLUDED_STATUSES.includes(lead.status)) {
+      active[month] = (active[month] || 0) + 1;
+    }
+  });
+  return { totals, active };
+}
+
+// current vs. previous is 2026 vs. 2025 for a given month. previous = 0 has
+// no meaningful percent change (division by zero) — shown as "New" if 2026
+// actually has leads, or a flat dash if both years are empty, rather than
+// a misleading 0%/Infinity%.
+function renderPctBadge(current, previous) {
+  if (!previous) {
+    return current > 0
+      ? '<span class="pct-badge pct-up">New</span>'
+      : '<span class="pct-badge pct-flat">&mdash;</span>';
+  }
+  const pct = Math.round(((current - previous) / previous) * 1000) / 10; // one decimal place
+  if (pct === 0) return '<span class="pct-badge pct-flat">0%</span>';
+  const cls = pct > 0 ? 'pct-up' : 'pct-down';
+  const arrow = pct > 0 ? '▲' : '▼';
+  return `<span class="pct-badge ${cls}">${arrow} ${Math.abs(pct)}%</span>`;
+}
+
+function renderAnalyticsTable(title, rowsData, previousYear, currentYear, subtitle) {
+  const rows = rowsData.map((r) => `
+        <tr>
+          <td>${esc(r.month)}</td>
+          <td>${r.yPrev}</td>
+          <td>${r.yCurrent}</td>
+          <td>${renderPctBadge(r.yCurrent, r.yPrev)}</td>
+        </tr>`).join('');
+
+  return `
+  <div class="analytics-section">
+    <h2>${esc(title)}</h2>
+    ${subtitle ? `<span class="subtext">${esc(subtitle)}</span>` : ''}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Month</th><th>${previousYear}</th><th>${currentYear}</th><th>Change</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// No lead list here, just aggregate counts — January through the current
+// month, this year vs. the same month last year (computed from the current
+// date, not hardcoded, so this doesn't need a manual edit every January).
+// Scoped to every lead in the database (all sources/tabs combined), per
+// the brief; see the commit message / report for the flagged ambiguity on
+// whether this should instead be CheckCherry-only.
+function renderAnalyticsPage() {
+  const leads = listLeads(); // no target arg -> every lead, every source
+  const { totals, active } = computeMonthlyCounts(leads);
+
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
+  const previousYear = currentYear - 1;
+  const currentMonthIndex = now.getUTCMonth(); // 0 = January
+  const volumeRows = [];
+  const activeRows = [];
+  for (let m = 0; m <= currentMonthIndex; m++) {
+    const mm = String(m + 1).padStart(2, '0');
+    const keyPrev = `${previousYear}-${mm}`;
+    const keyCurrent = `${currentYear}-${mm}`;
+    const month = MONTH_NAMES[m] + (m === currentMonthIndex ? ' (partial)' : '');
+    volumeRows.push({ month, yPrev: totals[keyPrev] || 0, yCurrent: totals[keyCurrent] || 0 });
+    activeRows.push({ month, yPrev: active[keyPrev] || 0, yCurrent: active[keyCurrent] || 0 });
+  }
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DMA Leads Admin</title>
+<style>${PAGE_STYLES}</style>
+</head>
+<body>
+  <h1>DMA &amp; BuyAndRentRobots — Leads Admin</h1>
+
+  ${renderTabsNav('ANALYTICS')}
+
+  <p class="subtext">All leads across every tab (DMA, BuyAndRentRobots, and CheckCherry combined), grouped by the month each lead was received. The current month is still in progress.</p>
+
+  ${renderAnalyticsTable('Lead Volume by Month', volumeRows, previousYear, currentYear)}
+  ${renderAnalyticsTable('Active Leads by Month', activeRows, previousYear, currentYear, 'Leads not yet marked Proposal Sent, Won, or Lost.')}
+</body>
+</html>`;
+}
+
+// Resolves the `target` query/body param to one of the tabs this admin
+// page knows about — anything else (missing, stray value) falls back to
+// DMA.
 function resolveView(value) {
-  return ['DMA', 'BARR', 'EMAIL'].includes(value) ? value : 'DMA';
+  return Object.keys(TAB_LABELS).includes(value) ? value : 'DMA';
 }
 
 router.get('/', (req, res) => {
   const target = resolveView(req.query.target);
-  const leads = target === 'EMAIL' ? listEmailListLeads() : listLeads(target);
-  res.type('html').send(renderPage(target, leads));
+  if (target === 'ANALYTICS') {
+    return res.type('html').send(renderAnalyticsPage());
+  }
+  res.type('html').send(renderPage(target, listLeads(target)));
 });
 
 // Both routes redirect back to whichever tab the edit was made from
 // (return_view, a hidden field on each row's form) rather than always the
-// lead's own DMA/BARR target — otherwise saving/deleting a row from the
-// Email List tab would silently kick you back to the DMA tab, since a
-// CheckCherry/Chat Lead row's real `target` is DMA or BARR, never EMAIL.
+// lead's own target. Every lead-list tab's target now equals a real,
+// resolveView()-valid tab (DMA/BARR/CHECKCHERRY), so in practice this
+// already agrees with lead.target — return_view is what future-proofs
+// that (e.g. a tab that, like the old Email List one, shows leads that
+// don't all share one real target).
 router.post('/update/:id', (req, res) => {
   const lead = getLead(req.params.id);
   if (!lead) return res.status(404).send('Lead not found');
@@ -597,7 +750,7 @@ router.post('/add', (req, res) => {
 
 router.get('/export.csv', (req, res) => {
   const target = resolveView(req.query.target);
-  const leads = target === 'EMAIL' ? listEmailListLeads() : listLeads(target);
+  const leads = target === 'ANALYTICS' ? [] : listLeads(target);
   const cols = ['id', 'date_received', 'source', 'name', 'company', 'email', 'phone', 'location', 'interest', 'status', 'owner', 'notes', 'next_follow_up', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
   const csvEscape = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
   const lines = [cols.join(',')].concat(

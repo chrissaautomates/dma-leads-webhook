@@ -692,6 +692,111 @@ async function syncCsvSheet(envVar, sourceName) {
   }
 }
 
+const WIX_SITE_ID = '54f29a7c-7e6b-4f9a-97b2-bb6964356278';
+const WIX_FORM_ID = '71826e5f-736b-4792-b486-4f64ca8d331b';
+const WIX_NAMESPACE = 'wix.form_app.form';
+
+// Wix's Form Submission Service wraps each entry's actual field values
+// under a nested `submissions` map, keyed by each field's storage
+// "target" (a stable key unrelated to its GUID or label) rather than a
+// flat object. Confirmed against real live submissions on 2026-09-11 —
+// this form's real keys are exactly tell_us_about_your_event, email_ad54,
+// last_name_23c8, first_name_973b (the _ad54/_23c8/_973b suffixes are
+// Wix's own auto-generated disambiguation suffixes, not something chosen
+// here). One real submission verified end-to-end: Margaret Kuettel's
+// Diwali in-store sampling program inquiry, margaret.kuettel@youradv.com.
+function mapWixFormSubmission(record) {
+  const values = record.submissions || {};
+  const name = [values.first_name_973b, values.last_name_23c8].filter(Boolean).join(' ');
+  const email = values.email_ad54 || '';
+  // Requires an email, unlike the name-only tolerance elsewhere in this
+  // file: this sync re-queries the same full submission history every 15
+  // minutes with no date filter, and findLead()/upsertLead() dedupe by
+  // email alone with no fallback key — a name-only submission would never
+  // match its own previously-inserted row, so it'd get re-inserted as a
+  // fresh duplicate every single cycle forever instead of updating one
+  // (the exact failure mode already fixed this way in
+  // syncCheckCherryProposals() above).
+  if (!email) return null;
+
+  return {
+    source: 'Wix Form - Digital Mirror Homepage',
+    name,
+    company: '',
+    email,
+    phone: '',
+    location: '',
+    interest: values.tell_us_about_your_event || '',
+    status: 'New',
+    owner: '',
+    notes: '',
+    nextFollowUp: 'Yes',
+    // Real field, verified against live data on 2026-09-11 (Margaret
+    // Kuettel's submission: createdDate "2026-09-10T18:58:37.507Z"). Same
+    // "always use the real date, never fall back to today" fix just
+    // applied to CheckCherry's mapCheckCherryLead() — upsertLead()'s
+    // insert path defaults to today's date whenever this comes back
+    // undefined, which would otherwise stamp every Wix lead with its sync
+    // date instead of when it was actually submitted.
+    dateReceived: record.createdDate ? record.createdDate.slice(0, 10) : undefined,
+  };
+}
+
+async function syncWixForms() {
+  console.log('syncWixForms: starting');
+  const apiKey = process.env.WIX_API_KEY;
+  if (!apiKey) return recordStatus('Wix Forms', { ok: null, error: 'not configured', count: 0 });
+  try {
+    let cursor;
+    let total = 0;
+    let page = 1;
+    for (;;) {
+      // Verified directly against the real API on 2026-09-11: the body
+      // must be wrapped in a top-level "query" object — a flat
+      // {filter, sort, cursorPaging} body 400s with "query must not be
+      // empty". Per Wix's own docs, filter/sort are only meaningful on
+      // the first request; a paginated request should carry only
+      // cursorPaging.cursor (no filter/sort) since the cursor already
+      // encodes the original query.
+      const query = cursor
+        ? { cursorPaging: { limit: 100, cursor } }
+        : {
+          filter: { formId: WIX_FORM_ID, namespace: WIX_NAMESPACE },
+          sort: [{ fieldName: 'createdDate', order: 'DESC' }],
+          cursorPaging: { limit: 100 },
+        };
+      const res = await fetchWithTimeout('https://www.wixapis.com/form-submission-service/v4/submissions/namespace/query', {
+        method: 'POST',
+        headers: {
+          // API-key auth, not OAuth — the raw key value, no "Bearer " prefix.
+          Authorization: apiKey,
+          'wix-site-id': WIX_SITE_ID,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ query }),
+      });
+      if (!res.ok) throw new Error(`Wix Forms HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const body = await res.json();
+      const submissions = body.submissions || [];
+      for (const record of submissions) {
+        const lead = mapWixFormSubmission(record);
+        if (!lead) continue;
+        upsertLead(lead);
+        total++;
+      }
+      const meta = body.metadata || {};
+      if (!meta.hasNext || !meta.cursors || !meta.cursors.next) break;
+      cursor = meta.cursors.next;
+      page++;
+      if (page > 50) break; // safety cap, matching the pattern used elsewhere in this file
+    }
+    recordStatus('Wix Forms', { ok: true, count: total });
+    console.log(`syncWixForms: done (${total} submissions)`);
+  } catch (err) {
+    recordStatus('Wix Forms', { ok: false, error: err.message, count: 0 });
+  }
+}
+
 async function runFullSync() {
   console.log('runFullSync: starting');
   await Promise.allSettled([
@@ -700,6 +805,7 @@ async function runFullSync() {
     syncGHL(),
     syncCsvSheet('META_ADS_CSV_URL', 'Meta Ads'),
     syncCsvSheet('GOOGLE_ADS_CSV_URL', 'Google Ads'),
+    syncWixForms(),
   ]);
   return getSyncStatus();
 }

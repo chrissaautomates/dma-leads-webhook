@@ -117,6 +117,7 @@ const SOURCE_CLASSES = {
   'Meta Ads': 'source-metaads',
   'Google Ads': 'source-googleads',
   'BuyAndRentRobots Website': 'source-barr',
+  'Wix Form - Digital Mirror Homepage': 'source-wix',
 };
 // DMA/BARR tabs only: CheckCherry and Chat Lead now always route to their
 // own tabs (see computeTarget()'s source-based overrides in db.js), so
@@ -375,6 +376,7 @@ const PAGE_STYLES = `
   .source-metaads { background-color: #fce7f3; color: #9d174d; border-color: #fbcfe8; }
   .source-googleads { background-color: #ffedd5; color: #9a3412; border-color: #fed7aa; }
   .source-barr { background-color: #cffafe; color: #155e75; border-color: #a5f3fc; }
+  .source-wix { background-color: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
   .source-manual { background-color: #f5f5f4; color: #57534e; border-color: #e7e5e4; }
   .source-other { background-color: #e5e7eb; color: #4b5563; border-color: #d1d5db; }
 

@@ -40,6 +40,30 @@ db.exec(`
 db.exec(`CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_leads_target ON leads(target);`);
 
+// Tombstones for leads a human explicitly deleted from /admin. Every
+// polling sync (Wix Forms, CheckCherry, CheckCherry Proposals, GHL) shares
+// the same upsertLead() path and the same dedup identity — email + target,
+// exactly what findLead() already keys on — so without this, a sync that
+// runs every 15 minutes silently re-inserts a deleted lead the next time
+// it sees the same source record, since there's nothing left in `leads`
+// for findLead() to match against once the row is gone. dedup_key is the
+// same normalized (lowercased/trimmed) email upsertLead() already stores,
+// not a new identity scheme. `source` is recorded for reference only
+// (which integration the deleted row came from) — it is not part of the
+// match, since the match needs to block *any* source from recreating the
+// same email+target, matching how upsertLead() already treats email+target
+// as one identity regardless of which source last wrote to it.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deleted_leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_key TEXT NOT NULL,
+    target TEXT NOT NULL,
+    source TEXT,
+    deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_deleted_leads_key ON deleted_leads(dedup_key, target);`);
+
 // Migration: adds CheckCherry's UTM tracking columns to a table that may
 // already exist and already hold real rows on the production volume — a
 // bare ALTER TABLE ADD COLUMN (checked against PRAGMA table_info first, so
@@ -106,6 +130,35 @@ console.log(
 const findByEmailAndTarget = db.prepare(
   `SELECT * FROM leads WHERE email = ? AND target = ? AND email != '' ORDER BY id DESC LIMIT 1`
 );
+
+const findDeletion = db.prepare(
+  `SELECT 1 FROM deleted_leads WHERE dedup_key = ? AND target = ? LIMIT 1`
+);
+const recordDeletionStmt = db.prepare(`
+  INSERT INTO deleted_leads (dedup_key, target, source, deleted_at)
+  VALUES (@dedup_key, @target, @source, datetime('now'))
+  ON CONFLICT(dedup_key, target) DO UPDATE SET source = excluded.source, deleted_at = excluded.deleted_at
+`);
+
+// True if a human has already deleted this exact email+target from
+// /admin — the same identity findLead() uses, so this only ever blocks a
+// sync from recreating the specific row that was removed, never a
+// different target bucket or a different email.
+function isLeadDeleted(email, target) {
+  const normalizedEmail = (email || '').toString().trim().toLowerCase();
+  if (!normalizedEmail) return false; // no email -> findLead() could never have matched this anyway
+  return !!findDeletion.get(normalizedEmail, target);
+}
+
+// Tombstones an email+target so upsertLead() skips it on every future
+// sync. Idempotent — deleting the same lead twice (or a lead that somehow
+// gets recreated and re-deleted) just refreshes deleted_at rather than
+// erroring on the unique index.
+function recordDeletion(email, target, source) {
+  const normalizedEmail = (email || '').toString().trim().toLowerCase();
+  if (!normalizedEmail) return; // nothing for a future sync to match against anyway
+  recordDeletionStmt.run({ dedup_key: normalizedEmail, target, source: source || '' });
+}
 
 const insertLead = db.prepare(`
   INSERT INTO leads (
@@ -176,6 +229,17 @@ function findLead(email, target) {
 function upsertLead(data) {
   const target = computeTarget(data);
   const email = (data.email || '').toString().trim().toLowerCase();
+
+  // A human deleted this exact email+target from /admin — every sync
+  // (Wix Forms, CheckCherry, CheckCherry Proposals, GHL) shares this same
+  // upsert path, so checking here once covers all of them rather than
+  // needing a per-sync guard. Only ever blocks recreating the specific
+  // row that was removed; a genuinely different email sails through
+  // untouched.
+  if (isLeadDeleted(email, target)) {
+    return { action: 'skipped_deleted', target };
+  }
+
   const existing = findLead(email, target);
 
   if (existing) {
@@ -263,7 +327,15 @@ function updateLeadFromAdmin(id, fields) {
   `).run({ id, ...fields });
 }
 
+// Records a tombstone for this row's email+target before removing it, so
+// the next sync cycle doesn't silently bring it right back — see
+// isLeadDeleted()/recordDeletion() above. Looked up here (rather than
+// requiring the caller to pass the row) so every caller gets this for
+// free; a row with no email is deleted with no tombstone recorded, since
+// findLead() could never have matched it back to a sync record anyway.
 function deleteLead(id) {
+  const lead = db.prepare(`SELECT email, target, source FROM leads WHERE id = ?`).get(id);
+  if (lead) recordDeletion(lead.email, lead.target, lead.source);
   db.prepare(`DELETE FROM leads WHERE id = ?`).run(id);
 }
 

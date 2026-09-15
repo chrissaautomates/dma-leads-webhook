@@ -693,22 +693,175 @@ async function syncCsvSheet(envVar, sourceName) {
 }
 
 const WIX_SITE_ID = '54f29a7c-7e6b-4f9a-97b2-bb6964356278';
-const WIX_FORM_ID = '71826e5f-736b-4792-b486-4f64ca8d331b';
 const WIX_NAMESPACE = 'wix.form_app.form';
 
+// A form's set of fields — and which formId even exists — isn't stable
+// enough to hardcode: confirmed directly against the real site on
+// 2026-09-15 that it has 10 distinct forms (GET .../form-schema-service/
+// v4/forms/query), each with its own field schema, and that even the one
+// form already synced had a "Phone" field added to it since it was first
+// wired up. So instead of a fixed formId + field-key list, every sync
+// cycle re-discovers every form on the site and maps each one generically
+// by field label (see mapWixFormSubmission() below) — nothing here is
+// specific to any one form.
+//
+// A form's real Wix name is used for its source label. One exception:
+// this form already had 174+ rows synced under a deliberately-chosen
+// label from before form discovery existed — kept here so switching to
+// automatic discovery doesn't silently split already-synced rows under a
+// second, different-looking source.
+const KNOWN_WIX_FORM_LABELS = {
+  '71826e5f-736b-4792-b486-4f64ca8d331b': 'Wix Form - Digital Mirror Homepage',
+};
+
+// Wix's own un-customized default name ("My Form", "My Form 1", "My Form
+// 2", ...) isn't a real, human-chosen name — treated the same as no name
+// at all. Confirmed against the real site: 3 of the 10 forms still carry
+// this exact default. Falls back to an identifiable label (a short,
+// traceable fragment of the real formId) rather than presenting a raw
+// UUID, or the meaningless placeholder, as if either were a real name.
+function wixFormSourceLabel(form) {
+  const known = KNOWN_WIX_FORM_LABELS[form.id];
+  if (known) return known;
+  const name = (form.name || '').trim();
+  if (name && !/^my form\s*\d*$/i.test(name)) return `Wix Form - ${name}`;
+  return `Wix Form - Untitled (${form.id.slice(0, 8)})`;
+}
+
+// Every field a form has ever had, current and since-deleted/replaced —
+// GetForm's response retains removed/renamed field definitions under
+// deletedFields, confirmed against real data: form 3c982836's *current*
+// schema no longer has several fields (venue_name, describe_your_experience,
+// date_and_time, event_date_and_time, ...) that its own older real
+// submissions still carry values under — every one of them shows up here.
+// Without this, an old submission using a target key the current schema
+// doesn't have anymore would silently lose that value with no error at
+// all — worst case, if the dropped field happened to be the email field
+// itself, the whole submission (not just one field of it) would vanish
+// silently, since email is required before insert.
+function allFieldDefinitions(form) {
+  return [...(form.fields || []), ...(form.deletedFields || [])];
+}
+
+// Every field's storage "target" (e.g. "email_ad54") is an auto-generated
+// per-form disambiguation suffix, not a stable identity across forms —
+// two different forms' "Email" fields have completely different target
+// keys. A field's label is the most reliable way to know what a *custom*
+// field actually is (see classifyFieldLabel() below) — but Wix also tags
+// its own built-in contact fields with a semantic fieldType
+// (CONTACTS_EMAIL/_FIRST_NAME/_LAST_NAME/_PHONE), captured here too since
+// it's needed to fix a real mismatch label-matching alone gets wrong (see
+// classifyFieldLabel()'s comment). Built once per form (current fields win
+// over a deleted one on the rare chance the same target were ever reused).
+function buildFieldMetaMap(form) {
+  const map = {};
+  allFieldDefinitions(form).forEach((f) => {
+    if (f.target && f.view && f.view.label && !map[f.target]) {
+      map[f.target] = { label: f.view.label, fieldType: f.view.fieldType };
+    }
+  });
+  return map;
+}
+
+const CONTACT_FIELD_TYPES = {
+  CONTACTS_FIRST_NAME: 'firstName',
+  CONTACTS_LAST_NAME: 'lastName',
+  CONTACTS_EMAIL: 'email',
+  CONTACTS_PHONE: 'phone',
+};
+
+// Which of the 4 categories this form has (or ever had) a genuinely
+// Wix-tagged field for (fieldType CONTACTS_EMAIL etc. — the same semantic
+// tag Wix uses to sync a field into the site's real Contacts list).
+// Computed once per form so classifyField() below can tell "no field in
+// this form is tagged as the real email field, so trust the label match"
+// apart from "this form already has a real tagged email field, so a
+// label merely containing the word doesn't get to also claim that
+// category."
+function taggedCategoriesInForm(form) {
+  const present = {};
+  allFieldDefinitions(form).forEach((f) => {
+    const category = CONTACT_FIELD_TYPES[f.view && f.view.fieldType];
+    if (category) present[category] = true;
+  });
+  return present;
+}
+
+// Case-insensitive, as specified: "first" and "name" together is a
+// first-name field, "last" and "name" a last-name field, anything
+// mentioning "email" or "phone" is that. Everything else (budget, event
+// type, venue, how they heard about us, whatever a given form happens to
+// ask) is combined into notes/interest instead of being silently dropped.
+//
+// fieldType is checked first, and — critically — a category already
+// satisfied by a genuinely-tagged field (tagged) disables the label
+// fallback for that category on every OTHER field in the same form.
+// Confirmed against real data that without this, label-substring matching
+// alone gets it wrong on a field literally labeled "Can we send you
+// information and promotion emails?" (a Yes/No opt-in question, Wix
+// fieldType RADIO_GROUP, not CONTACTS_EMAIL) — its label contains
+// "email", so on its own it's misclassified as the actual email field.
+// This really happened on a real Julian Hill/GSK Canada submission during
+// testing: his true email was silently discarded because that consent
+// question's "No thanks" value won the match instead — checking fieldType
+// on that one field alone wasn't enough to stop it, since the label match
+// still independently caught it as a second, competing "email" field.
+// Label matching for a category still applies normally in a form that has
+// no genuinely-tagged field for it at all.
+function classifyField(fieldMeta, tagged) {
+  const byType = CONTACT_FIELD_TYPES[fieldMeta.fieldType];
+  if (byType) return byType;
+
+  const normalized = (fieldMeta.label || '').toLowerCase();
+  if (!tagged.firstName && normalized.includes('first') && normalized.includes('name')) return 'firstName';
+  if (!tagged.lastName && normalized.includes('last') && normalized.includes('name')) return 'lastName';
+  if (!tagged.email && normalized.includes('email')) return 'email';
+  if (!tagged.phone && normalized.includes('phone')) return 'phone';
+  return 'other';
+}
+
 // Wix's Form Submission Service wraps each entry's actual field values
-// under a nested `submissions` map, keyed by each field's storage
-// "target" (a stable key unrelated to its GUID or label) rather than a
-// flat object. Confirmed against real live submissions on 2026-09-11 —
-// this form's real keys are exactly tell_us_about_your_event, email_ad54,
-// last_name_23c8, first_name_973b (the _ad54/_23c8/_973b suffixes are
-// Wix's own auto-generated disambiguation suffixes, not something chosen
-// here). One real submission verified end-to-end: Margaret Kuettel's
-// Diwali in-store sampling program inquiry, margaret.kuettel@youradv.com.
-function mapWixFormSubmission(record) {
+// under a nested `submissions` map, keyed by target, not label. Maps
+// generically by field metadata (via classifyField()) rather than a
+// per-form hardcoded key list, since field keys and even which fields
+// exist differ across every form on this site — confirmed directly
+// against real data on 2026-09-15 (10 forms, no two sharing a schema,
+// some 21-submission-old forms whose own schema has visibly evolved over
+// their history: earlier submissions on the same formId carry fields the
+// current schema doesn't even have anymore). Two real submissions
+// verified end-to-end this way: Margaret Kuettel's Diwali sampling
+// program inquiry (the original homepage form) and, on the newly-
+// discovered form, Emma Mansell's CIBC inquiry and Julian Hill's GSK
+// Canada inquiry.
+//
+// fieldMetaByTarget/tagged/sourceLabel are computed once per form by the
+// caller (syncWixFormSubmissions()) and passed in rather than rebuilt
+// here — this runs once per submission, up to 100 per page, so rebuilding
+// them from the form's schema on every single record would be wasted work
+// that scales with total submission count instead of form count.
+function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
   const values = record.submissions || {};
-  const name = [values.first_name_973b, values.last_name_23c8].filter(Boolean).join(' ');
-  const email = values.email_ad54 || '';
+
+  let firstName = '';
+  let lastName = '';
+  let email = '';
+  let phone = '';
+  const otherParts = [];
+
+  Object.keys(values).forEach((target) => {
+    const value = values[target];
+    if (value === null || value === undefined || value === '') return;
+    const fieldMeta = fieldMetaByTarget[target];
+    if (!fieldMeta) return; // no real label to identify this field by — never guess what it is
+    switch (classifyField(fieldMeta, tagged)) {
+      case 'firstName': firstName = firstName || String(value); break;
+      case 'lastName': lastName = lastName || String(value); break;
+      case 'email': email = email || String(value); break;
+      case 'phone': phone = phone || String(value); break;
+      default: otherParts.push(`${fieldMeta.label}: ${value}`);
+    }
+  });
+
   // Requires an email, unlike the name-only tolerance elsewhere in this
   // file: this sync re-queries the same full submission history every 15
   // minutes with no date filter, and findLead()/upsertLead() dedupe by
@@ -720,26 +873,107 @@ function mapWixFormSubmission(record) {
   if (!email) return null;
 
   return {
-    source: 'Wix Form - Digital Mirror Homepage',
-    name,
+    source: sourceLabel,
+    name: [firstName, lastName].filter(Boolean).join(' '),
     company: '',
     email,
-    phone: '',
+    phone,
     location: '',
-    interest: values.tell_us_about_your_event || '',
+    interest: otherParts.join(' | '),
     status: 'New',
     owner: '',
     notes: '',
     nextFollowUp: 'Yes',
-    // Real field, verified against live data on 2026-09-11 (Margaret
-    // Kuettel's submission: createdDate "2026-09-10T18:58:37.507Z"). Same
-    // "always use the real date, never fall back to today" fix just
-    // applied to CheckCherry's mapCheckCherryLead() — upsertLead()'s
-    // insert path defaults to today's date whenever this comes back
-    // undefined, which would otherwise stamp every Wix lead with its sync
-    // date instead of when it was actually submitted.
+    // Real field, verified against live data. Same "always use the real
+    // date, never fall back to today" fix already applied to CheckCherry's
+    // mapCheckCherryLead() — upsertLead()'s insert path defaults to
+    // today's date whenever this comes back undefined, which would
+    // otherwise stamp every Wix lead with its sync date instead of when
+    // it was actually submitted.
     dateReceived: record.createdDate ? record.createdDate.slice(0, 10) : undefined,
   };
+}
+
+// Discovers every form on the site rather than syncing a hardcoded list.
+// Confirmed directly against the real API on 2026-09-15: the response
+// shape is { forms: [...], metadata: { count, cursors, hasNext } } — the
+// same paging convention QuerySubmissionsByNamespace already uses, not
+// the different-looking example shown in Wix's own published docs (which
+// don't match a real call here, same kind of doc/reality mismatch already
+// hit elsewhere in this project — verified against the live response, not
+// assumed from the docs).
+async function fetchAllWixForms(apiKey) {
+  const forms = [];
+  let cursor;
+  let page = 1;
+  for (;;) {
+    const query = cursor ? { cursorPaging: { limit: 100, cursor } } : { cursorPaging: { limit: 100 } };
+    const res = await fetchWithTimeout('https://www.wixapis.com/form-schema-service/v4/forms/query', {
+      method: 'POST',
+      headers: { Authorization: apiKey, 'wix-site-id': WIX_SITE_ID, 'content-type': 'application/json' },
+      body: JSON.stringify({ namespace: WIX_NAMESPACE, query }),
+    });
+    if (!res.ok) throw new Error(`Wix Query Forms HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const body = await res.json();
+    forms.push(...(body.forms || []));
+    const meta = body.metadata || {};
+    if (!meta.hasNext || !meta.cursors || !meta.cursors.next) break;
+    cursor = meta.cursors.next;
+    page++;
+    if (page > 50) break; // safety cap, matching the pattern used elsewhere in this file
+  }
+  return forms;
+}
+
+async function syncWixFormSubmissions(apiKey, form) {
+  // Computed once per form, not per submission — see mapWixFormSubmission()'s comment.
+  const fieldMetaByTarget = buildFieldMetaMap(form);
+  const tagged = taggedCategoriesInForm(form);
+  const sourceLabel = wixFormSourceLabel(form);
+
+  let cursor;
+  let total = 0;
+  let page = 1;
+  for (;;) {
+    // Verified directly against the real API: the body must be wrapped in
+    // a top-level "query" object — a flat {filter, sort, cursorPaging}
+    // body 400s with "query must not be empty". Per Wix's own docs,
+    // filter/sort are only meaningful on the first request; a paginated
+    // request carries only cursorPaging.cursor (no filter/sort), since
+    // the cursor already encodes the original query.
+    const query = cursor
+      ? { cursorPaging: { limit: 100, cursor } }
+      : {
+        filter: { formId: form.id, namespace: WIX_NAMESPACE },
+        sort: [{ fieldName: 'createdDate', order: 'DESC' }],
+        cursorPaging: { limit: 100 },
+      };
+    const res = await fetchWithTimeout('https://www.wixapis.com/form-submission-service/v4/submissions/namespace/query', {
+      method: 'POST',
+      headers: {
+        // API-key auth, not OAuth — the raw key value, no "Bearer " prefix.
+        Authorization: apiKey,
+        'wix-site-id': WIX_SITE_ID,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ query }),
+    });
+    if (!res.ok) throw new Error(`Wix Forms HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const body = await res.json();
+    const submissions = body.submissions || [];
+    for (const record of submissions) {
+      const lead = mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel);
+      if (!lead) continue;
+      upsertLead(lead);
+      total++;
+    }
+    const meta = body.metadata || {};
+    if (!meta.hasNext || !meta.cursors || !meta.cursors.next) break;
+    cursor = meta.cursors.next;
+    page++;
+    if (page > 50) break; // safety cap, matching the pattern used elsewhere in this file
+  }
+  return total;
 }
 
 async function syncWixForms() {
@@ -747,51 +981,15 @@ async function syncWixForms() {
   const apiKey = process.env.WIX_API_KEY;
   if (!apiKey) return recordStatus('Wix Forms', { ok: null, error: 'not configured', count: 0 });
   try {
-    let cursor;
+    const forms = await fetchAllWixForms(apiKey);
     let total = 0;
-    let page = 1;
-    for (;;) {
-      // Verified directly against the real API on 2026-09-11: the body
-      // must be wrapped in a top-level "query" object — a flat
-      // {filter, sort, cursorPaging} body 400s with "query must not be
-      // empty". Per Wix's own docs, filter/sort are only meaningful on
-      // the first request; a paginated request should carry only
-      // cursorPaging.cursor (no filter/sort) since the cursor already
-      // encodes the original query.
-      const query = cursor
-        ? { cursorPaging: { limit: 100, cursor } }
-        : {
-          filter: { formId: WIX_FORM_ID, namespace: WIX_NAMESPACE },
-          sort: [{ fieldName: 'createdDate', order: 'DESC' }],
-          cursorPaging: { limit: 100 },
-        };
-      const res = await fetchWithTimeout('https://www.wixapis.com/form-submission-service/v4/submissions/namespace/query', {
-        method: 'POST',
-        headers: {
-          // API-key auth, not OAuth — the raw key value, no "Bearer " prefix.
-          Authorization: apiKey,
-          'wix-site-id': WIX_SITE_ID,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ query }),
-      });
-      if (!res.ok) throw new Error(`Wix Forms HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const body = await res.json();
-      const submissions = body.submissions || [];
-      for (const record of submissions) {
-        const lead = mapWixFormSubmission(record);
-        if (!lead) continue;
-        upsertLead(lead);
-        total++;
-      }
-      const meta = body.metadata || {};
-      if (!meta.hasNext || !meta.cursors || !meta.cursors.next) break;
-      cursor = meta.cursors.next;
-      page++;
-      if (page > 50) break; // safety cap, matching the pattern used elsewhere in this file
+    for (const form of forms) {
+      const count = await syncWixFormSubmissions(apiKey, form);
+      total += count;
+      console.log(`syncWixForms: "${form.name}" (${form.id}) -> ${count} lead(s)`);
     }
-    recordStatus('Wix Forms', { ok: true, count: total });
-    console.log(`syncWixForms: done (${total} submissions)`);
+    recordStatus('Wix Forms', { ok: true, count: total, forms: forms.length });
+    console.log(`syncWixForms: done (${forms.length} forms, ${total} leads)`);
   } catch (err) {
     recordStatus('Wix Forms', { ok: false, error: err.message, count: 0 });
   }

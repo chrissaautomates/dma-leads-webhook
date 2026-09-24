@@ -75,47 +75,67 @@ curl -X POST localhost:3000/webhook/lead \
 # then open http://localhost:3000/admin (user: admin, password: test)
 ```
 
-## Wix → GHL lead intake (`POST /api/leads/wix`)
+## Pushing new leads into GHL
 
-A second, separate endpoint: receives a lead submitted through the Wix
-public website form (via a Wix Velo backend `.jsw` function — see
-`wix-example/`) and creates/updates the matching DMA Events GHL contact
-directly, using only the canonical DMA fields/tags documented in
-`docs/ghl-canonical-fields.md` / `docs/ghl-canonical-tags.md`. It does
-**not** touch the local `leads.db` used by everything else in this
-README — it's a push straight to GHL, kept deliberately separate from the
-pull-based syncs above.
+New leads from **Wix Forms, Meta Ads, Google Ads and CheckCherry** are pushed
+into the DMA Events GHL location as they are captured. The polling syncs and
+the Google Ads webhook store the lead exactly as before, then hand the new row
+to `ghl-push.js` (`pushLeadToGhl` — one shared implementation; per-source
+differences live in `SOURCE_PROFILES`). The old `/api/leads/wix` relay was
+retired — Wix now flows only through the Wix Forms sync.
 
-It deliberately does **not** create an opportunity, create a sales task, or
-send any email/SMS — Workflow 1 ("New Lead- Send Services - Email
-Sequence", GHL workflow ID `d79a76bd-c787-425a-8588-2b3594714d64`) already
-does all of that the moment a new contact is created. See
-`docs/wix-ghl-existing-contact-behavior.md` for what happens (and doesn't)
-when Wix submits a lead who's already a GHL contact.
+What a push does: find the contact by email (else phone), create or update it
+(canonical fields only, never overwriting a value with a blank), apply tags,
+add a note. It does **not** create opportunities/tasks or send email/SMS —
+GHL's own workflow does that when `new-lead` is applied.
 
-### Setup
+| Source | Source tag | DMA Lead Source |
+|---|---|---|
+| Wix Forms (`Wix Form - …`) | `source-wix` | Website Form |
+| Meta Ads | `source-meta` | Meta Ad |
+| Google Ads | `source-google-ads` | Google Ad |
+| CheckCherry (`/leads` feed only) | `source-checkcherry` | Check Cherry |
 
-1. **Environment variables** (in addition to the ones above):
-   - `WIX_WEBHOOK_SECRET` — random string; the Wix backend function must send
-     it back as `Authorization: Bearer <secret>` (or an `x-wix-webhook-secret`
-     header). Separate from `WEBHOOK_SECRET` above — different callers,
-     rotate independently.
-   - `GHL_API_KEY` / `GHL_LOCATION_ID` — already used by `sync.js`'s GHL
-     chat-lead pull; reused here for the push direction too.
-2. **In Wix**: add `wix-example/backend.jsw` and `wix-example/frontend.js`
-   (or your own equivalents) to your site, following the setup comments at
-   the top of `backend.jsw` (Secrets Manager entry + real deployed URL).
+**`new-lead` tag** (the gate into the nurture funnel) — applied to new contacts
+from every source **except** CheckCherry, where it is applied only if
+CheckCherry has **no event (proposal/booking) for that email**. It is never
+applied to an *advanced* existing contact (Lead Status beyond New/Nurture, or a
+tag matching `proposal|won|booked|deposit|contract|client` — override with
+`GHL_ADVANCED_TAG_PATTERN`); those get a minimal update (last-activity + note,
+no tags). It is also never re-applied to a contact that already has it.
+
+**Never pushed:** BuyAndRentRobots leads (any lead whose text/UTMs match the
+BARR keywords `humanoid | robot rental | buyandrentrobots`, or that is filed
+under the BARR tab), Chat Lead (already in GHL), manual `/admin` entries,
+`/webhook/lead` events, and CheckCherry proposal-event rows.
+
+### Safety controls (env vars, set in Railway)
+
+| Variable | Effect |
+|---|---|
+| *(none set)* | **DRY-RUN — the default.** Logs `[ghl-push][DRY-RUN] WOULD …` lines; sends nothing; marks nothing. Makes only read calls to GHL so the log reflects what live would do. |
+| `GHL_PUSH_LIVE=true` | Send for real. **Requires** `GHL_PUSH_CUTOFF_DATE`; without a valid one it refuses and pushes nothing. |
+| `GHL_PUSH_CUTOFF_DATE=YYYY-MM-DD` | Go-live date. Rows received before it never push. |
+| `GHL_PUSH_DISABLED=true` | **Kill switch.** Nothing is evaluated or sent. (Railway restarts the service on a variable change.) |
+| `GHL_CHECKCHERRY_SETTLE_MINUTES` | Hold a brand-new CheckCherry lead this long (default 10) so a proposal created moments later is caught on the next cycle. |
+
+The `leads.ghl_pushed` column records push state per row. On first boot after
+this change every existing row is stamped `legacy` (in the same transaction as
+the `ALTER TABLE`), so the back catalog can never be sent. `NULL` = pending.
+Other terminal values: `pushed`, `excluded_barr`, `excluded_source`,
+`excluded_proposal`, `skipped_no_contact`. A pending row that fails (GHL error)
+or is deferred (CheckCherry events unavailable / settle window) is retried on
+the next 15-minute cycle.
+
+### Reading the dry-run list
+
+- Railway logs: filter on `[ghl-push]`. Startup logs `GHL lead push mode: …`.
+- **`GET /admin/ghl-preview?since=YYYY-MM-DD[&limit=50]`** (admin login):
+  read-only. Runs already-stored rows received since that date through the same
+  decision path and lists what would be pushed / tagged / skipped / excluded —
+  the way to review real records before going live, since legacy rows are
+  otherwise locked out.
 
 ### Local test
 
-```
-DB_PATH=:memory: WIX_WEBHOOK_SECRET=test GHL_API_KEY=test GHL_LOCATION_ID=WWFoHKH8wu9QTuAKBUzK npm start
-curl -X POST localhost:3000/api/leads/wix \
-  -H 'content-type: application/json' -H 'authorization: Bearer test' \
-  -d '{"firstName":"Jane","email":"jane@example.com","eventType":"Corporate","interest":"AI Photo Booth"}'
-```
-
-Note this will make a *real* call to the GHL API if `GHL_API_KEY` is a real
-key — for local development against fake data, use the automated tests
-instead (`npm test`), which mock the GHL API entirely and never touch a
-real DMA contact.
+`npm test` — GHL is fully mocked; nothing touches a real contact.

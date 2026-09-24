@@ -6,7 +6,9 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, listChatLeadLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead } = require('./db');
+const { listLeads, listChatLeadLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead, listLeadsSince } = require('./db');
+const { previewLead, getPushConfig, describeMode } = require('./ghl-push');
+const { fetchCheckCherryEvents, buildProposalEmailSet } = require('./sync');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -798,6 +800,50 @@ router.get('/export.csv', (req, res) => {
   res.set('Content-Type', 'text/csv');
   res.set('Content-Disposition', `attachment; filename="${target}-leads.csv"`);
   res.send(lines.join('\n'));
+});
+
+// GHL push DRY-RUN PREVIEW — read-only. Runs stored rows received on/after
+// ?since= through the exact same decision path the live push uses (source
+// profile, BARR exclusion, CheckCherry proposal set, existing-contact /
+// advanced-contact check against GHL) and prints what WOULD happen to each.
+// Sends nothing and marks nothing; the only outbound calls are GHL reads and
+// the CheckCherry events read. This is the "read the list" checkpoint: the
+// back catalog is locked out of the real push (ghl_pushed = 'legacy'), so
+// without this the dry-run would only ever show leads arriving after deploy.
+//   /admin/ghl-preview?since=2026-09-01[&limit=50]   (limit max 200)
+router.get('/ghl-preview', async (req, res) => {
+  const since = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.since || '')) ? req.query.since : null;
+  if (!since) return res.status(400).type('text').send('Usage: /admin/ghl-preview?since=YYYY-MM-DD[&limit=50]');
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+
+  const out = [`GHL push dry-run preview — read-only, nothing is sent or marked`, `push mode right now: ${describeMode()}`, `rows received since ${since}, newest first (limit ${limit})`, ''];
+  let proposalEmails = null;
+  if (process.env.CHECKCHERRY_API_KEY) {
+    try {
+      proposalEmails = buildProposalEmailSet(await fetchCheckCherryEvents(process.env.CHECKCHERRY_API_KEY));
+      out.push(`CheckCherry proposal set loaded: ${proposalEmails.size} email(s)`, '');
+    } catch (err) {
+      out.push(`CheckCherry events fetch FAILED (${err.message}) — CheckCherry rows will show as deferred`, '');
+    }
+  }
+
+  const counts = {};
+  const cfg = { ...getPushConfig(), cutoff: since };
+  for (const row of listLeadsSince(since, limit)) {
+    const lead = {
+      source: row.source, name: row.name, company: row.company, email: row.email, phone: row.phone,
+      location: row.location, interest: row.interest, notes: row.notes,
+      utmSource: row.utm_source, utmMedium: row.utm_medium, utmCampaign: row.utm_campaign,
+      utmContent: row.utm_content, utmTerm: row.utm_term,
+    };
+    const r = await previewLead(lead, row, { proposalEmails }, cfg);
+    counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+    const who = `#${row.id} ${row.date_received} ${row.email || row.name || '(no email)'} [${row.source}] target=${row.target} db-status=${row.status} ghl_pushed=${row.ghl_pushed}`;
+    out.push(`${r.verdict.toUpperCase().padEnd(11)} ${who}`);
+    out.push(`            ${r.line || r.reason}`);
+  }
+  out.push('', `Summary: ${JSON.stringify(counts)}`);
+  res.type('text').send(out.join('\n'));
 });
 
 module.exports = router;

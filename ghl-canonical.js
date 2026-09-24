@@ -18,7 +18,7 @@ const FIELDS = {
   EVENT_TYPE: '2RrUkfZp9fxlxJACtbqt', // "Event Type", SINGLE_OPTIONS
   INTEREST: '85yxy9C2z42HfOv36Pif', // "DMA_Interest", MULTIPLE_OPTIONS
   LEAD_SCORE: 'yF3w9QsksBuReeauCq4x', // "Lead Score", NUMERICAL
-  OWNER: 'uqFqlFzXExP1rpyRCgFY', // "Owner", SINGLE_OPTIONS — not written by this webhook (see wix-lead-intake.js)
+  OWNER: 'uqFqlFzXExP1rpyRCgFY', // "Owner", SINGLE_OPTIONS — not written by this webhook (see ghl-lead-plan.js)
 
   // --- Part 2: new fields created in Phase 1 Step 2 ---
   CAMPAIGN: 'bPznSu7NvOYe7fWMXM4K', // "DMA Campaign", TEXT
@@ -47,7 +47,7 @@ const FORBIDDEN_LEGACY_FIELD_IDS = new Set([
 // Wix-submitted value before ever sending it to GHL — a SINGLE_OPTIONS field
 // sent a value outside this list either silently fails to render correctly
 // in the GHL UI or (worse) gets stored as an orphan string no report/filter
-// will ever match. When a Wix value doesn't match, wix-lead-intake.js does
+// will ever match. When a Wix value doesn't match, ghl-lead-plan.js does
 // NOT set the field — it preserves the raw value in the contact note
 // instead, so nothing is silently lost, just not force-fit into a field
 // that doesn't support it.
@@ -55,7 +55,7 @@ const FIELD_OPTIONS = {
   // "Website" (the literal value named in the DMA lead-intake spec) is not
   // one of this field's real options — "Website Form" is the closest valid
   // canonical value and is what this webhook actually writes. Documented
-  // here and in wix-lead-intake.js rather than silently substituted.
+  // here and in ghl-lead-plan.js rather than silently substituted.
   LEAD_SOURCE: [
     'Website Form', 'Chatbot', 'GHL Form', 'Google Ad', 'Meta Ad', 'LinkedIn',
     'Calendly', 'Email Reply', 'Manual Entry', 'Referral', 'Event Lead',
@@ -71,7 +71,7 @@ const FIELD_OPTIONS = {
   MARKETING_CONSENT: ['Yes', 'No', 'Unknown'],
   // DMA_Interest's real option list. Note several canonical interest TAGS
   // (Glambot, Robotics, DMA Engage, Holiday, Headshot, LED Tunnel) have no
-  // matching option here — see INTEREST_MAP in wix-lead-intake.js for how
+  // matching option here — see INTEREST_MAP in ghl-lead-plan.js for how
   // that gap is handled (tag still applied, field falls back to "Other").
   INTEREST: [
     'Hat Bar', 'AI Photo Booth', 'Trading Cards', '360 Booth', 'Laser Engraving',
@@ -88,7 +88,13 @@ const FIELD_OPTIONS = {
 // canonical one. Cross-checked against that doc's "Canonical Tag" vs.
 // "Reused or New" columns for every single entry below.
 const TAGS = {
-  SOURCE_WEBSITE: 'source-website', // NEW, exact name
+  SOURCE_WEBSITE: 'source-website', // NEW, exact name (legacy Wix relay — no longer applied by the push)
+  // Per-source attribution tags applied by ghl-push.js. Names specified by the
+  // project owner; GHL creates a tag the first time it is added to a contact.
+  SOURCE_WIX: 'source-wix',
+  SOURCE_META: 'source-meta',
+  SOURCE_GOOGLE_ADS: 'source-google-ads',
+  SOURCE_CHECKCHERRY: 'source-checkcherry',
   LEAD_NEW: 'new-lead', // REUSED — canonical pointer's real name, NOT the literal string "lead-new"
 
   LEAD_TYPE: {
@@ -107,7 +113,7 @@ const TAGS = {
 // taxonomy) but the value is still a real DMA_Interest option. `fieldOption`
 // is 'Other' where the reverse is true (a canonical tag exists but
 // DMA_Interest's picklist has no matching option) — flagged inline. Lookup
-// keys are lowercased; wix-lead-intake.js normalizes input the same way.
+// keys are lowercased; ghl-lead-plan.js normalizes input the same way.
 const INTEREST_MAP = {
   'ai photo booth': { tag: 'interest-ai', fieldOption: 'AI Photo Booth' },
   ai: { tag: 'interest-ai', fieldOption: 'AI Photo Booth' },

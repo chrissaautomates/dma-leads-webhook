@@ -77,6 +77,27 @@ UTM_COLUMNS.forEach((col) => {
   }
 });
 
+// Migration: ghl_pushed records whether a lead has been pushed to GHL (see
+// ghl-push.js). NULL = pending (eligible to push); anything else is terminal:
+// 'pushed', 'legacy', 'excluded_barr', 'excluded_source', 'excluded_proposal'.
+//
+// SAFETY: the moment the column is first created, EVERY row already in the
+// table is stamped 'legacy' — the back catalog (historical Wix / CheckCherry /
+// Meta rows) must never be sent to GHL. The ALTER and the stamp run in ONE
+// transaction (SQLite DDL is transactional), so a crash between them can't
+// leave the existing rows as NULL ("pending") on the next boot. Guarded by the
+// column-doesn't-exist check, so it runs exactly once and never re-stamps rows
+// added after the migration. (Two independent guards back this up in
+// ghl-push.js: pushes only trigger for freshly inserted / still-pending rows,
+// and only rows with date_received >= the configured go-live cutoff.)
+if (!db.prepare(`PRAGMA table_info(leads)`).all().some((c) => c.name === 'ghl_pushed')) {
+  db.transaction(() => {
+    db.exec(`ALTER TABLE leads ADD COLUMN ghl_pushed TEXT DEFAULT NULL`);
+    db.exec(`UPDATE leads SET ghl_pushed = 'legacy'`);
+  })();
+  console.log(`ghl_pushed migration: column added, ${db.prepare(`SELECT COUNT(*) n FROM leads WHERE ghl_pushed = 'legacy'`).get().n} existing row(s) marked legacy`);
+}
+
 // One-time fixup: rows synced before CheckCherry got its own tab were
 // routed to DMA/BARR by content keywords alone (the only rule that existed
 // at the time), even though their source is 'CheckCherry'. computeTarget()
@@ -163,11 +184,11 @@ function recordDeletion(email, target, source) {
 const insertLead = db.prepare(`
   INSERT INTO leads (
     target, date_received, source, name, company, email, phone, location, interest,
-    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed
   )
   VALUES (
     @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
-    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed
   )
 `);
 
@@ -185,6 +206,12 @@ const updateLeadFields = db.prepare(`
     updated_at = datetime('now')
   WHERE id = @id
 `);
+
+// How the app recognizes a BuyAndRentRobots lead: a keyword match, not a
+// stored brand flag. Shared with ghl-push.js, which must exclude BARR leads
+// from the DMA Events GHL funnel. Deliberately NOT broadened to plain "robot"
+// — DMA sells robotics/Glambot too.
+const BARR_PATTERN = /humanoid|robot rental|buyandrentrobots/i;
 
 // Exposed so callers can compute the target a lead would land in before
 // they actually upsert it (e.g. to look up its current row first).
@@ -211,9 +238,7 @@ function computeTarget(data) {
     const dateReceived = data.dateReceived || new Date().toISOString().slice(0, 10);
     if (dateReceived >= '2026-01-01') return 'CHATLEAD';
   }
-  return /humanoid|robot rental|buyandrentrobots/i.test(
-    source + ' ' + (data.interest || '')
-  ) ? 'BARR' : 'DMA';
+  return BARR_PATTERN.test(source + ' ' + (data.interest || '')) ? 'BARR' : 'DMA';
 }
 
 // Returns the existing lead row for a given email + target, or undefined if
@@ -289,6 +314,9 @@ function upsertLead(data) {
     utm_campaign: data.utmCampaign || '',
     utm_content: data.utmContent || '',
     utm_term: data.utmTerm || '',
+    // NULL = pending push. Callers that know a row must never be pushed
+    // (e.g. CheckCherry proposal-event rows) pass an explicit terminal value.
+    ghl_pushed: data.ghlPushed || null,
   });
   return { action: 'inserted', id: info.lastInsertRowid, target };
 }
@@ -363,12 +391,34 @@ function addLeadFromAdmin(fields) {
     utm_campaign: fields.utm_campaign || '',
     utm_content: fields.utm_content || '',
     utm_term: fields.utm_term || '',
+    ghl_pushed: 'excluded_source', // manual entries are never pushed to GHL
   });
   return info.lastInsertRowid;
 }
 
+// Rows received on/after `since`, newest first — for the admin GHL dry-run
+// preview (which evaluates them read-only, regardless of ghl_pushed).
+function listLeadsSince(since, limit) {
+  return db.prepare(`SELECT * FROM leads WHERE date_received >= ? ORDER BY id DESC LIMIT ?`).all(since, limit);
+}
+
+// GHL push state for one row: { ghl_pushed, date_received, target, ... }.
+function getGhlState(id) {
+  return db.prepare(`SELECT id, ghl_pushed, date_received, target, created_at FROM leads WHERE id = ?`).get(id);
+}
+
+// Only ever moves a row OUT of pending (NULL) — never overwrites a terminal
+// state such as 'legacy', so a bug elsewhere can't re-arm a locked-out row.
+function markGhlPushed(id, value) {
+  return db.prepare(`UPDATE leads SET ghl_pushed = ? WHERE id = ? AND ghl_pushed IS NULL`).run(value, id).changes;
+}
+
 module.exports = {
   db,
+  BARR_PATTERN,
+  getGhlState,
+  markGhlPushed,
+  listLeadsSince,
   upsertLead,
   findLead,
   computeTarget,

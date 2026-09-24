@@ -1,6 +1,9 @@
-// Wix -> GHL lead intake business logic: validates a Wix form submission,
-// maps it onto DMA Events' canonical GHL fields/tags, and decides what to
-// write for a brand-new contact vs. an existing one. Pure functions only —
+// Lead -> GHL business logic shared by every source (Wix Forms, Meta Ads,
+// Google Ads, CheckCherry): maps a lead onto DMA Events' canonical GHL
+// fields/tags, and decides what to write for a brand-new contact vs. an
+// existing one. What differs per source (Lead Source label, source tag,
+// last-activity label, new-lead policy) lives in a `profile` — see
+// SOURCE_PROFILES in ghl-push.js — so none of this logic is duplicated. Pure functions only —
 // no network calls here (those live in ghl-client.js) — so this can be
 // tested without mocking fetch at all.
 //
@@ -25,14 +28,24 @@
 //    actually supplied a non-empty value for it. Nothing is ever sent as
 //    "" or null to intentionally clear a field.
 //
-// 3. "Website" (as named in the task spec) isn't a real DMA Lead Source
-//    option — "Website Form" is used instead (see ghl-canonical.js).
+// 3. The Lead Source custom field is set from the profile, always to a real
+//    picklist option (see FIELD_OPTIONS.LEAD_SOURCE in ghl-canonical.js).
 //
 // 4. Values that don't match a canonical picklist option (event type,
 //    budget range, interest) are never force-fit into the field. They're
 //    preserved in the contact note instead, alongside any free-text
 //    message, so nothing Wix sent is silently lost — just not written
 //    somewhere it would corrupt reporting.
+//
+// 6. THE new-lead TAG IS THE GATE INTO THE NURTURE FUNNEL, so it is applied
+//    only when ALL of these hold: the source's own policy allows it
+//    (profile.applyNewLead — CheckCherry refuses when a proposal exists),
+//    the contact isn't already "advanced" (Lead Status beyond New/Nurture,
+//    or a proposal/won-type tag — decided by ghl-push.js and passed in as
+//    context.advancedReason), and — for an EXISTING contact — it doesn't
+//    already carry the tag (never re-applied on an update). An advanced
+//    contact gets a minimal update instead: last-activity + note only, no
+//    other field changes and no tags at all.
 //
 // 5. Marketing consent is written ONLY when Wix explicitly supplied a
 //    yes/no answer. No value is ever written for "not supplied" (not even
@@ -59,24 +72,6 @@ function matchOption(value, options) {
   const key = normalizeKey(value);
   if (!key) return null;
   return options.find((opt) => opt.toLowerCase() === key) || null;
-}
-
-function required(body, ...keys) {
-  return keys.some((k) => normalize(body[k]));
-}
-
-// Required minimum per the task spec: (name OR firstName) AND (email OR
-// phone). Wix may send a combined `name` field or separate first/last —
-// both are accepted for the name half of the check.
-function validateWixPayload(body) {
-  const errors = [];
-  if (!required(body, 'name', 'firstName')) {
-    errors.push('Missing required field: name or firstName');
-  }
-  if (!required(body, 'email', 'phone')) {
-    errors.push('Missing required field: email or phone');
-  }
-  return { valid: errors.length === 0, errors };
 }
 
 function splitName(body) {
@@ -121,34 +116,57 @@ function resolveInterests(body) {
 // Free-text note: the original message, plus (only when present) any
 // submitted value that didn't cleanly map to a canonical field option —
 // preserved here rather than dropped, per design decision #4 above.
-function buildNote(body, unmapped) {
+function buildNote(body, unmapped, noteLabel) {
   const lines = [];
   if (normalize(body.message)) lines.push(`Message: ${normalize(body.message)}`);
   if (normalize(body.guestCount)) lines.push(`Guest Count (no canonical field for this yet): ${normalize(body.guestCount)}`);
+  (body.noteLines || []).forEach((l) => { if (normalize(l)) lines.push(normalize(l)); });
   unmapped.forEach(({ label, value }) => {
     lines.push(`${label} (submitted value did not match a canonical option): ${value}`);
   });
   if (!lines.length) return null;
-  return [
-    'Submitted via Wix lead form.',
-    ...lines,
-    `Page: ${normalize(body.pageUrl) || '(not provided)'}`,
-  ].join('\n');
+  const out = [`Submitted via ${noteLabel}.`, ...lines];
+  if (normalize(body.pageUrl)) out.push(`Page: ${normalize(body.pageUrl)}`);
+  return out.join('\n');
+}
+
+// The single place the new-lead gate (design decision #6) is decided.
+function decideNewLead(lead, { isNewContact, profile, context }) {
+  if (context.advancedReason && !isNewContact) {
+    return { applied: false, reason: `contact already advanced (${context.advancedReason})` };
+  }
+  if (profile.applyNewLead) {
+    const policy = profile.applyNewLead({ lead, context });
+    if (!policy.allow) return { applied: false, reason: policy.reason };
+  }
+  if (!isNewContact && context.hasNewLeadTag) {
+    return { applied: false, reason: 'existing contact already has the new-lead tag (not re-applied)' };
+  }
+  return { applied: true, reason: isNewContact ? 'new contact' : 'existing contact, not advanced' };
 }
 
 // Core mapping function. `isNewContact` must be determined by the caller
-// (ghl-client.js's findDuplicateContact / createContact result) BEFORE
-// calling this — see design decision #1 above for why new-vs-existing
-// changes what gets written, not just how it's written.
+// (ghl-client.js's findDuplicateContact result) BEFORE calling this — see
+// design decision #1 above for why new-vs-existing changes what gets
+// written, not just how it's written.
+//
+// options.profile — { leadSourceOption, sourceTag, nativeSource,
+//   lastActivityLabel, noteLabel, applyNewLead({lead, context}) }
+// options.context — { advancedReason: string|null, hasNewLeadTag: bool,
+//   proposalEmails: Set|null } — facts about the existing contact / source
+//   state, gathered by ghl-push.js (this function stays pure).
 //
 // Returns:
-//   { contactFields, customFields, tags, note, warnings }
+//   { contactFields, customFields, tags, note, warnings, newLead }
+// where newLead is { applied, reason } — why the new-lead tag was or wasn't
+// applied (surfaced in dry-run output).
 // where contactFields/customFields are ready to hand to ghl-client.js's
 // createContact/updateContact, tags is an array of tag name strings ready
 // for addTags(), note is a string or null ready for createNote(), and
 // warnings is a list of human-readable strings about anything that
 // couldn't be mapped (for logging — never exposed to the Wix caller).
-function buildLeadPlan(body, { isNewContact }) {
+function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
+  if (!profile) throw new Error('buildLeadPlan requires a source profile');
   const warnings = [];
   const unmapped = [];
   const { firstName, lastName } = splitName(body);
@@ -165,7 +183,7 @@ function buildLeadPlan(body, { isNewContact }) {
   // information in the DMA-specific taxonomy) — set on create only, same
   // "don't regress an existing contact's original attribution" reasoning
   // as the DMA Lead Source custom field below.
-  if (isNewContact) contactFields.source = 'Wix Lead Form';
+  if (isNewContact && profile.nativeSource) contactFields.source = profile.nativeSource;
 
   const customFields = [];
   function setField(id, value) {
@@ -175,14 +193,14 @@ function buildLeadPlan(body, { isNewContact }) {
 
   // --- New-lead-only defaults (see design decision #1) ---
   if (isNewContact) {
-    setField(FIELDS.LEAD_SOURCE, 'Website Form'); // "Website" per spec -> closest real option, see ghl-canonical.js
+    setField(FIELDS.LEAD_SOURCE, profile.leadSourceOption);
     setField(FIELDS.LEAD_STATUS, 'New');
     setField(FIELDS.LEAD_SCORE, 0);
   }
 
   // --- Always safe to update: describes the most recent event, not a
   // cumulative/regressable state ---
-  setField(FIELDS.LAST_ACTIVITY, `Wix Form Submission — ${new Date().toISOString()}`);
+  setField(FIELDS.LAST_ACTIVITY, `${profile.lastActivityLabel} — ${new Date().toISOString()}`);
 
   // --- Campaign: submitted campaign, falling back to utmCampaign ---
   const campaign = normalize(body.campaign) || normalize(body.utmCampaign);
@@ -235,16 +253,31 @@ function buildLeadPlan(body, { isNewContact }) {
     unmapped.push({ label: 'Marketing Consent', value: normalize(body.marketingConsent) });
   }
 
-  // --- Tags: always source-website + lead-new (new-lead's real name),
-  // plus lead-type/interest tags only when explicitly recognized. ---
-  const tags = [TAGS.SOURCE_WEBSITE, TAGS.LEAD_NEW];
+  // --- Tags: the source tag always; new-lead only through the gate in
+  // design decision #6; lead-type/interest tags only when recognized. ---
+  const tags = [profile.sourceTag];
+  const newLead = decideNewLead(body, { isNewContact, profile, context });
+  if (newLead.applied) tags.push(TAGS.LEAD_NEW);
   const typeTag = leadTypeTag(body.leadType);
   if (typeTag) tags.push(typeTag);
   else if (normalize(body.leadType)) unmapped.push({ label: 'Lead Type', value: normalize(body.leadType) });
   tags.push(...interestTags);
 
-  const note = buildNote(body, unmapped);
+  const note = buildNote(body, unmapped, profile.noteLabel);
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
+
+  // ADVANCED contact: minimal update only — last-activity + note. No standard
+  // field changes, no other custom fields, no tags of any kind.
+  if (context.advancedReason && !isNewContact) {
+    return {
+      contactFields: {},
+      customFields: customFields.filter((f) => f.id === FIELDS.LAST_ACTIVITY),
+      tags: [],
+      note,
+      warnings,
+      newLead,
+    };
+  }
 
   return {
     contactFields,
@@ -252,12 +285,13 @@ function buildLeadPlan(body, { isNewContact }) {
     tags: [...new Set(tags)],
     note,
     warnings,
+    newLead,
   };
 }
 
 module.exports = {
-  validateWixPayload,
   buildLeadPlan,
+  decideNewLead,
   // exported for tests
   splitName,
   matchOption,

@@ -3,6 +3,7 @@
 // Each source is independent and best-effort.
 
 const { upsertLead, findLead, computeTarget } = require('./db');
+const { pushAfterUpsert } = require('./ghl-push');
 
 const status = {};
 
@@ -15,6 +16,16 @@ function getSyncStatus() {
 }
 
 const DEFAULT_TIMEOUT_MS = 15000;
+
+// Every source that feeds GHL goes through this instead of a bare
+// upsertLead(): stores the lead exactly as before, then hands the row to
+// ghl-push.js, which decides (dry-run / live / off, cutoff, BARR, pending-only)
+// whether anything is sent. Never throws — a GHL problem can't fail a sync.
+async function upsertAndPush(lead, context) {
+  const result = upsertLead(lead);
+  await pushAfterUpsert(lead, result, context);
+  return result;
+}
 
 // Shared by every outbound call in this file so one slow/unresponsive
 // source can't hang the whole runFullSync() Promise.allSettled forever with
@@ -110,35 +121,39 @@ function mapCheckCherryLead(record) {
   };
 }
 
-async function syncCheckCherry() {
-  console.log('syncCheckCherry: starting');
-  const apiKey = process.env.CHECKCHERRY_API_KEY;
-  if (!apiKey) return recordStatus('CheckCherry', { ok: null, error: 'not configured', count: 0 });
-  try {
-    let page = 1;
-    let total = 0;
-    for (;;) {
-      const url = `https://api.checkcherry.com/api/v1/leads?page=${page}&per=100`;
-      const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey } });
-      if (!res.ok) throw new Error(`CheckCherry HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const body = await res.json();
-      const records = Array.isArray(body) ? body : (body.leads || body.data || []);
-      if (!records.length) break;
-      for (const record of records) {
-        const lead = mapCheckCherryLead(record);
-        if (!lead.email && !lead.name) continue; // malformed/unmapped record — never write a junk row
-        upsertLead(lead);
-        total++;
-      }
-      if (records.length < 100) break;
-      page++;
-      if (page > 50) break;
-    }
-    recordStatus('CheckCherry', { ok: true, count: total });
-    console.log(`syncCheckCherry: done (${total} leads)`);
-  } catch (err) {
-    recordStatus('CheckCherry', { ok: false, error: err.message, count: 0 });
+// Fetches every open CheckCherry lead (raw records). Split from the upsert
+// loop (processCheckCherryLeads) so syncCheckCherryAll() can fetch leads
+// FIRST, then events, then process both — see the race note there.
+async function fetchCheckCherryLeads(apiKey) {
+  const all = [];
+  let page = 1;
+  for (;;) {
+    const url = `https://api.checkcherry.com/api/v1/leads?page=${page}&per=100`;
+    const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey } });
+    if (!res.ok) throw new Error(`CheckCherry HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const body = await res.json();
+    const records = Array.isArray(body) ? body : (body.leads || body.data || []);
+    if (!records.length) break;
+    all.push(...records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 50) break;
   }
+  return all;
+}
+
+// proposalEmails: Set of lowercased emails that have a CheckCherry event, or
+// null when the events feed couldn't be fetched (then ghl-push.js defers the
+// push — fail closed — rather than guess).
+async function processCheckCherryLeads(records, proposalEmails) {
+  let total = 0;
+  for (const record of records) {
+    const lead = mapCheckCherryLead(record);
+    if (!lead.email && !lead.name) continue; // malformed/unmapped record — never write a junk row
+    await upsertAndPush(lead, { proposalEmails });
+    total++;
+  }
+  return total;
 }
 
 // CheckCherry's leads endpoint isn't the only way a prospect enters the
@@ -231,79 +246,158 @@ function mapCheckCherryProposalEvent(record) {
   };
 }
 
-async function syncCheckCherryProposals() {
-  console.log('syncCheckCherryProposals: starting');
-  const apiKey = process.env.CHECKCHERRY_API_KEY;
-  if (!apiKey) return recordStatus('CheckCherry Proposals', { ok: null, error: 'not configured', count: 0 });
-  try {
-    let page = 1;
-    let total = 0;
-    for (;;) {
-      const url = `https://api.checkcherry.com/api/v1/events?page=${page}&per=100`;
-      // Each page comes back much heavier than /leads' (measured ~750-900KB
-      // for 100 events vs. a few KB per lead — the pricing/proposal/URL
-      // fields alone roughly triple the attribute count) — DEFAULT_TIMEOUT_MS
-      // was cutting it close on a real run (page 11 timed out at 15s during
-      // testing even though every page normally takes 3-6s), so this gets
-      // its own more generous timeout rather than raising it globally for
-      // every other (much lighter) sync in this file.
-      const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey } }, 30000);
-      if (!res.ok) throw new Error(`CheckCherry events HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const body = await res.json();
-      const records = Array.isArray(body) ? body : (body.data || []);
-      if (!records.length) break;
-      for (const record of records) {
-        const attrs = (record && record.attributes) || {};
-        if (!isRelevantProposalEvent(attrs)) continue;
-        const lead = mapCheckCherryProposalEvent(record);
-        // Unlike syncCheckCherry() above (which tolerates a name-only lead),
-        // this path requires an email: findLead()/upsertLead() dedupe by
-        // email alone, with no fallback key (no event id column on the
-        // leads table), so a name-only record would never match its own
-        // previously-inserted row — every 15-minute cycle would insert a
-        // fresh duplicate for the same event forever instead of updating
-        // one. No real event has come back email-less yet, but skip
-        // defensively rather than let that silently happen the first time
-        // one does.
-        if (!lead.email) continue;
+// Fetches every CheckCherry event (raw records).
+async function fetchCheckCherryEvents(apiKey) {
+  const all = [];
+  let page = 1;
+  for (;;) {
+    const url = `https://api.checkcherry.com/api/v1/events?page=${page}&per=100`;
+    // Each page comes back much heavier than /leads' (measured ~750-900KB
+    // for 100 events vs. a few KB per lead — the pricing/proposal/URL
+    // fields alone roughly triple the attribute count) — DEFAULT_TIMEOUT_MS
+    // was cutting it close on a real run (page 11 timed out at 15s during
+    // testing even though every page normally takes 3-6s), so this gets
+    // its own more generous timeout rather than raising it globally for
+    // every other (much lighter) sync in this file.
+    const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey } }, 30000);
+    if (!res.ok) throw new Error(`CheckCherry events HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const body = await res.json();
+    const records = Array.isArray(body) ? body : (body.data || []);
+    if (!records.length) break;
+    all.push(...records);
+    if (records.length < 100) break;
+    page++;
+    if (page > 50) break;
+  }
+  return all;
+}
 
-        // Stamp the initial status only the first time this contact is
-        // seen — once it's a row in the leads table, staff manage its
-        // status from /admin like any other lead. Re-passing a status on
-        // every sync cycle (this runs every 15 min) would silently stomp
-        // a manual status change (e.g. to "Contacted") right back to
-        // whatever this sync would otherwise set it to.
-        //
-        // One deliberate exception: a convert_from_lead event reaching
-        // 'confirmed' whose row already exists here gets promoted to
-        // 'Won' — but only if its current status is one mapCheckCherryLead()
-        // could have set entirely on its own (see SYNC_ONLY_STATUSES),
-        // never a status a human actually chose. Without this, a lead
-        // captured while e.g. converted_to_event was already true (so
-        // mapCheckCherryLead() stamped it 'Converted', not 'New') would
-        // fail the original New-only check and stay stuck at 'Converted'
-        // forever even once really confirmed/won — silently defeating the
-        // whole point of this promotion for exactly the rows it's
-        // supposed to help.
-        const target = computeTarget(lead);
-        const existing = findLead(lead.email, target);
-        let status = '';
-        if (!existing) {
-          status = initialStatusFor(attrs);
-        } else if (attrs.status === 'confirmed' && SYNC_ONLY_STATUSES.includes(existing.status)) {
-          status = 'Won';
-        }
-        upsertLead({ ...lead, status });
-        total++;
-      }
-      if (records.length < 100) break;
-      page++;
-      if (page > 50) break;
+// Every status this build knows means "a proposal exists or has progressed":
+// the three open stages, confirmed (booked), and 'won' (not seen from the API
+// so far, included per spec). ANY event for an email counts — including
+// canceled/archived/postponed and unrecognized statuses — because a contact
+// who has ever had a proposal must not be dropped into cold nurture. This is
+// deliberately broader than isRelevantProposalEvent() (which only decides what
+// gets IMPORTED as a lead row).
+const PROPOSAL_STATUSES = [...OPEN_PROPOSAL_STATUSES, 'confirmed', 'won'];
+
+function buildProposalEmailSet(events) {
+  const set = new Set();
+  events.forEach((record) => {
+    const attrs = (record && record.attributes) || record || {};
+    if (attrs.status && !PROPOSAL_STATUSES.includes(attrs.status)) {
+      console.log(`syncCheckCherry: event with unlisted status "${attrs.status}" counted as a proposal (fail closed)`);
     }
-    recordStatus('CheckCherry Proposals', { ok: true, count: total });
-    console.log(`syncCheckCherryProposals: done (${total} proposals)`);
+    // customer_emails is a comma-joined string — take EVERY address, not just
+    // the first, so a proposal under a colleague's address on the same event
+    // still blocks.
+    String(attrs.customer_emails || '').split(',').forEach((e) => {
+      const email = e.trim().toLowerCase();
+      if (email) set.add(email);
+    });
+  });
+  return set;
+}
+
+async function processCheckCherryProposals(events) {
+  let total = 0;
+  for (const record of events) {
+    const attrs = (record && record.attributes) || {};
+    if (!isRelevantProposalEvent(attrs)) continue;
+    const lead = mapCheckCherryProposalEvent(record);
+    // Unlike the /leads path (which tolerates a name-only lead), this path
+    // requires an email: findLead()/upsertLead() dedupe by email alone, with
+    // no fallback key (no event id column on the leads table), so a name-only
+    // record would never match its own previously-inserted row — every
+    // 15-minute cycle would insert a fresh duplicate for the same event
+    // forever instead of updating one. No real event has come back email-less
+    // yet, but skip defensively rather than let that silently happen.
+    if (!lead.email) continue;
+
+    // Stamp the initial status only the first time this contact is seen —
+    // once it's a row in the leads table, staff manage its status from /admin
+    // like any other lead. Re-passing a status on every sync cycle (this runs
+    // every 15 min) would silently stomp a manual status change (e.g. to
+    // "Contacted") right back to whatever this sync would otherwise set it to.
+    //
+    // One deliberate exception: a convert_from_lead event reaching
+    // 'confirmed' whose row already exists here gets promoted to 'Won' — but
+    // only if its current status is one mapCheckCherryLead() could have set
+    // entirely on its own (see SYNC_ONLY_STATUSES), never a status a human
+    // actually chose.
+    const target = computeTarget(lead);
+    const existing = findLead(lead.email, target);
+    let status = '';
+    if (!existing) {
+      status = initialStatusFor(attrs);
+    } else if (attrs.status === 'confirmed' && SYNC_ONLY_STATUSES.includes(existing.status)) {
+      status = 'Won';
+    }
+    // A proposal-event row is a proposal by definition: never pushed to GHL
+    // as a new lead (ghlPushed only applies when the row is first inserted).
+    upsertLead({ ...lead, status, ghlPushed: 'excluded_proposal' });
+    total++;
+  }
+  return total;
+}
+
+// One CheckCherry sync cycle, in a deliberate order (replaces two parallel
+// syncs). Previously syncCheckCherry() and syncCheckCherryProposals() ran
+// concurrently, so a lead could be pushed and tagged new-lead a moment before
+// its proposal event was even fetched. Now:
+//   1. fetch /leads   (snapshot T1)
+//   2. fetch /events  (snapshot T2 > T1) -> the proposal-email set
+//   3. store events rows, then process leads with that set
+// Any lead that converted between T1 and T2 shows up in the T2 events, so it
+// is in the set. On top of that ghl-push.js holds a brand-new CheckCherry
+// lead back for one settle window (GHL_CHECKCHERRY_SETTLE_MINUTES, default 10
+// -> re-checked next cycle against fresh events) so a proposal created
+// minutes after the inquiry also lands before any tag is applied. If the
+// events fetch fails, leads are still stored for the dashboard but NOT
+// pushed (proposalEmails = null -> fail closed).
+async function syncCheckCherryAll() {
+  console.log('syncCheckCherry: starting');
+  const apiKey = process.env.CHECKCHERRY_API_KEY;
+  if (!apiKey) {
+    recordStatus('CheckCherry', { ok: null, error: 'not configured', count: 0 });
+    recordStatus('CheckCherry Proposals', { ok: null, error: 'not configured', count: 0 });
+    return;
+  }
+
+  let leadRecords = null;
+  try {
+    leadRecords = await fetchCheckCherryLeads(apiKey);
+  } catch (err) {
+    recordStatus('CheckCherry', { ok: false, error: err.message, count: 0 });
+  }
+
+  let events = null;
+  let proposalEmails = null;
+  try {
+    events = await fetchCheckCherryEvents(apiKey);
+    proposalEmails = buildProposalEmailSet(events);
   } catch (err) {
     recordStatus('CheckCherry Proposals', { ok: false, error: err.message, count: 0 });
+  }
+
+  if (events) {
+    try {
+      const total = await processCheckCherryProposals(events);
+      recordStatus('CheckCherry Proposals', { ok: true, count: total });
+      console.log(`syncCheckCherryProposals: done (${total} proposals)`);
+    } catch (err) {
+      recordStatus('CheckCherry Proposals', { ok: false, error: err.message, count: 0 });
+    }
+  }
+
+  if (leadRecords) {
+    try {
+      const total = await processCheckCherryLeads(leadRecords, proposalEmails);
+      recordStatus('CheckCherry', { ok: true, count: total });
+      console.log(`syncCheckCherry: done (${total} leads)`);
+    } catch (err) {
+      recordStatus('CheckCherry', { ok: false, error: err.message, count: 0 });
+    }
   }
 }
 
@@ -524,6 +618,7 @@ async function syncGHL() {
         owner: '',
         notes,
         nextFollowUp: 'Yes',
+        ghlPushed: 'excluded_source', // already a GHL contact — never pushed back
       });
       total++;
     }
@@ -682,7 +777,7 @@ async function syncCsvSheet(envVar, sourceName) {
         : mapGenericCsvRow(rowObj, sourceName);
       if (!lead) continue;
 
-      upsertLead(lead);
+      await upsertAndPush(lead);
       total++;
     }
     recordStatus(sourceName, { ok: true, count: total });
@@ -964,7 +1059,7 @@ async function syncWixFormSubmissions(apiKey, form) {
     for (const record of submissions) {
       const lead = mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel);
       if (!lead) continue;
-      upsertLead(lead);
+      await upsertAndPush(lead);
       total++;
     }
     const meta = body.metadata || {};
@@ -998,8 +1093,7 @@ async function syncWixForms() {
 async function runFullSync() {
   console.log('runFullSync: starting');
   await Promise.allSettled([
-    syncCheckCherry(),
-    syncCheckCherryProposals(),
+    syncCheckCherryAll(),
     syncGHL(),
     syncCsvSheet('META_ADS_CSV_URL', 'Meta Ads'),
     syncCsvSheet('GOOGLE_ADS_CSV_URL', 'Google Ads'),
@@ -1008,4 +1102,4 @@ async function runFullSync() {
   return getSyncStatus();
 }
 
-module.exports = { runFullSync, getSyncStatus };
+module.exports = { runFullSync, getSyncStatus, buildProposalEmailSet, fetchCheckCherryEvents, PROPOSAL_STATUSES };

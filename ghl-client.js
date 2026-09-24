@@ -1,5 +1,5 @@
-// Thin GHL (LeadConnector) API client, scoped to exactly what the Wix lead
-// intake endpoint needs: find-by-email/phone, create, update, add tags,
+// Thin GHL (LeadConnector) API client, scoped to exactly what the lead push
+// (ghl-push.js) needs: find-by-email/phone, get, create, update, add tags,
 // add a note. Uses the same timeout-wrapped fetch() pattern already
 // established in sync.js (fetchWithTimeout) rather than a new HTTP library —
 // this project has no axios/node-fetch dependency and there's no reason to
@@ -96,6 +96,21 @@ async function findDuplicateContact({ email, phone }) {
   return (body && body.contact) || null;
 }
 
+// GET /contacts/{id} — the full contact, including tags and customFields.
+// Used to decide whether an existing contact is already "advanced" (see
+// ghl-push.js) before any new-lead tag is applied. Not assumed to be part of
+// the duplicate-search response, whose exact shape has never been verified
+// against a live call.
+async function getContact(contactId) {
+  const { apiKey } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/contacts/${encodeURIComponent(contactId)}`, {
+    headers: authHeaders(apiKey),
+  });
+  if (!res.ok) throw new GhlApiError(`GHL get-contact HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  const body = await res.json();
+  return body.contact || null;
+}
+
 // Returns { contact, created: true }. If GHL rejects the create as a
 // duplicate (allowDuplicateContact is OFF for this location, so this is a
 // real possibility under a race — e.g. a double-submit from Wix, or this
@@ -129,7 +144,7 @@ async function createContact(fields) {
 // field schema) and merges customFields by id rather than replacing the
 // whole array (confirmed behavior, see docs/ghl-phase3-results.md Step 6 —
 // setting one custom field via update-contact left every previously-set
-// field on the contact untouched). wix-lead-intake.js relies on exactly
+// field on the contact untouched). ghl-lead-plan.js relies on exactly
 // this: it only ever includes fields Wix actually supplied.
 async function updateContact(contactId, fields) {
   const { apiKey } = getConfig();
@@ -174,6 +189,7 @@ async function createNote(contactId, body) {
 module.exports = {
   GhlApiError,
   findDuplicateContact,
+  getContact,
   createContact,
   updateContact,
   addTags,

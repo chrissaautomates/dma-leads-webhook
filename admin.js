@@ -6,9 +6,9 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { listLeads, listChatLeadLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead, listLeadsSince } = require('./db');
+const { listLeads, listChatLeadLeads, getLead, updateLeadFromAdmin, addLeadFromAdmin, deleteLead, listLeadsSince, getProposalState } = require('./db');
 const { previewLead, getPushConfig, describeMode } = require('./ghl-push');
-const { fetchCheckCherryEvents, buildProposalEmailSet } = require('./sync');
+const { fetchCheckCherryEvents, buildProposalIndex } = require('./sync');
 
 const router = express.Router();
 const SESSION_COOKIE_NAME = 'dma_admin_session';
@@ -817,30 +817,80 @@ router.get('/ghl-preview', async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
 
   const out = [`GHL push dry-run preview — read-only, nothing is sent or marked`, `push mode right now: ${describeMode()}`, `rows received since ${since}, newest first (limit ${limit})`, ''];
+  let proposalIndex = null;
   let proposalEmails = null;
   if (process.env.CHECKCHERRY_API_KEY) {
     try {
-      proposalEmails = buildProposalEmailSet(await fetchCheckCherryEvents(process.env.CHECKCHERRY_API_KEY));
+      proposalIndex = buildProposalIndex(await fetchCheckCherryEvents(process.env.CHECKCHERRY_API_KEY));
+      proposalEmails = new Set(proposalIndex.keys());
       out.push(`CheckCherry proposal set loaded: ${proposalEmails.size} email(s)`, '');
     } catch (err) {
       out.push(`CheckCherry events fetch FAILED (${err.message}) — CheckCherry rows will show as deferred`, '');
     }
   }
+  const stored = getProposalState();
+  out.push(`stored proposal set (used by every source's push): ${stored.loaded ? `${stored.count} email(s), loaded ${stored.loadedAt} UTC` : 'NOT LOADED YET'}`, '');
 
   const counts = {};
   const cfg = { ...getPushConfig(), cutoff: since };
+  const results = [];
   for (const row of listLeadsSince(since, limit)) {
     const lead = {
       source: row.source, name: row.name, company: row.company, email: row.email, phone: row.phone,
-      location: row.location, interest: row.interest, notes: row.notes,
+      location: row.location, interest: row.interest, notes: row.notes, status: row.status,
       utmSource: row.utm_source, utmMedium: row.utm_medium, utmCampaign: row.utm_campaign,
       utmContent: row.utm_content, utmTerm: row.utm_term,
     };
     const r = await previewLead(lead, row, { proposalEmails }, cfg);
     counts[r.verdict] = (counts[r.verdict] || 0) + 1;
-    const who = `#${row.id} ${row.date_received} ${row.email || row.name || '(no email)'} [${row.source}] target=${row.target} db-status=${row.status} ghl_pushed=${row.ghl_pushed}`;
-    out.push(`${r.verdict.toUpperCase().padEnd(11)} ${who}`);
+    const email = String(row.email || '').trim().toLowerCase();
+    results.push({ row, email, r });
+    out.push(`${r.verdict.toUpperCase().padEnd(11)} #${row.id} ${row.date_received} ${row.email || row.name || '(no email)'} [${row.source}] target=${row.target} db-status=${row.status} ghl_pushed=${row.ghl_pushed}`);
     out.push(`            ${r.line || r.reason}`);
+
+    // HOW a proposal matched: the actual CheckCherry event(s) behind it.
+    const matches = proposalIndex && email ? proposalIndex.get(email) : null;
+    if (matches) {
+      matches.slice(0, 3).forEach((m) => {
+        const flags = [m.canceled && 'CANCELED', m.archived && 'ARCHIVED', m.postponed && 'POSTPONED'].filter(Boolean).join(',');
+        const days = m.createdAt ? Math.round((Date.parse(m.createdAt) - Date.parse(row.date_received)) / 86400000) : null;
+        const rel = days === null ? 'event date unknown' : days === 0 ? 'event created the SAME DAY as this lead' : days > 0 ? `event created ${days}d AFTER this lead` : `event created ${-days}d BEFORE this lead`;
+        out.push(`            matched event ${m.id || '?'}: status=${m.status} via=${m.createdVia || '-'} created=${m.createdAt || '-'}${flags ? ` [${flags}]` : ''} title="${m.title}" | this email is address #${m.position + 1} on the event | ${rel}`);
+      });
+      if (matches.length > 3) out.push(`            …and ${matches.length - 3} more event(s) for this email`);
+    }
+  }
+
+  // Over-breadth diagnostics: for rows whose email is in the proposal set, how
+  // do they break down? These are the categories where "has a proposal" might
+  // be wrong for a genuinely new inquiry.
+  if (proposalIndex) {
+    const matched = results.filter((x) => x.email && proposalIndex.has(x.email));
+    if (matched.length) {
+      const only = (x, pred) => proposalIndex.get(x.email).every(pred);
+      const dead = (m) => m.canceled || m.archived || m.postponed;
+      const before = (x) => proposalIndex.get(x.email).every((m) => m.createdAt && m.createdAt < x.row.date_received);
+      out.push('', `Proposal-match breakdown for the ${matched.length} listed row(s) whose email is in the proposal set:`);
+      out.push(`  - matched ONLY by canceled/archived/postponed events: ${matched.filter((x) => only(x, dead)).length}`);
+      out.push(`  - matched ONLY by events created BEFORE the lead (returning client, not this inquiry): ${matched.filter(before).length}`);
+      out.push(`  - matched only via a NON-primary address on the event (colleague/assistant/agency): ${matched.filter((x) => only(x, (m) => m.position > 0)).length}`);
+      out.push(`  - of these, db-status is still New (stale — sync doesn't update status when a proposal is later created): ${matched.filter((x) => x.row.status === 'New').length}`);
+    }
+  }
+
+  // Same email in several rows (different sources / targets): one GHL contact.
+  const byEmail = new Map();
+  results.forEach((x) => { if (x.email) { if (!byEmail.has(x.email)) byEmail.set(x.email, []); byEmail.get(x.email).push(x); } });
+  const dupes = [...byEmail.entries()].filter(([, rows]) => rows.length > 1);
+  if (dupes.length) {
+    out.push('', `Same email in more than one row (${dupes.length}) — these all resolve onto ONE GHL contact:`);
+    dupes.forEach(([email, rows]) => {
+      const newLeadFlags = new Set(rows.map((x) => (x.r.line || '').match(/new-lead: (YES|NO)/)).filter(Boolean).map((m) => m[1]));
+      const verdicts = new Set(rows.map((x) => x.r.verdict));
+      // Consistent = every row lands the same way (same verdict, and the same new-lead answer).
+      const consistent = newLeadFlags.size <= 1 && verdicts.size === 1;
+      out.push(`  ${email}: ${rows.map((x) => `#${x.row.id} [${x.row.source}] ${x.r.verdict}${(x.r.line || '').match(/route=(\S+)/) ? ` route=${(x.r.line || '').match(/route=(\S+)/)[1]}` : ''}`).join('  +  ')}  =>  ${consistent ? 'CONSISTENT' : 'CONFLICT — sources disagree on new-lead, review'}`);
+    });
   }
   out.push('', `Summary: ${JSON.stringify(counts)}`);
   res.type('text').send(out.join('\n'));

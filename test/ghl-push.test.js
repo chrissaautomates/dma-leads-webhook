@@ -11,9 +11,9 @@ process.env.GHL_LOCATION_ID = 'WWFoHKH8wu9QTuAKBUzK';
 const { test, describe, beforeEach, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { db, upsertLead } = require('../db');
+const { db, upsertLead, setProposalEmails, getProposalState, hasProposalEmail } = require('../db');
 const push = require('../ghl-push');
-const { buildProposalEmailSet } = require('../sync');
+const { buildProposalEmailSet, buildProposalIndex } = require('../sync');
 const { FIELDS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('../ghl-canonical');
 
 // 'advanced' reason (or null) for a contact — the skip bucket only.
@@ -74,7 +74,11 @@ function setEnv(env) {
   Object.entries(env).forEach(([k, v]) => { process.env[k] = v; });
 }
 
-beforeEach(() => { resetGhl(); logs = []; setEnv({}); });
+beforeEach(() => {
+  resetGhl(); logs = []; setEnv({});
+  delete process.env.CHECKCHERRY_API_KEY;
+  db.exec(`DELETE FROM proposal_emails; DELETE FROM sync_state;`);
+});
 
 // ---------------------------------------------------------------------------
 describe('modes: dry-run default, kill switch, cutoff requirement', () => {
@@ -522,5 +526,187 @@ describe('buildProposalEmailSet (sync.js)', () => {
   });
   test('events with no email contribute nothing', () => {
     assert.equal(buildProposalEmailSet([ev('confirmed', '')]).size, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('spam exclusion', () => {
+  beforeEach(() => setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01', GHL_CHECKCHERRY_SETTLE_MINUTES: '0' }));
+
+  test('a lead with status Spam is EXCLUDED — no GHL call, row marked, never new-lead', async () => {
+    const lead = newLead({ status: 'Spam' });
+    const result = insert(lead);
+    assert.equal(await push.pushAfterUpsert(lead, result), 'excluded_spam');
+    assert.equal(calls.length, 0);
+    assert.equal(rowOf(result.id).ghl_pushed, 'excluded_spam');
+  });
+
+  test('CheckCherry spam flag (mapped to status Spam) is excluded', async () => {
+    const lead = newLead({ source: 'CheckCherry', status: 'Spam', email: 'john.doe@gmail.com' });
+    const result = insert(lead);
+    assert.equal(await push.pushAfterUpsert(lead, result, { proposalEmails: new Set() }), 'excluded_spam');
+    assert.equal(calls.length, 0);
+  });
+
+  test('marked Spam in /admin AFTER insert but BEFORE the push: still excluded (row status is re-read)', async () => {
+    const lead = newLead({ status: 'New' });
+    const result = insert(lead);
+    db.prepare(`UPDATE leads SET status = 'Spam' WHERE id = ?`).run(result.id);
+    assert.equal(await push.pushAfterUpsert(lead, { action: 'updated', id: result.id }), 'excluded_spam');
+    assert.equal(calls.length, 0);
+  });
+
+  test('spam is excluded for every pushable source', async () => {
+    for (const source of ['Wix Form - Homepage', 'Meta Ads', 'Google Ads']) {
+      const lead = newLead({ source, status: 'spam' });
+      assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'excluded_spam', source);
+    }
+    assert.equal(calls.length, 0);
+  });
+
+  test('other statuses (New / Contacted / Converted) are NOT treated as spam', async () => {
+    for (const status of ['New', 'Contacted', 'Converted']) {
+      assert.equal(push.isSpamLead({ status }, { status }), false, status);
+    }
+  });
+
+  test('dry-run lists the spam lead as WOULD EXCLUDE and marks nothing', async () => {
+    setEnv({});
+    const lead = newLead({ status: 'Spam', email: 'john.doe@gmail.com' });
+    const result = insert(lead);
+    await push.pushAfterUpsert(lead, result);
+    assert.ok(logs.some((l) => l.includes('WOULD EXCLUDE') && l.includes('john.doe@gmail.com') && l.includes('Spam')));
+    assert.equal(rowOf(result.id).ghl_pushed, null);
+  });
+});
+
+describe('same email from two sources: the proposal always wins (any source, any order)', () => {
+  let EMAIL;
+  let contact;
+
+  // Stateful GHL: one contact shared by every push, accumulating tags.
+  function statefulGhl() {
+    contact = null;
+    global.fetch = async (url, options = {}) => {
+      const u = String(url); const method = (options && options.method) || 'GET';
+      calls.push({ method, url: u, body: options.body ? JSON.parse(options.body) : undefined });
+      const reply = (status, body) => ({ ok: status < 300, status, text: async () => JSON.stringify(body || {}), json: async () => body || {} });
+      if (u.includes('/search/duplicate')) return contact ? reply(200, { contact: { id: 'c1' } }) : reply(404);
+      if (method === 'GET') return reply(200, { contact: { id: 'c1', tags: [...contact.tags], customFields: [] } });
+      if (method === 'POST' && u.endsWith('/contacts/')) { contact = { tags: [] }; return reply(200, { contact: { id: 'c1' } }); }
+      if (method === 'PUT') return reply(200, { contact: { id: 'c1' } });
+      if (method === 'POST' && u.endsWith('/tags')) { contact.tags.push(...JSON.parse(options.body).tags); return reply(200); }
+      return reply(200);
+    };
+  }
+  const wixLead = () => ({ source: 'Wix Form - Homepage', name: 'Rosemary Byrne', email: EMAIL, dateReceived: '2026-10-05' });
+  const ccLead = () => ({ source: 'CheckCherry', name: 'Rosemary Byrne', email: EMAIL, dateReceived: '2026-10-05' });
+
+  beforeEach(() => {
+    seq += 1;
+    EMAIL = `rosemary.byrne${seq}@example.com`; // unique per test: rows dedupe by email, and the DB is shared across tests
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01', GHL_CHECKCHERRY_SETTLE_MINUTES: '0' });
+    setProposalEmails(new Set([EMAIL]));
+    statefulGhl();
+  });
+  after(() => { global.fetch = mockFetch; });
+
+  for (const order of ['wix-first', 'checkcherry-first']) {
+    test(`live, ${order}: she ends with NO new-lead, both source tags, ONE contact`, async () => {
+      const wix = wixLead(); const cc = ccLead();
+      const rw = insert(wix); const rc = insert(cc);
+      assert.notEqual(rw.id, rc.id, 'two DB rows (different targets), one email');
+      const steps = order === 'wix-first'
+        ? [[wix, rw, {}], [cc, rc, { proposalEmails: new Set([EMAIL]) }]]
+        : [[cc, rc, { proposalEmails: new Set([EMAIL]) }], [wix, rw, {}]];
+      for (const [l, r, ctx] of steps) assert.equal(await push.pushAfterUpsert(l, r, ctx), 'pushed');
+      assert.equal(calls.filter((c) => c.method === 'POST' && c.url.endsWith('/contacts/')).length, 1, 'contact created once');
+      assert.ok(!contact.tags.includes('new-lead'), `tags: ${contact.tags}`);
+      assert.deepEqual([...contact.tags].sort(), ['source-checkcherry', 'source-wix']);
+    });
+  }
+
+  test('Wix / Meta / Google alone (no CheckCherry row) also get no new-lead when the email has a proposal', async () => {
+    const sources = ['Wix Form - Homepage', 'Meta Ads', 'Google Ads'];
+    const emails = sources.map((_, i) => `${i}.${EMAIL}`);
+    setProposalEmails(new Set(emails));
+    for (const [i, source] of sources.entries()) {
+      statefulGhl(); calls = [];
+      const lead = { source, name: 'Rosemary Byrne', email: emails[i], dateReceived: '2026-10-05' };
+      assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'pushed', source);
+      assert.ok(!contact.tags.includes('new-lead'), source);
+    }
+  });
+
+  test('an email WITHOUT a proposal still gets new-lead from Wix (unconditional for non-CheckCherry sources)', async () => {
+    const lead = { source: 'Wix Form - Homepage', name: 'Fresh Person', email: 'fresh.person@example.com', dateReceived: '2026-10-05' };
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.ok(contact.tags.includes('new-lead'));
+  });
+
+  test('dry-run shows the same answer for BOTH rows: no new-lead (not one YES and one NO)', async () => {
+    setEnv({ GHL_CHECKCHERRY_SETTLE_MINUTES: '0' });
+    global.fetch = mockFetch; resetGhl();
+    const wix = wixLead(); const cc = ccLead();
+    await push.pushAfterUpsert(wix, insert(wix));
+    await push.pushAfterUpsert(cc, insert(cc), { proposalEmails: new Set([EMAIL]) });
+    const lines = logs.filter((l) => l.includes('WOULD') && l.includes(EMAIL));
+    assert.equal(lines.length, 2);
+    lines.forEach((l) => { assert.match(l, /new-lead: NO/); assert.match(l, /route=no-new-lead/); });
+  });
+});
+
+describe('proposal set is shared with every source (fail closed until loaded)', () => {
+  beforeEach(() => setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' }));
+
+  test('CheckCherry configured but the set was never loaded: non-CheckCherry pushes DEFER', async () => {
+    process.env.CHECKCHERRY_API_KEY = 'cc';
+    const lead = newLead();
+    assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'defer');
+    assert.equal(calls.length, 0);
+  });
+
+  test('once a set is stored, other sources use it (even when this cycle fetched nothing)', async () => {
+    process.env.CHECKCHERRY_API_KEY = 'cc';
+    setProposalEmails(new Set(['someone@else.com']));
+    const lead = newLead();
+    assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'pushed');
+  });
+
+  test('no CheckCherry integration configured at all: no proposal source, sources push normally', async () => {
+    const lead = newLead();
+    assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'pushed');
+  });
+
+  test("CheckCherry's own leads never fall back to a stale set (fresh only)", async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01', GHL_CHECKCHERRY_SETTLE_MINUTES: '0' });
+    setProposalEmails(new Set(['x@y.com']));
+    const lead = newLead({ source: 'CheckCherry' });
+    assert.equal(await push.pushAfterUpsert(lead, insert(lead), { proposalEmails: null }), 'defer');
+  });
+
+  test('setProposalEmails replaces the whole set atomically and records when', () => {
+    setProposalEmails(new Set(['a@x.com', 'b@x.com']));
+    assert.equal(getProposalState().count, 2);
+    setProposalEmails(new Set(['c@x.com']));
+    assert.equal(getProposalState().count, 1);
+    assert.equal(hasProposalEmail('A@x.com'), false);
+    assert.equal(hasProposalEmail(' C@X.com '), true);
+    assert.equal(getProposalState().loaded, true);
+  });
+});
+
+describe('buildProposalIndex — every match traces to a real event', () => {
+  const rec = (id, attrs) => ({ id, attributes: attrs });
+  test('records status, via, created date, flags and the address position', () => {
+    const idx = buildProposalIndex([
+      rec('e1', { status: 'confirmed', created_via: 'convert_from_lead', created_at: '2026-10-08T12:00:00Z', customer_emails: 'Main@x.com, assistant@x.com', title: 'Gala', canceled: true }),
+    ]);
+    assert.deepEqual(idx.get('main@x.com'), [{ id: 'e1', status: 'confirmed', createdVia: 'convert_from_lead', createdAt: '2026-10-08', canceled: true, archived: false, postponed: false, title: 'Gala', position: 0 }]);
+    assert.equal(idx.get('assistant@x.com')[0].position, 1);
+  });
+  test('an email with several events keeps all of them', () => {
+    const idx = buildProposalIndex([rec('a', { status: 'confirmed', customer_emails: 'r@x.com' }), rec('b', { status: 'proposal_date_open', customer_emails: 'r@x.com' })]);
+    assert.equal(idx.get('r@x.com').length, 2);
   });
 });

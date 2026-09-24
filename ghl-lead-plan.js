@@ -143,6 +143,13 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
   if (context.reengageReason && !isNewContact) {
     return { applied: false, reason: `dead deal (${context.reengageReason}) — routed to ${TAGS.NEWSLETTER_REENGAGEMENT}, not new-lead` };
   }
+  // Cross-source proposal gate: if CheckCherry has a proposal/booking for this
+  // email, NO source may tag new-lead — the more advanced signal always wins,
+  // whichever door the lead came through. (context.proposal comes from
+  // ghl-push.js; absent in pure unit tests.)
+  if (context.proposal && context.proposal.has) {
+    return { applied: false, reason: 'CheckCherry already has a proposal/booking for this email' };
+  }
   if (profile.applyNewLead) {
     const policy = profile.applyNewLead({ lead, context });
     if (!policy.allow) return { applied: false, reason: policy.reason };
@@ -160,7 +167,7 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
 //
 // options.profile — { leadSourceOption, sourceTag, nativeSource,
 //   lastActivityLabel, noteLabel, applyNewLead({lead, context}) }
-// options.context — { advancedReason: string|null, reengageReason: string|null,
+// options.context — { proposal: {known, has}, advancedReason: string|null, reengageReason: string|null,
 //   hasNewLeadTag: bool, hasReengageTag: bool,
 //   proposalEmails: Set|null } — facts about the existing contact / source
 //   state, gathered by ghl-push.js (this function stays pure).

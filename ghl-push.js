@@ -27,7 +27,7 @@
 const ghl = require('./ghl-client');
 const { buildLeadPlan } = require('./ghl-lead-plan');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed } = require('./db');
+const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -143,6 +143,37 @@ function isBarrLead(lead, row) {
   return BARR_PATTERN.test(haystack);
 }
 
+// Spam: a lead marked Spam — by CheckCherry's own spam flag (mapped to status
+// 'Spam' in sync.js) or by staff in /admin — must never enter the funnel. Checks
+// both the stored row (fresh: catches a lead marked spam AFTER it was inserted
+// but before it was pushed) and the incoming lead.
+function isSpamLead(lead, row) {
+  const isSpam = (v) => String(v == null ? '' : v).trim().toLowerCase() === 'spam';
+  return isSpam(row && row.status) || isSpam(lead && lead.status);
+}
+
+// Does CheckCherry have a proposal/booking for this email? Applies to EVERY
+// source, not just CheckCherry: the same person arriving through Wix / Meta /
+// Google must not be tagged new-lead when a proposal already exists. The
+// truth is the events feed; each successful CheckCherry cycle stores the set
+// (db.js proposal_emails), so any source can ask.
+//   requireFresh (CheckCherry's own leads): only this cycle's set counts —
+//   if the events fetch failed, don't guess from a stale copy.
+//   { known: false } -> the caller must not push (fail closed).
+function proposalLookup(email, context, { requireFresh = false } = {}) {
+  if (context && context.proposalEmails) {
+    return { known: true, has: context.proposalEmails.has(email), from: 'this cycle' };
+  }
+  if (requireFresh) return { known: false, has: false, from: null };
+  const state = getProposalState();
+  if (state.loaded) return { known: true, has: hasProposalEmail(email), from: `stored set (${state.count} emails, loaded ${state.loadedAt} UTC)` };
+  // Nothing stored yet. With no CheckCherry integration configured there is no
+  // proposal source at all, so "no proposal" is the honest answer; otherwise
+  // the first load simply hasn't happened yet -> wait (fail closed).
+  if (!process.env.CHECKCHERRY_API_KEY) return { known: true, has: false, from: 'CheckCherry not configured' };
+  return { known: false, has: false, from: null };
+}
+
 function settleWindowMinutes(env = process.env) {
   const raw = env.GHL_CHECKCHERRY_SETTLE_MINUTES;
   const n = raw === undefined || raw === '' ? NaN : Number(raw);
@@ -158,16 +189,24 @@ function assess(lead, row, cfg, context) {
   const profile = profileForSource(lead.source);
   if (!profile) return { kind: 'exclude', terminal: 'excluded_source', reason: `source "${lead.source || ''}" is not pushed to GHL` };
   if (isBarrLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_barr', reason: 'BuyAndRentRobots lead — not for the DMA Events funnel' };
+  if (isSpamLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_spam', reason: 'lead is marked Spam — never enters the funnel' };
   if (cfg.cutoff && row && row.date_received < cfg.cutoff) {
     return { kind: 'skip', reason: `received ${row.date_received}, before cutoff ${cfg.cutoff}` };
   }
   if (!normEmail(lead.email) && !String(lead.phone || '').trim()) {
     return { kind: 'exclude', terminal: 'skipped_no_contact', reason: 'no email or phone to match/create a GHL contact' };
   }
-  if (profile.key === 'checkcherry') {
-    if (!(context && context.proposalEmails)) {
-      return { kind: 'defer', reason: 'CheckCherry events feed not loaded this cycle — cannot check for a proposal' };
-    }
+  const isCheckCherry = profile.key === 'checkcherry';
+  const proposal = proposalLookup(normEmail(lead.email), context, { requireFresh: isCheckCherry });
+  if (!proposal.known) {
+    return {
+      kind: 'defer',
+      reason: isCheckCherry
+        ? 'CheckCherry events feed not loaded this cycle — cannot check for a proposal'
+        : 'CheckCherry proposal set not loaded yet — cannot check this email for a proposal (fail closed)',
+    };
+  }
+  if (isCheckCherry) {
     // Settle window: a proposal created minutes after the inquiry must land
     // before any tag is applied. A brand-new row waits until a later sync
     // cycle re-checks it against fresh events. (See syncCheckCherryAll.)
@@ -177,7 +216,7 @@ function assess(lead, row, cfg, context) {
       return { kind: 'defer', reason: `CheckCherry settle window (${settleMinutes} min) — re-checked next cycle against fresh events` };
     }
   }
-  return { kind: 'push', profile };
+  return { kind: 'push', profile, proposal };
 }
 
 // --- Advanced-contact guard -------------------------------------------------
@@ -355,7 +394,7 @@ async function pushAfterUpsert(lead, result, context = {}) {
 
     // kind === 'push'
     if (dry && dryRunLogged.has(row.id)) return 'dry-run-seen';
-    const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context, dryRun: dry });
+    const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context: { ...context, proposal: decision.proposal }, dryRun: dry });
     if (dry) {
       dryRunLogged.add(row.id);
       console.log(`[ghl-push][DRY-RUN] WOULD ${describeOutcome(lead, decision.profile, outcome)}`);
@@ -377,7 +416,7 @@ async function previewLead(lead, row, context = {}, cfg = getPushConfig()) {
   const decision = assess(lead, row, { ...cfg, cutoff: cfg.cutoff }, context);
   if (decision.kind !== 'push') return { verdict: decision.kind, reason: decision.reason };
   try {
-    const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context, dryRun: true });
+    const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context: { ...context, proposal: decision.proposal }, dryRun: true });
     return { verdict: 'would-push', line: describeOutcome(lead, decision.profile, outcome) };
   } catch (err) {
     return { verdict: 'error', reason: err.message };
@@ -391,6 +430,8 @@ module.exports = {
   describeMode,
   profileForSource,
   isBarrLead,
+  isSpamLead,
+  proposalLookup,
   assess,
   classifyContact,
   pushLeadToGhl,

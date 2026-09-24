@@ -105,7 +105,16 @@ never keywords):
 |---|---|---|
 | **Skip** (active/booked) | carries any of the 16 `ADVANCED_TAGS`, **or** Lead Status beyond Nurture other than Lost / Not Ready | minimal update (last-activity + note). **No tags.** |
 | **Re-engage** (dead deal) | carries one of the 5 `DEAD_DEAL_TAGS`, **or** Lead Status is Lost / Not Ready | minimal update + tag **`newsletter-reengagement`** only. Never `new-lead`. |
-| **New-lead** (cold) | brand-new contact, or an existing one in neither bucket above | source tag + **`new-lead`** (unless already present). CheckCherry: only if CheckCherry has no event for that email. |
+| **New-lead** (cold) | brand-new contact, or an existing one in neither bucket above | source tag + **`new-lead`** (unless already present) — but **only if CheckCherry has no event (proposal/booking) for that email, whichever source the lead came through.** |
+
+**One email, several sources.** Leads dedupe by email *and* target, so the same
+person arriving via Wix and CheckCherry is two rows but one GHL contact. Each
+row is pushed on its own, so the decisions must agree regardless of order. They
+do because the proposal check is shared: every successful CheckCherry cycle
+stores its set of proposal emails (`proposal_emails` table) and **every** source
+consults it — a proposal blocks `new-lead` for that email from any door. Until
+that set has loaded once, non-CheckCherry pushes wait (fail closed); CheckCherry
+leads always need this cycle's fresh set.
 
 Active always wins: a contact that is both a dead deal and active (e.g. `proposal
 expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
@@ -114,7 +123,7 @@ expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
 is a separate GHL workflow/broadcast that must also check **DMA Marketing Consent
 = Yes** (CASL) before sending.
 
-**Never pushed:** BuyAndRentRobots leads (any lead whose text/UTMs match the
+**Never pushed:** leads with status **Spam** (CheckCherry's spam flag, or set in `/admin` — re-checked at push time), BuyAndRentRobots leads (any lead whose text/UTMs match the
 BARR keywords `humanoid | robot rental | buyandrentrobots`, or that is filed
 under the BARR tab), Chat Lead (already in GHL), manual `/admin` entries,
 `/webhook/lead` events, and CheckCherry proposal-event rows.
@@ -133,7 +142,7 @@ The `leads.ghl_pushed` column records push state per row. On first boot after
 this change every existing row is stamped `legacy` (in the same transaction as
 the `ALTER TABLE`), so the back catalog can never be sent. `NULL` = pending.
 Other terminal values: `pushed`, `excluded_barr`, `excluded_source`,
-`excluded_proposal`, `skipped_no_contact`. A pending row that fails (GHL error)
+`excluded_proposal`, `excluded_spam`, `skipped_no_contact`. A pending row that fails (GHL error)
 or is deferred (CheckCherry events unavailable / settle window) is retried on
 the next 15-minute cycle.
 
@@ -144,7 +153,10 @@ the next 15-minute cycle.
   read-only. Runs already-stored rows received since that date through the same
   decision path and lists what would be pushed / tagged / skipped / excluded —
   the way to review real records before going live, since legacy rows are
-  otherwise locked out.
+  otherwise locked out. For every proposal match it prints the CheckCherry
+  event(s) behind it (status, how created, date, which address, before/after the
+  lead), a breakdown of possibly over-broad matches, and a section for emails
+  that appear in more than one row (flags any disagreement as CONFLICT).
 
 ### Local test
 

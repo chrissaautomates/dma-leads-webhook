@@ -98,6 +98,17 @@ if (!db.prepare(`PRAGMA table_info(leads)`).all().some((c) => c.name === 'ghl_pu
   console.log(`ghl_pushed migration: column added, ${db.prepare(`SELECT COUNT(*) n FROM leads WHERE ghl_pushed = 'legacy'`).get().n} existing row(s) marked legacy`);
 }
 
+// Emails that CheckCherry has an event (proposal/booking) for, refreshed from
+// the events feed on every successful CheckCherry cycle (see sync.js). Stored
+// here — not just held in memory — so EVERY source's GHL push can consult it:
+// a Wix / Meta / Google lead whose email has a CheckCherry proposal must not be
+// tagged new-lead just because it arrived through a different door. Persisting
+// it also means a restart doesn't leave the other sources without a set while
+// the (slow, ~40s) events fetch runs. Not GHL push state — it is a cache of
+// CheckCherry data and is written in every mode, dry-run included.
+db.exec(`CREATE TABLE IF NOT EXISTS proposal_emails (email TEXT PRIMARY KEY)`);
+db.exec(`CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT)`);
+
 // One-time fixup: rows synced before CheckCherry got its own tab were
 // routed to DMA/BARR by content keywords alone (the only rule that existed
 // at the time), even though their source is 'CheckCherry'. computeTarget()
@@ -402,9 +413,39 @@ function listLeadsSince(since, limit) {
   return db.prepare(`SELECT * FROM leads WHERE date_received >= ? ORDER BY id DESC LIMIT ?`).all(since, limit);
 }
 
+const replaceProposalEmails = db.transaction((emails) => {
+  db.exec(`DELETE FROM proposal_emails`);
+  const ins = db.prepare(`INSERT OR IGNORE INTO proposal_emails (email) VALUES (?)`);
+  for (const e of emails) ins.run(e);
+  db.prepare(`INSERT INTO sync_state (key, value) VALUES ('proposal_emails_loaded_at', datetime('now'))
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
+});
+
+// Replaces the stored set with the latest successfully-fetched one (all-or-
+// nothing). Only call with a COMPLETE set — never after a failed fetch.
+function setProposalEmails(emailSet) {
+  replaceProposalEmails([...emailSet]);
+}
+
+// { loaded, loadedAt, count } — loaded=false until the first successful load.
+function getProposalState() {
+  const row = db.prepare(`SELECT value FROM sync_state WHERE key = 'proposal_emails_loaded_at'`).get();
+  return {
+    loaded: !!row,
+    loadedAt: row ? row.value : null,
+    count: row ? db.prepare(`SELECT COUNT(*) n FROM proposal_emails`).get().n : 0,
+  };
+}
+
+function hasProposalEmail(email) {
+  const e = (email || '').toString().trim().toLowerCase();
+  if (!e) return false;
+  return !!db.prepare(`SELECT 1 FROM proposal_emails WHERE email = ?`).get(e);
+}
+
 // GHL push state for one row: { ghl_pushed, date_received, target, ... }.
 function getGhlState(id) {
-  return db.prepare(`SELECT id, ghl_pushed, date_received, target, created_at FROM leads WHERE id = ?`).get(id);
+  return db.prepare(`SELECT id, ghl_pushed, date_received, target, created_at, status FROM leads WHERE id = ?`).get(id);
 }
 
 // Only ever moves a row OUT of pending (NULL) — never overwrites a terminal
@@ -417,6 +458,9 @@ module.exports = {
   db,
   BARR_PATTERN,
   getGhlState,
+  setProposalEmails,
+  getProposalState,
+  hasProposalEmail,
   markGhlPushed,
   listLeadsSince,
   upsertLead,

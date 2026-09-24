@@ -2,7 +2,7 @@
 // GHL API, and Google Sheets published-to-web CSVs (Meta Ads / Google Ads).
 // Each source is independent and best-effort.
 
-const { upsertLead, findLead, computeTarget } = require('./db');
+const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert } = require('./ghl-push');
 
 const status = {};
@@ -281,22 +281,41 @@ async function fetchCheckCherryEvents(apiKey) {
 // gets IMPORTED as a lead row).
 const PROPOSAL_STATUSES = [...OPEN_PROPOSAL_STATUSES, 'confirmed', 'won'];
 
-function buildProposalEmailSet(events) {
-  const set = new Set();
+// email -> [event summaries]. The index behind the proposal set: every match
+// can be traced to the actual CheckCherry event(s) that caused it (used by the
+// /admin/ghl-preview breakdown to check the matching isn't over-broad).
+function buildProposalIndex(events) {
+  const index = new Map();
   events.forEach((record) => {
     const attrs = (record && record.attributes) || record || {};
     if (attrs.status && !PROPOSAL_STATUSES.includes(attrs.status)) {
       console.log(`syncCheckCherry: event with unlisted status "${attrs.status}" counted as a proposal (fail closed)`);
     }
+    const summary = {
+      id: (record && record.id) || attrs.id || null,
+      status: attrs.status || '',
+      createdVia: attrs.created_via || '',
+      createdAt: attrs.created_at ? String(attrs.created_at).slice(0, 10) : '',
+      canceled: !!attrs.canceled,
+      archived: !!attrs.archived,
+      postponed: !!attrs.postponed,
+      title: attrs.title || attrs.package_name || '',
+    };
     // customer_emails is a comma-joined string — take EVERY address, not just
     // the first, so a proposal under a colleague's address on the same event
     // still blocks.
-    String(attrs.customer_emails || '').split(',').forEach((e) => {
+    String(attrs.customer_emails || '').split(',').forEach((e, position) => {
       const email = e.trim().toLowerCase();
-      if (email) set.add(email);
+      if (!email) return;
+      if (!index.has(email)) index.set(email, []);
+      index.get(email).push({ ...summary, position }); // position 0 = the event's primary customer address
     });
   });
-  return set;
+  return index;
+}
+
+function buildProposalEmailSet(events) {
+  return new Set(buildProposalIndex(events).keys());
 }
 
 async function processCheckCherryProposals(events) {
@@ -376,6 +395,10 @@ async function syncCheckCherryAll() {
   try {
     events = await fetchCheckCherryEvents(apiKey);
     proposalEmails = buildProposalEmailSet(events);
+    // Share it with every other source's GHL push (see db.js). Only ever a
+    // COMPLETE, successfully-fetched set — a failed fetch leaves the previous
+    // stored set in place rather than overwriting it with nothing.
+    setProposalEmails(proposalEmails);
   } catch (err) {
     recordStatus('CheckCherry Proposals', { ok: false, error: err.message, count: 0 });
   }
@@ -1102,4 +1125,4 @@ async function runFullSync() {
   return getSyncStatus();
 }
 
-module.exports = { runFullSync, getSyncStatus, buildProposalEmailSet, fetchCheckCherryEvents, PROPOSAL_STATUSES };
+module.exports = { runFullSync, getSyncStatus, buildProposalEmailSet, buildProposalIndex, fetchCheckCherryEvents, PROPOSAL_STATUSES };

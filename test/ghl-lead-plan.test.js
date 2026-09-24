@@ -269,6 +269,16 @@ describe('buildLeadPlan — new-lead gate', () => {
     assert.equal(buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set(['jane@example.com']) } }).route, 'no-new-lead');
   });
 
+  test('cross-source: context.proposal.has blocks new-lead for ANY source profile', () => {
+    for (const key of ['wix', 'meta', 'google', 'checkcherry']) {
+      const plan = buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES[key], context: { proposal: { known: true, has: true }, proposalEmails: new Set(['jane@example.com']) } });
+      assert.ok(!plan.tags.includes('new-lead'), key);
+      assert.equal(plan.route, 'no-new-lead', key);
+    }
+    const ok = buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES.wix, context: { proposal: { known: true, has: false } } });
+    assert.ok(ok.tags.includes('new-lead'));
+  });
+
   test('CheckCherry: email in the proposal set -> no new-lead (source tag still applied)', () => {
     const plan = buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set(['jane@example.com']) } });
     assert.ok(!plan.tags.includes('new-lead'));

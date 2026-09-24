@@ -96,13 +96,23 @@ GHL's own workflow does that when `new-lead` is applied.
 | Google Ads | `source-google-ads` | Google Ad |
 | CheckCherry (`/leads` feed only) | `source-checkcherry` | Check Cherry |
 
-**`new-lead` tag** (the gate into the nurture funnel) — applied to new contacts
-from every source **except** CheckCherry, where it is applied only if
-CheckCherry has **no event (proposal/booking) for that email**. It is never
-applied to an *advanced* existing contact (Lead Status beyond New/Nurture, or a
-tag matching `proposal|won|booked|deposit|contract|client` — override with
-`GHL_ADVANCED_TAG_PATTERN`); those get a minimal update (last-activity + note,
-no tags). It is also never re-applied to a contact that already has it.
+**Three destinations, no overlap.** After the duplicate lookup, an *existing*
+GHL contact is put in exactly one bucket (tags matched by exact name, case-
+insensitive — see `ADVANCED_TAGS` / `DEAD_DEAL_TAGS` in `ghl-canonical.js`;
+never keywords):
+
+| Bucket | Who | What the push does |
+|---|---|---|
+| **Skip** (active/booked) | carries any of the 16 `ADVANCED_TAGS`, **or** Lead Status beyond Nurture other than Lost / Not Ready | minimal update (last-activity + note). **No tags.** |
+| **Re-engage** (dead deal) | carries one of the 5 `DEAD_DEAL_TAGS`, **or** Lead Status is Lost / Not Ready | minimal update + tag **`newsletter-reengagement`** only. Never `new-lead`. |
+| **New-lead** (cold) | brand-new contact, or an existing one in neither bucket above | source tag + **`new-lead`** (unless already present). CheckCherry: only if CheckCherry has no event for that email. |
+
+Active always wins: a contact that is both a dead deal and active (e.g. `proposal
+expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
+
+`newsletter-reengagement` only *tags* the contact. The monthly newsletter itself
+is a separate GHL workflow/broadcast that must also check **DMA Marketing Consent
+= Yes** (CASL) before sending.
 
 **Never pushed:** BuyAndRentRobots leads (any lead whose text/UTMs match the
 BARR keywords `humanoid | robot rental | buyandrentrobots`, or that is filed

@@ -14,7 +14,11 @@ const assert = require('node:assert/strict');
 const { db, upsertLead } = require('../db');
 const push = require('../ghl-push');
 const { buildProposalEmailSet } = require('../sync');
-const { FIELDS } = require('../ghl-canonical');
+const { FIELDS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('../ghl-canonical');
+
+// 'advanced' reason (or null) for a contact — the skip bucket only.
+const adv = (c) => { const r = push.classifyContact(c); return r.bucket === 'advanced' ? r.reason : null; };
+const bucketOf = (tags, status) => push.classifyContact({ tags, customFields: status ? [{ id: FIELDS.LEAD_STATUS, value: status }] : [] });
 
 // --- Route-based GHL mock ---------------------------------------------------
 let calls = [];
@@ -65,7 +69,7 @@ function insert(lead) { return upsertLead(lead); }
 const rowOf = (id) => db.prepare('SELECT * FROM leads WHERE id = ?').get(id);
 
 function setEnv(env) {
-  ['GHL_PUSH_LIVE', 'GHL_PUSH_DISABLED', 'GHL_PUSH_CUTOFF_DATE', 'GHL_CHECKCHERRY_SETTLE_MINUTES', 'GHL_ADVANCED_TAG_PATTERN']
+  ['GHL_PUSH_LIVE', 'GHL_PUSH_DISABLED', 'GHL_PUSH_CUTOFF_DATE', 'GHL_CHECKCHERRY_SETTLE_MINUTES']
     .forEach((k) => delete process.env[k]);
   Object.entries(env).forEach(([k, v]) => { process.env[k] = v; });
 }
@@ -232,17 +236,141 @@ describe('pushAfterUpsert — LIVE', () => {
 
   test('existing contact with a proposal-type tag counts as advanced', async () => {
     ghl.duplicate = 'ghl-78';
-    ghl.contact = { tags: ['Proposal Sent'], customFields: [] };
+    ghl.contact = { tags: ['Proposal Sent'], customFields: [] }; // exact list entry 'proposal sent' (case-insensitive)
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
     assert.equal(tagsSent(), null);
   });
 
+  test('advanced tags: every listed tag is advanced, matched by exact name (case-insensitive)', () => {
+    assert.equal(ADVANCED_TAGS.length, 16);
+    for (const tag of ADVANCED_TAGS) {
+      assert.equal(adv({ tags: [tag], customFields: [] }), `tag "${tag}"`, tag);
+      assert.ok(adv({ tags: [tag.toUpperCase()], customFields: [] }), `${tag} uppercased`);
+      assert.ok(adv({ tags: [`  ${tag} `], customFields: [] }), `${tag} padded`);
+    }
+  });
+
+  test('NO substring/keyword matching: "contractor" is not "contract", etc.', () => {
+    for (const tag of ['contractor', 'contract', 'proposal', 'proposals', 'won', 'client', 'clients', 'booked', 'deposit-refunded',
+      'call booked - cancelled', 'not-lead-won', 'cc-proposal', '2025-cc-clients', 'discovery call', 'appointment', 'source-wix', 'new-lead']) {
+      assert.equal(adv({ tags: [tag], customFields: [] }), null, tag);
+    }
+  });
+
+  test('exact means exact: no separator normalization ("proposal-sent" != "proposal sent")', () => {
+    assert.equal(adv({ tags: ['proposal-sent'], customFields: [] }), null);
+    assert.equal(adv({ tags: ['cc proposal sent'], customFields: [] }), null);
+  });
+
+  test('DEAD-DEAL tags are not in the advanced (skip) bucket', () => {
+    assert.equal(DEAD_DEAL_TAGS.length, 5);
+    for (const tag of DEAD_DEAL_TAGS) {
+      assert.equal(adv({ tags: [tag], customFields: [] }), null, tag);
+      assert.ok(!ADVANCED_TAGS.includes(tag), `${tag} must never be on the advanced list`);
+    }
+  });
+
+  test('a contact with a dead-deal tag AND an active tag is still advanced (active wins)', () => {
+    assert.equal(adv({ tags: ['proposal expired', 'deposit'], customFields: [] }), 'tag "deposit"');
+  });
+
+  test('DEAD-DEAL tags route to re-engagement (bucket 2) — not advanced, not normal', () => {
+    for (const tag of DEAD_DEAL_TAGS) {
+      const c = bucketOf([tag], 'Nurture');
+      assert.equal(c.bucket, 'reengage', tag);
+      assert.equal(c.reason, `tag "${tag}"`);
+    }
+  });
+
+  test('Lead Status Lost / Not Ready route to re-engagement; other beyond-Nurture statuses stay advanced', () => {
+    assert.deepEqual(REENGAGE_STATUSES, ['Lost', 'Not Ready']);
+    assert.equal(bucketOf([], 'Lost').bucket, 'reengage');
+    assert.equal(bucketOf([], 'not ready').bucket, 'reengage');
+    assert.equal(bucketOf([], 'Not Ready').reason, 'Lead Status = Not Ready');
+    for (const status of ['Engaged', 'Hot', 'Sales Priority', 'Sales Contacted', 'Discovery Booked', 'Discovery Completed',
+      'Proposal Sent', 'Proposal Follow-Up', 'Verbal Yes', 'Contract / Deposit', 'Won']) {
+      assert.equal(bucketOf([], status).bucket, 'advanced', status);
+    }
+    assert.equal(bucketOf([], 'New').bucket, 'normal');
+    assert.equal(bucketOf([], 'Nurture').bucket, 'normal');
+    assert.equal(bucketOf([], '').bucket, 'normal');
+  });
+
+  test('PRECEDENCE: active always wins over dead-deal (tag or status)', () => {
+    assert.equal(bucketOf(['proposal expired', 'deposit'], 'Lost').bucket, 'advanced');   // active tag beats dead tag + Lost
+    assert.equal(bucketOf(['expired-proposal'], 'Won').bucket, 'advanced');               // active status beats dead tag
+    assert.equal(bucketOf(['lead-won'], 'Not Ready').bucket, 'advanced');                 // active tag beats Not Ready
+    assert.equal(bucketOf(['proposal expired'], 'Lost').bucket, 'reengage');              // dead + dead
+  });
+
+  test('dead-deal contact in a live push: tagged newsletter-reengagement ONLY — no new-lead, minimal update, note kept', async () => {
+    ghl.duplicate = 'ghl-dead';
+    ghl.contact = { tags: ['expired-proposal'], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Nurture' }] };
+    const lead = newLead({ phone: '5550000', interest: 'Gala booth' });
+    const result = insert(lead);
+    await push.pushAfterUpsert(lead, result);
+    const put = calls.find((c) => c.method === 'PUT');
+    assert.equal(put.body.firstName, undefined, 'no standard fields touched');
+    assert.deepEqual(put.body.customFields.map((f) => f.id), [FIELDS.LAST_ACTIVITY]);
+    assert.deepEqual(tagsSent(), ['newsletter-reengagement'], 'only the re-engagement tag: no new-lead, no source tag');
+    assert.ok(calls.some((c) => c.url.endsWith('/notes')));
+    assert.equal(rowOf(result.id).ghl_pushed, 'pushed');
+  });
+
+  test('Lost / Not Ready status contact in a live push: same re-engagement route', async () => {
+    for (const status of ['Lost', 'Not Ready']) {
+      resetGhl();
+      ghl.duplicate = `ghl-${status}`;
+      ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: status }] };
+      const lead = newLead();
+      await push.pushAfterUpsert(lead, insert(lead));
+      assert.deepEqual(tagsSent(), ['newsletter-reengagement'], status);
+    }
+  });
+
+  test('already carrying newsletter-reengagement: not re-added (no tags call at all)', async () => {
+    ghl.duplicate = 'ghl-dead2';
+    ghl.contact = { tags: ['proposals-not-booked', 'Newsletter-Reengagement'], customFields: [] };
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(tagsSent(), null);
+    assert.ok(calls.some((c) => c.method === 'PUT'));
+  });
+
+  test('dead deal that ALSO has an active tag: skip bucket — no tags at all', async () => {
+    ghl.duplicate = 'ghl-both';
+    ghl.contact = { tags: ['proposal expired', 'call booked'], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Lost' }] };
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(tagsSent(), null);
+  });
+
+  test('dry-run log names the route and the dead-deal reason', async () => {
+    setEnv({});
+    ghl.duplicate = 'ghl-dead3';
+    ghl.contact = { tags: ['expired-proposal-batch-1'], customFields: [] };
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(writes(), []);
+    const line = logs.find((l) => l.includes('WOULD'));
+    assert.match(line, /route=reengage/);
+    assert.match(line, /tags=\[newsletter-reengagement\]/);
+    assert.match(line, /new-lead: NO \(dead deal/);
+    assert.match(line, /dead deal: tag "expired-proposal-batch-1"/);
+  });
+
+  test('brand-new contact (nothing in GHL) is unaffected: still the new-lead route', async () => {
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(tagsSent(), ['source-meta', 'new-lead']);
+  });
+
   test('Lead Status New / Nurture are NOT advanced', () => {
     for (const status of ['New', 'Nurture', 'nurture']) {
-      assert.equal(push.getAdvancedReason({ tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: status }] }), null);
+      assert.equal(adv({ tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: status }] }), null);
     }
-    assert.equal(push.getAdvancedReason({ tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Won' }] }), 'Lead Status = Won');
+    assert.equal(adv({ tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Won' }] }), 'Lead Status = Won');
   });
 });
 

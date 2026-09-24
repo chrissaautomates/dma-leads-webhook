@@ -22,13 +22,11 @@
 //   GHL_PUSH_DISABLED        true -> kill switch, nothing evaluated or sent
 //   GHL_PUSH_CUTOFF_DATE     YYYY-MM-DD go-live date; required for live
 //   GHL_CHECKCHERRY_SETTLE_MINUTES  hold a new CheckCherry lead this long (default 10)
-//   GHL_ADVANCED_TAG_PATTERN regex (case-insensitive) for tags marking an
-//                            already-advanced contact; overrides the default
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
 const { buildLeadPlan } = require('./ghl-lead-plan');
-const { FIELDS, TAGS } = require('./ghl-canonical');
+const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
 const { BARR_PATTERN, getGhlState, markGhlPushed } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
@@ -185,17 +183,12 @@ function assess(lead, row, cfg, context) {
 // --- Advanced-contact guard -------------------------------------------------
 
 const NOT_ADVANCED_STATUSES = ['new', 'nurture'];
-// Guess at the names of tags marking a contact already in an active sales
-// stage — the real tag list isn't in this repo. Errs toward matching (a false
-// match only withholds new-lead). Override via GHL_ADVANCED_TAG_PATTERN.
-const DEFAULT_ADVANCED_TAG_PATTERN = /proposal|\bwon\b|booked|deposit|contract|client/i;
+const REENGAGE_STATUS_SET = new Set(REENGAGE_STATUSES.map((x) => x.toLowerCase()));
 
-function advancedTagPattern(env = process.env) {
-  if (env.GHL_ADVANCED_TAG_PATTERN) {
-    try { return new RegExp(env.GHL_ADVANCED_TAG_PATTERN, 'i'); } catch { /* fall through to default */ }
-  }
-  return DEFAULT_ADVANCED_TAG_PATTERN;
-}
+// Tag matching is EXACT-name (ghl-canonical.js): whole-tag equality, trimmed and
+// case-insensitive — never a substring/keyword match.
+const ADVANCED_TAG_SET = new Set(ADVANCED_TAGS.map((t) => t.trim().toLowerCase()));
+const DEAD_DEAL_TAG_SET = new Set(DEAD_DEAL_TAGS.map((t) => t.trim().toLowerCase()));
 
 function customFieldValue(contact, fieldId) {
   const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
@@ -204,14 +197,30 @@ function customFieldValue(contact, fieldId) {
   return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
 }
 
-// null when the contact is not advanced; otherwise a human-readable reason.
-function getAdvancedReason(contact, env = process.env) {
+const tagKey = (t) => String(t).trim().toLowerCase();
+
+// Which of the three buckets an EXISTING contact is in:
+//   { bucket: 'advanced', reason }  active / booked  -> skip (no tags)
+//   { bucket: 'reengage', reason }  dead deal        -> newsletter-reengagement
+//   { bucket: 'normal' }
+// Precedence: anything active wins. An active tag OR an advanced Lead Status
+// (beyond New/Nurture, other than Lost / Not Ready) makes the contact advanced
+// even if it also carries a dead-deal tag or a Lost status. Only when nothing
+// active is present do dead-deal tags / Lost / Not Ready route to re-engagement.
+function classifyContact(contact) {
   const status = customFieldValue(contact, FIELDS.LEAD_STATUS);
-  if (status && !NOT_ADVANCED_STATUSES.includes(status.toLowerCase())) return `Lead Status = ${status}`;
-  const pattern = advancedTagPattern(env);
-  const hit = (contact.tags || []).find((t) => pattern.test(String(t)));
-  if (hit) return `tag "${hit}"`;
-  return null;
+  const statusKey = status.toLowerCase();
+  const tags = contact.tags || [];
+
+  const activeTag = tags.find((t) => ADVANCED_TAG_SET.has(tagKey(t)));
+  if (activeTag) return { bucket: 'advanced', reason: `tag "${activeTag}"` };
+  if (status && !NOT_ADVANCED_STATUSES.includes(statusKey) && !REENGAGE_STATUS_SET.has(statusKey)) {
+    return { bucket: 'advanced', reason: `Lead Status = ${status}` };
+  }
+  const deadTag = tags.find((t) => DEAD_DEAL_TAG_SET.has(tagKey(t)));
+  if (deadTag) return { bucket: 'reengage', reason: `tag "${deadTag}"` };
+  if (status && REENGAGE_STATUS_SET.has(statusKey)) return { bucket: 'reengage', reason: `Lead Status = ${status}` };
+  return { bucket: 'normal' };
 }
 
 // --- The shared push --------------------------------------------------------
@@ -247,14 +256,18 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
   const existing = found ? ((await ghl.getContact(found.id)) || found) : null;
   const isNewContact = !existing;
 
+  const cls = existing ? classifyContact(existing) : { bucket: 'normal' };
+  const hasTag = (name) => (existing ? (existing.tags || []).some((t) => tagKey(t) === name) : false);
   const ctx = {
     ...context,
-    advancedReason: existing ? getAdvancedReason(existing) : null,
-    hasNewLeadTag: existing ? (existing.tags || []).some((t) => String(t).toLowerCase() === TAGS.LEAD_NEW) : false,
+    advancedReason: cls.bucket === 'advanced' ? cls.reason : null,
+    reengageReason: cls.bucket === 'reengage' ? cls.reason : null,
+    hasNewLeadTag: hasTag(TAGS.LEAD_NEW),
+    hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
-  const action = isNewContact ? 'create' : (ctx.advancedReason ? 'update-minimal' : 'update');
-  const outcome = { action, contactId: existing ? existing.id : null, plan, advancedReason: ctx.advancedReason };
+  const action = isNewContact ? 'create' : ((ctx.advancedReason || ctx.reengageReason) ? 'update-minimal' : 'update');
+  const outcome = { action, contactId: existing ? existing.id : null, plan, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
   if (dryRun) return { ...outcome, dryRun: true };
 
   let contactId;
@@ -283,7 +296,9 @@ function describeOutcome(lead, profile, outcome) {
     `leadSource=${profile.leadSourceOption}`,
     `tags=[${plan.tags.join(', ')}]`,
     `new-lead: ${plan.newLead.applied ? 'YES' : 'NO'} (${plan.newLead.reason})`,
+    `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
+    outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');
 }
@@ -377,7 +392,7 @@ module.exports = {
   profileForSource,
   isBarrLead,
   assess,
-  getAdvancedReason,
+  classifyContact,
   pushLeadToGhl,
   pushAfterUpsert,
   previewLead,

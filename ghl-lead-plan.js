@@ -40,12 +40,17 @@
 // 6. THE new-lead TAG IS THE GATE INTO THE NURTURE FUNNEL, so it is applied
 //    only when ALL of these hold: the source's own policy allows it
 //    (profile.applyNewLead — CheckCherry refuses when a proposal exists),
-//    the contact isn't already "advanced" (Lead Status beyond New/Nurture,
-//    or a proposal/won-type tag — decided by ghl-push.js and passed in as
-//    context.advancedReason), and — for an EXISTING contact — it doesn't
-//    already carry the tag (never re-applied on an update). An advanced
-//    contact gets a minimal update instead: last-activity + note only, no
-//    other field changes and no tags at all.
+//    the contact isn't already in another bucket (decided by ghl-push.js and
+//    passed in as context.advancedReason / context.reengageReason), and —
+//    for an EXISTING contact — it doesn't already carry the tag (never
+//    re-applied on an update). Three destinations, no overlap:
+//      new-lead     brand-new / cold contacts        -> cold nurture sequence
+//      reengage     dead deals (dead-deal tags, Lead Status Lost / Not Ready)
+//                   -> tag newsletter-reengagement ONLY (monthly newsletter
+//                   path; never new-lead)
+//      skip         active / booked (advanced)       -> no tags at all
+//    Reengage and skip contacts get a MINIMAL update: last-activity + note,
+//    no other field changes.
 //
 // 5. Marketing consent is written ONLY when Wix explicitly supplied a
 //    yes/no answer. No value is ever written for "not supplied" (not even
@@ -135,6 +140,9 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
   if (context.advancedReason && !isNewContact) {
     return { applied: false, reason: `contact already advanced (${context.advancedReason})` };
   }
+  if (context.reengageReason && !isNewContact) {
+    return { applied: false, reason: `dead deal (${context.reengageReason}) — routed to ${TAGS.NEWSLETTER_REENGAGEMENT}, not new-lead` };
+  }
   if (profile.applyNewLead) {
     const policy = profile.applyNewLead({ lead, context });
     if (!policy.allow) return { applied: false, reason: policy.reason };
@@ -152,12 +160,15 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
 //
 // options.profile — { leadSourceOption, sourceTag, nativeSource,
 //   lastActivityLabel, noteLabel, applyNewLead({lead, context}) }
-// options.context — { advancedReason: string|null, hasNewLeadTag: bool,
+// options.context — { advancedReason: string|null, reengageReason: string|null,
+//   hasNewLeadTag: bool, hasReengageTag: bool,
 //   proposalEmails: Set|null } — facts about the existing contact / source
 //   state, gathered by ghl-push.js (this function stays pure).
 //
 // Returns:
-//   { contactFields, customFields, tags, note, warnings, newLead }
+//   { contactFields, customFields, tags, note, warnings, newLead, route }
+// where route is 'new-lead' | 'no-new-lead' (source policy, e.g. CheckCherry has a
+// proposal) | 'reengage' | 'skip'
 // where newLead is { applied, reason } — why the new-lead tag was or wasn't
 // applied (surfaced in dry-run output).
 // where contactFields/customFields are ready to hand to ghl-client.js's
@@ -266,16 +277,20 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   const note = buildNote(body, unmapped, profile.noteLabel);
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
 
-  // ADVANCED contact: minimal update only — last-activity + note. No standard
-  // field changes, no other custom fields, no tags of any kind.
-  if (context.advancedReason && !isNewContact) {
+  // ADVANCED (skip) or DEAD-DEAL (reengage) existing contact: minimal update —
+  // last-activity + note only. No standard field changes, no other custom
+  // fields. Advanced gets no tags at all; a dead deal gets only the
+  // re-engagement tag (not re-added if it already has it).
+  if ((context.advancedReason || context.reengageReason) && !isNewContact) {
+    const reengage = !context.advancedReason;
     return {
       contactFields: {},
       customFields: customFields.filter((f) => f.id === FIELDS.LAST_ACTIVITY),
-      tags: [],
+      tags: reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : [],
       note,
       warnings,
       newLead,
+      route: reengage ? 'reengage' : 'skip',
     };
   }
 
@@ -286,6 +301,7 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     note,
     warnings,
     newLead,
+    route: newLead.applied ? 'new-lead' : 'no-new-lead',
   };
 }
 

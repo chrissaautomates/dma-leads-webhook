@@ -95,7 +95,11 @@ const TAGS = {
   SOURCE_META: 'source-meta',
   SOURCE_GOOGLE_ADS: 'source-google-ads',
   SOURCE_CHECKCHERRY: 'source-checkcherry',
-  LEAD_NEW: 'new-lead', // REUSED — canonical pointer's real name, NOT the literal string "lead-new"
+  LEAD_NEW: 'new-lead',
+  // Bucket 2 (dead deals): applied by ghl-push.js instead of new-lead. A separate
+  // GHL workflow / monthly broadcast enrolls this tag — and must respect DMA
+  // Marketing Consent (CASL).
+  NEWSLETTER_REENGAGEMENT: 'newsletter-reengagement', // REUSED — canonical pointer's real name, NOT the literal string "lead-new"
 
   LEAD_TYPE: {
     'event planner': 'planners', // REUSED
@@ -107,6 +111,49 @@ const TAGS = {
     social: 'type-social', // NEW, exact name
   },
 };
+
+// Tags that mark a contact as ALREADY in active sales / booked — such a contact
+// must never be dropped into cold nurture (see ghl-push.js classifyContact).
+// This is an EXACT-name list taken from the real GHL tag set. It is matched by
+// whole-tag equality (trimmed, case-insensitive because GHL stores tags
+// lowercased) — never by substring or keyword, because the real tag names are
+// inconsistent and some contain these words but mean the opposite (e.g.
+// "contractor" is NOT "contract"). Add a tag here only by exact name.
+const ADVANCED_TAGS = [
+  'cc-proposal-sent',
+  'cc-proposals-sent',
+  'proposal sent',
+  'cc-proposal-replied',
+  'proposal follow up',
+  'proposal_reactivated',
+  'extend-proposal',
+  'lead-won',
+  'contract won',
+  'contract complete',
+  'contract lost',
+  'appointment booked',
+  'call booked',
+  'discovery call booked',
+  'deposit',
+  '2026-cc-clients',
+];
+
+// DEAD-DEAL tags: NOT advanced — the contact is routed to the re-engagement
+// newsletter path (tag newsletter-reengagement), never to the new-lead cold
+// sequence and never skipped in silence. Same exact-name matching as
+// ADVANCED_TAGS; an active tag always wins over these. Asserted against in the
+// tests so nobody adds one to ADVANCED_TAGS.
+const DEAD_DEAL_TAGS = [
+  'proposal expired',
+  'expired-proposal',
+  'expired-proposal-call-completed',
+  'expired-proposal-batch-1',
+  'proposals-not-booked',
+];
+
+// DMA Lead Status values that mean a dead deal -> re-engagement path (matched
+// case-insensitively). Every OTHER status beyond New/Nurture is "advanced".
+const REENGAGE_STATUSES = ['Lost', 'Not Ready'];
 
 // Interest input -> { tag, fieldOption }. `tag` is null where no canonical
 // interest-* tag exists for that concept (none defined in Phase 1's
@@ -141,5 +188,8 @@ module.exports = {
   FIELD_OPTIONS,
   FORBIDDEN_LEGACY_FIELD_IDS,
   TAGS,
+  ADVANCED_TAGS,
+  DEAD_DEAL_TAGS,
+  REENGAGE_STATUSES,
   INTEREST_MAP,
 };

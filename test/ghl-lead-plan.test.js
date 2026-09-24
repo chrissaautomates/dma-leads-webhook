@@ -247,6 +247,28 @@ describe('buildLeadPlan — new-lead gate', () => {
     assert.match(plan.newLead.reason, /advanced/);
   });
 
+  test('DEAD-DEAL existing contact: route=reengage, tag newsletter-reengagement only, never new-lead, minimal update', () => {
+    const plan = buildLeadPlan(
+      { ...lead, phone: '5551', company: 'Acme', noteLines: ['Interest / form answers: gala'] },
+      { isNewContact: false, profile: SOURCE_PROFILES.meta, context: { advancedReason: null, reengageReason: 'tag "proposal expired"', hasNewLeadTag: false, hasReengageTag: false } }
+    );
+    assert.equal(plan.route, 'reengage');
+    assert.deepEqual(plan.tags, ['newsletter-reengagement']);
+    assert.deepEqual(plan.contactFields, {});
+    assert.equal(plan.customFields.length, 1);
+    assert.equal(plan.newLead.applied, false);
+    assert.match(plan.newLead.reason, /dead deal/);
+    assert.ok(plan.note);
+  });
+
+  test('routes: skip / reengage / new-lead / no-new-lead', () => {
+    const p = SOURCE_PROFILES.meta;
+    assert.equal(buildLeadPlan(lead, { isNewContact: false, profile: p, context: { advancedReason: 'tag "deposit"' } }).route, 'skip');
+    assert.equal(buildLeadPlan(lead, { isNewContact: false, profile: p, context: { reengageReason: 'Lead Status = Lost' } }).route, 'reengage');
+    assert.equal(buildLeadPlan(lead, { isNewContact: true, profile: p }).route, 'new-lead');
+    assert.equal(buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set(['jane@example.com']) } }).route, 'no-new-lead');
+  });
+
   test('CheckCherry: email in the proposal set -> no new-lead (source tag still applied)', () => {
     const plan = buildLeadPlan(lead, { isNewContact: true, profile: SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set(['jane@example.com']) } });
     assert.ok(!plan.tags.includes('new-lead'));

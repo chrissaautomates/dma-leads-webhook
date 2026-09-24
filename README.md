@@ -74,3 +74,48 @@ curl -X POST localhost:3000/webhook/lead \
   -d '{"source":"GHL","email":"klein@example.com","name":"Klein","interest":"humanoid robot Chicago","status":"New"}'
 # then open http://localhost:3000/admin (user: admin, password: test)
 ```
+
+## Wix → GHL lead intake (`POST /api/leads/wix`)
+
+A second, separate endpoint: receives a lead submitted through the Wix
+public website form (via a Wix Velo backend `.jsw` function — see
+`wix-example/`) and creates/updates the matching DMA Events GHL contact
+directly, using only the canonical DMA fields/tags documented in
+`docs/ghl-canonical-fields.md` / `docs/ghl-canonical-tags.md`. It does
+**not** touch the local `leads.db` used by everything else in this
+README — it's a push straight to GHL, kept deliberately separate from the
+pull-based syncs above.
+
+It deliberately does **not** create an opportunity, create a sales task, or
+send any email/SMS — Workflow 1 ("New Lead- Send Services - Email
+Sequence", GHL workflow ID `d79a76bd-c787-425a-8588-2b3594714d64`) already
+does all of that the moment a new contact is created. See
+`docs/wix-ghl-existing-contact-behavior.md` for what happens (and doesn't)
+when Wix submits a lead who's already a GHL contact.
+
+### Setup
+
+1. **Environment variables** (in addition to the ones above):
+   - `WIX_WEBHOOK_SECRET` — random string; the Wix backend function must send
+     it back as `Authorization: Bearer <secret>` (or an `x-wix-webhook-secret`
+     header). Separate from `WEBHOOK_SECRET` above — different callers,
+     rotate independently.
+   - `GHL_API_KEY` / `GHL_LOCATION_ID` — already used by `sync.js`'s GHL
+     chat-lead pull; reused here for the push direction too.
+2. **In Wix**: add `wix-example/backend.jsw` and `wix-example/frontend.js`
+   (or your own equivalents) to your site, following the setup comments at
+   the top of `backend.jsw` (Secrets Manager entry + real deployed URL).
+
+### Local test
+
+```
+DB_PATH=:memory: WIX_WEBHOOK_SECRET=test GHL_API_KEY=test GHL_LOCATION_ID=WWFoHKH8wu9QTuAKBUzK npm start
+curl -X POST localhost:3000/api/leads/wix \
+  -H 'content-type: application/json' -H 'authorization: Bearer test' \
+  -d '{"firstName":"Jane","email":"jane@example.com","eventType":"Corporate","interest":"AI Photo Booth"}'
+```
+
+Note this will make a *real* call to the GHL API if `GHL_API_KEY` is a real
+key — for local development against fake data, use the automated tests
+instead (`npm test`), which mock the GHL API entirely and never touch a
+real DMA contact.

@@ -128,6 +128,11 @@ function mapGoogleAdsLead(userColumnData) {
 }
 
 const GOOGLE_ADS_RAW_LOG_LIMIT = 10;
+
+function redactGoogleKey(body) {
+  const { google_key: _omit, ...rest } = body || {};
+  return rest;
+}
 let googleAdsRawLogCount = 0;
 
 // Google Ads' Lead Form webhook integration — a different contract from
@@ -147,14 +152,15 @@ app.post('/webhook/google-ads-lead', (req, res) => {
     return res.status(200).json({});
   }
 
-  // Field mapping above is unverified against a real payload (Google's exact
-  // column_name/column_id values for this form aren't documented). Log the
-  // raw data for the first several real submissions so it can be checked.
+  // Log the COMPLETE body for the first several real submissions (google_key
+  // stripped) so the top-level attribution fields Google actually sends
+  // (campaign_id, adgroup_id, creative_id, gcl_id, form_id, lead_id, ...) can
+  // be seen before any mapping is built on them.
   googleAdsRawLogCount += 1;
   if (googleAdsRawLogCount <= GOOGLE_ADS_RAW_LOG_LIMIT) {
     console.log(
-      `Google Ads lead webhook raw user_column_data (#${googleAdsRawLogCount}):`,
-      JSON.stringify(req.body.user_column_data)
+      `Google Ads lead webhook raw body (#${googleAdsRawLogCount}):`,
+      JSON.stringify(redactGoogleKey(req.body))
     );
   }
 
@@ -202,3 +208,4 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports.mapGoogleAdsLead = mapGoogleAdsLead;
+module.exports.redactGoogleKey = redactGoogleKey;

@@ -23,3 +23,12 @@ test('maps the real Google Ads payload including email and phone', () => {
   assert.equal(lead.interest, 'Private Event');
   assert.equal(lead.notes, 'Event date: 05/30/2027');
 });
+
+test('redactGoogleKey drops google_key but keeps every other top-level field', () => {
+  const { redactGoogleKey } = require('../server');
+  const body = { google_key: 'secret', campaign_id: 1, adgroup_id: 2, creative_id: 3, gcl_id: 'x', user_column_data: [] };
+  const out = redactGoogleKey(body);
+  assert.equal('google_key' in out, false);
+  assert.deepEqual(out, { campaign_id: 1, adgroup_id: 2, creative_id: 3, gcl_id: 'x', user_column_data: [] });
+  assert.equal(body.google_key, 'secret'); // input not mutated
+});

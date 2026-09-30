@@ -82,9 +82,14 @@ function flattenUserColumnData(userColumnData) {
   const flat = {};
   (userColumnData || []).forEach((item) => {
     if (!item) return;
-    const key = normalizeFieldKey(item.column_name || item.column_id);
-    if (!key) return;
-    flat[key] = item.string_value != null ? String(item.string_value) : '';
+    const value = item.string_value != null ? String(item.string_value) : '';
+    // Register under BOTH column_id and column_name — a real submission sent
+    // column_name "User Email" with column_id "EMAIL", so keying on the name
+    // alone missed the standard id. First non-empty writer wins per key.
+    [item.column_id, item.column_name].forEach((raw) => {
+      const key = normalizeFieldKey(raw);
+      if (key && !flat[key]) flat[key] = value;
+    });
   });
   return flat;
 }
@@ -113,11 +118,12 @@ function mapGoogleAdsLead(userColumnData) {
   return {
     source: 'Google Ads',
     name: name || '',
-    email: pickGoogleField(flat, ['email', 'workemail', 'emailaddress']),
-    phone: pickGoogleField(flat, ['phonenumber', 'workphonenumber', 'phone', 'mobilephone']),
+    email: pickGoogleField(flat, ['email', 'useremail', 'workemail', 'emailaddress']),
+    phone: pickGoogleField(flat, ['phonenumber', 'userphone', 'workphonenumber', 'phone', 'mobilephone']),
     company: pickGoogleField(flat, ['companyname', 'company', 'businessname', 'organization']),
     location,
-    interest: pickGoogleField(flat, ['interest', 'message', 'whatareyouinterestedin', 'request', 'jobtitle']),
+    interest: pickGoogleField(flat, ['interest', 'message', 'whatareyouinterestedin', 'whattypeofeventareyouplanning', 'request', 'jobtitle']),
+    notes: flat.whenisyoureventdate ? `Event date: ${flat.whenisyoureventdate}` : '',
   };
 }
 
@@ -195,3 +201,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.mapGoogleAdsLead = mapGoogleAdsLead;

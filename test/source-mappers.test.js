@@ -160,7 +160,7 @@ describe('CheckCherry mapper (strict, config-driven)', () => {
   const realAttrs = { ...config.CHECKCHERRY_ATTRIBUTES };
   const warnings = [];
   const realWarn = console.warn;
-  test.beforeEach(() => { warnings.length = 0; console.warn = (m) => warnings.push(m); });
+  test.beforeEach(() => { sync.resetCheckCherryWarnings(); warnings.length = 0; console.warn = (m) => warnings.push(m); });
   test.afterEach(() => { console.warn = realWarn; Object.assign(config.CHECKCHERRY_ATTRIBUTES, realAttrs); });
 
   test('unconfigured attributes (null) stay blank — a plausible-looking attribute is never guessed', () => {
@@ -200,6 +200,20 @@ describe('CheckCherry mapper (strict, config-driven)', () => {
     assert.match(warnings[0], /guestCount\(lead_guests\)/);
     assert.ok(!/budget/.test(warnings[0]));
     assert.ok(!warnings[0].includes('cy@example.com'), 'no personal data in the log');
+  });
+
+  test('the shipped config maps the confirmed live attribute names and nothing else', () => {
+    assert.deepEqual(realAttrs, {
+      city: 'venue_city', eventDate: 'event_date', eventType: 'lead_event_type',
+      guestCount: 'estimated_number_guests', budgetRange: 'estimated_budget', owner: null,
+    });
+  });
+
+  test('the same lead is warned about once per process, not every sync cycle', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: null, budgetRange: null, owner: null, eventType: null });
+    const rec = { id: '77', attributes: { email: 'a@b.c' } };
+    sync.mapCheckCherryLead(rec); sync.mapCheckCherryLead(rec); sync.mapCheckCherryLead(rec);
+    assert.equal(warnings.length, 1);
   });
 
   test('a null value counts as missing', () => {

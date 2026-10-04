@@ -82,6 +82,8 @@ function strictAttr(attrs, shapeKey, missing) {
   return String(v).trim();
 }
 
+const warnedCheckCherry = new Set();
+
 function mapCheckCherryLead(record) {
   const attrs = (record && record.attributes) || record || {};
 
@@ -143,7 +145,12 @@ function mapCheckCherryLead(record) {
     utmTerm: attrs.utm_term || '',
   };
   // One line per lead, never one per attribute; ids only (no personal data in logs).
-  if (missing.length) console.warn(`[checkcherry-mapper] lead ${(record && record.id) || attrs.id || '?'}: mapped attribute(s) missing or blank, left blank: ${missing.join(', ')}`);
+  // The sync re-reads every open lead each cycle, so warn once per lead per process.
+  const warnKey = `${(record && record.id) || attrs.id || '?'}:${missing.join(',')}`;
+  if (missing.length && !warnedCheckCherry.has(warnKey)) {
+    warnedCheckCherry.add(warnKey);
+    console.warn(`[checkcherry-mapper] lead ${(record && record.id) || attrs.id || '?'}: mapped attribute(s) missing or blank, left blank: ${missing.join(', ')}`);
+  }
   return lead;
 }
 
@@ -1195,6 +1202,7 @@ async function runFullSync() {
 }
 
 module.exports = {
+  resetCheckCherryWarnings: () => warnedCheckCherry.clear(),
   mapCheckCherryLead, mapCheckCherryProposalEvent, mapMetaAdsRow, mapWixFormSubmission, buildFieldMetaMap, taggedCategoriesInForm,
   runFullSync,
   getSyncStatus,

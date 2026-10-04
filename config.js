@@ -3,16 +3,24 @@
 
 // CheckCherry /leads attribute names for each normalized shape field. EXACT names
 // only: if a name is set and a lead lacks it (missing/null/blank), the field is
-// left blank and ONE warning line is logged for that lead — the mapper never
-// falls through to a different attribute. `null` = not confirmed against the live
-// feed yet, so the field stays blank. Fill the nulls from the output of
-// scripts/inspect-checkcherry-leads.js.
+// left blank and ONE warning line is logged for that lead (once per process) — the
+// mapper never falls through to a different attribute. `null` = the live feed has
+// no such attribute, so the field stays blank.
+//
+// Confirmed 2026-10-04 with scripts/inspect-checkcherry-leads.js against the live
+// /leads feed (attribute names only; the feed carries 5 open leads, so several of
+// these were present but empty in every lead seen — the names are real, the value
+// formats are not yet observed):
+//   event_date, lead_event_type, estimated_number_guests, estimated_budget exist.
+//   NO owner / assigned_to attribute exists (referred_by_user_* is a referral, not
+//   an owner, so it is deliberately not used). `event_type_id` is a numeric id, not
+//   a name, so it is not used either.
 const CHECKCHERRY_ATTRIBUTES = {
-  city: 'venue_city', // already used by the existing /leads location mapping
-  eventDate: null,
-  eventType: null,
-  guestCount: null,
-  budgetRange: null,
+  city: 'venue_city',
+  eventDate: 'event_date',
+  eventType: 'lead_event_type',
+  guestCount: 'estimated_number_guests',
+  budgetRange: 'estimated_budget',
   owner: null,
 };
 

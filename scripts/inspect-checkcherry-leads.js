@@ -5,7 +5,7 @@
 //
 //   CHECKCHERRY_API_KEY=... node scripts/inspect-checkcherry-leads.js
 //
-// Sample values can be personal data: they are truncated, and nothing is stored.
+// Prints attribute NAMES and fill counts only — never a lead value.
 
 async function main() {
   const apiKey = process.env.CHECKCHERRY_API_KEY;
@@ -21,10 +21,10 @@ async function main() {
     for (const r of records) {
       total++;
       Object.entries((r && r.attributes) || r || {}).forEach(([k, v]) => {
-        const s = stats.get(k) || { filled: 0, sample: '' };
+        const s = stats.get(k) || { filled: 0, type: new Set() };
         if (v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && !v.length)) {
           s.filled++;
-          if (!s.sample) s.sample = JSON.stringify(v).slice(0, 40);
+          s.type.add(Array.isArray(v) ? 'array' : typeof v); // a type name, not a value
         }
         stats.set(k, s);
       });
@@ -33,7 +33,7 @@ async function main() {
   }
   console.log(`${total} leads scanned\n`);
   [...stats.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([k, s]) => {
-    console.log(`${k.padEnd(34)} ${String(s.filled).padStart(5)} filled   e.g. ${s.sample}`);
+    console.log(`${k.padEnd(34)} ${String(s.filled).padStart(5)} filled   ${[...s.type].join('/')}`);
   });
 }
 

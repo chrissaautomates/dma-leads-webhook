@@ -132,6 +132,22 @@ describe('rowToLead — legacy rows', () => {
     assert.equal(rowToLead({ source: 'CheckCherry', location: 'Toronto, ON' }).city, 'Toronto');
   });
 
+  test('real shape columns AND a stale folded interest (a re-synced old row): interest is still re-derived', () => {
+    const lead = rowToLead({
+      source: 'Meta Ads', email: 'a@b.c', event_type: 'Events', campaign: 'DMA | Retargeting',
+      interest: 'Services: ai_photo_booth | Planning: Events | Goal: More choices for clients',
+    });
+    assert.equal(lead.interest, 'ai_photo_booth');
+    assert.equal(lead.eventType, 'Events'); // the real column wins
+    assert.equal(lead.campaign, 'DMA | Retargeting');
+    const plan = buildLeadPlan(toPlanBody(lead), { isNewContact: false, profile: SOURCE_PROFILES.meta });
+    assert.deepEqual(plan.fillBlank.find((e) => e.key === 'interest').value, ['AI Photo Booth']);
+  });
+
+  test('a plain services answer is not mistaken for folded text', () => {
+    assert.equal(rowToLead({ source: 'Meta Ads', event_type: 'Gala', interest: 'Glambot, Robotics' }).interest, 'Glambot, Robotics');
+  });
+
   test('a row with real shape columns is used as-is', () => {
     const lead = rowToLead({ source: 'Wix Form - X', interest: 'Glambot', event_type: 'Gala', city: 'Ottawa' });
     assert.equal(lead.interest, 'Glambot');

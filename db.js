@@ -279,7 +279,11 @@ function computeTarget(data) {
     const dateReceived = data.dateReceived || new Date().toISOString().slice(0, 10);
     if (dateReceived >= '2026-01-01') return 'CHATLEAD';
   }
-  return BARR_PATTERN.test(source + ' ' + (data.interest || '')) ? 'BARR' : 'DMA';
+  // Same text the old folded `interest` carried (every submitted answer), so a
+  // row's target doesn't change now that answers live in separate fields.
+  const text = [data.interest, data.secondaryInterest, data.eventType, data.budgetRange, data.guestCount, data.leadType, data.extra]
+    .filter(Boolean).join(' ');
+  return BARR_PATTERN.test(source + ' ' + text) ? 'BARR' : 'DMA';
 }
 
 // Returns the existing lead row for a given email + target, or undefined if

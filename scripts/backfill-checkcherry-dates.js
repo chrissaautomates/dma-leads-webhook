@@ -21,11 +21,11 @@
 // date, so there's nothing to correct there.
 //
 // Run directly against the real production DB via:
-//   railway run node scripts/backfill-checkcherry-dates.js
+//   railway ssh -- sh -c 'cd /app && node scripts/backfill-checkcherry-dates.js'
 //
-// (Needs a working DB_PATH + CHECKCHERRY_API_KEY in the environment, same
-// as the live server — see delete-checkcherry-leads.js for why this must
-// run somewhere with real access to both, not a scratch/local setup.)
+// Use `railway ssh`, NOT `railway run`: the database exists only on the Railway
+// volume inside the container, and the container also has CHECKCHERRY_API_KEY in
+// its environment.
 //
 // Prints every correction (email, old date -> new date) before making it,
 // and reports how many rows were left unchanged.

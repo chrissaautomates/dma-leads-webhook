@@ -5,7 +5,10 @@
 //   node scripts/create-ghl-fields.js --apply    # do it
 //   (--allow-similar: create a field even if one with a similar name exists)
 //
-// Needs GHL_API_KEY + GHL_LOCATION_ID (e.g. `railway run node ...`). It:
+// Needs GHL_API_KEY + GHL_LOCATION_ID. This is the one script that works with
+// `railway run` (`railway run node scripts/create-ghl-fields.js`): it only talks to
+// GHL and never opens the leads database, so it doesn't need to run in the container.
+// It:
 //   1. creates "Guest Count" (NUMERICAL) — only if no contact field with that name exists
 //   2. creates "Lead Type" (SINGLE_OPTIONS, FIELD_OPTIONS.LEAD_TYPE) — same check
 //   3. adds Glambot / Robotics / LED Tunnel / DMA Engage / Holiday / Headshot to the

@@ -2,10 +2,14 @@
 // database. DRY-RUN by default: reads GHL, writes nothing, prints what it would
 // fill. Pass --apply to write.
 //
-//   railway run node scripts/backfill-ghl-fields.js                  # dry run, all sources
-//   railway run node scripts/backfill-ghl-fields.js --source wix     # one source (wix|meta|google|checkcherry)
-//   railway run node scripts/backfill-ghl-fields.js --limit 10       # first 10 contacts per source
-//   railway run node scripts/backfill-ghl-fields.js --apply
+// It reads the leads database, which exists only on the Railway volume, so run it
+// INSIDE the container with `railway ssh` (NOT `railway run`, which executes on your
+// own machine where /data/leads.db does not exist):
+//
+//   railway ssh -- sh -c 'cd /app && node scripts/backfill-ghl-fields.js'                  # dry run, all sources
+//   railway ssh -- sh -c 'cd /app && node scripts/backfill-ghl-fields.js --source wix'     # one source (wix|meta|google|checkcherry)
+//   railway ssh -- sh -c 'cd /app && node scripts/backfill-ghl-fields.js --limit 10'       # first 10 contacts per source
+//   railway ssh -- sh -c 'cd /app && node scripts/backfill-ghl-fields.js --apply'
 //
 // Starts from the STORED LEAD ROWS (not GHL tags — this app has never tagged
 // contacts with source-* before). For each source: group its rows by email

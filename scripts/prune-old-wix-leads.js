@@ -18,11 +18,11 @@
 // next sync cycle.
 //
 // Run directly against the real production DB via:
-//   railway run node scripts/prune-old-wix-leads.js
+//   railway ssh -- sh -c 'cd /app && node scripts/prune-old-wix-leads.js'
 //
-// (Not against a scratch/local DB — DB_PATH defaults to /data/leads.db,
-// same as the running server, so under `railway run` this hits the actual
-// production volume.)
+// Use `railway ssh`, NOT `railway run`: `railway run` executes on your own machine,
+// where /data/leads.db does not exist (the database lives only on the Railway
+// volume, inside the container).
 //
 // Prints every row it's about to remove (source, name, email, date) first,
 // so there's a record to work from if anything needs to be manually

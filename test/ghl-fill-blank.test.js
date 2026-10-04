@@ -139,64 +139,102 @@ describe('rowToLead — legacy rows', () => {
   });
 });
 
-describe('backfill-ghl-fields', () => {
+describe('backfill-ghl-fields (starts from stored rows, looks contacts up by email)', () => {
   const contacts = {
-    c1: { id: 'c1', email: 'blank@example.com', tags: ['source-wix'], customFields: [] },
-    c2: { id: 'c2', email: 'full@example.com', tags: ['source-wix'], city: 'Ottawa', customFields: [{ id: FIELDS.EVENT_TYPE, value: 'Gala' }] },
-    c3: { id: 'c3', email: 'adv@example.com', tags: ['source-wix', 'deposit'], customFields: [] },
-    c4: { id: 'c4', email: 'norow@example.com', tags: ['source-wix'], customFields: [] },
+    'blank@example.com': { id: 'c1', email: 'blank@example.com', tags: [], customFields: [] },
+    'full@example.com': { id: 'c2', email: 'full@example.com', tags: [], city: 'Ottawa', customFields: [{ id: FIELDS.EVENT_TYPE, value: 'Gala' }] },
+    'adv@example.com': { id: 'c3', email: 'adv@example.com', tags: ['deposit'], customFields: [] },
+    'dead@example.com': { id: 'c5', email: 'dead@example.com', tags: ['proposal expired'], customFields: [] },
+    'consent@example.com': { id: 'c6', email: 'consent@example.com', tags: [], customFields: [{ id: FIELDS.MARKETING_CONSENT, value: 'No' }] },
   };
-  const rows = {
-    'blank@example.com': [{ source: 'Wix Form - Quote', email: 'blank@example.com', event_type: 'Gala', city: 'Toronto', guest_count: '90', interest: 'Glambot' }],
-    'full@example.com': [{ source: 'Wix Form - Quote', email: 'full@example.com', event_type: 'Corporate', city: 'Toronto', company: 'Acme' }],
-    'adv@example.com': [{ source: 'Wix Form - Quote', email: 'adv@example.com', event_type: 'Gala' }],
-  };
-  function deps(updates) {
+  const wixRow = (email, over = {}) => ({ source: 'Wix Form - Quote', email, ...over });
+  const allRows = [
+    wixRow('blank@example.com', { event_type: 'Gala', city: 'Toronto', guest_count: '90', interest: 'Glambot' }),
+    wixRow('full@example.com', { event_type: 'Corporate', city: 'Toronto', company: 'Acme' }),
+    wixRow('adv@example.com', { event_type: 'Gala' }),
+    wixRow('dead@example.com', { event_type: 'Gala' }),
+    wixRow('consent@example.com', { event_type: 'Gala' }),
+    wixRow('ghost@example.com', { event_type: 'Gala' }), // not in GHL
+    wixRow('', { event_type: 'Gala' }), // no email
+    wixRow('spam@example.com', { status: 'Spam', event_type: 'Gala' }),
+    wixRow('x@example.com', { name: 'TEST DMA', event_type: 'Gala' }),
+    { source: 'Meta Ads', email: 'blank@example.com', event_type: 'Gala' }, // other source: not in the wix pass
+  ];
+  function deps(updates, lookups = []) {
     return {
-      iterateContacts: async function* () { yield* Object.values(contacts).map(({ id, email }) => ({ id, email })); },
-      getContact: async (id) => contacts[id],
+      rowsForSource: (profile) => allRows.filter((r) => require('../ghl-push').profileForSource(r.source) === profile),
+      findContact: async (email) => { lookups.push(email); return contacts[email] || null; },
       updateContact: async (id, body) => { updates.push({ id, body }); },
-      findRows: (email) => rows[email] || [],
     };
   }
 
-  test('dry run writes nothing but reports the fills and what is still missing', async () => {
+  test('dry run writes nothing and reports matched rows, contacts not found and still-missing counts', async () => {
     const updates = [];
-    const r = await backfillSource(WIX, deps(updates), { apply: false });
+    const lookups = [];
+    const r = await backfillSource(WIX, deps(updates, lookups), { apply: false });
     assert.equal(updates.length, 0);
-    assert.equal(r.scanned, 4);
-    assert.equal(r.withRow, 3);
-    assert.equal(r.noRow, 1);
-    assert.equal(r.skippedGuard, 1); // c3 carries "deposit"
-    assert.equal(r.contactsFilled, 2); // c1 fully, c2 only the blanks
-    assert.equal(r.missing.eventType, 2); // c3, c4 (c1 filled, c2 already set)
-    assert.equal(r.missing.city, 2); // c3, c4
-    assert.match(formatReport([r], { apply: false }), /DRY RUN/);
+    assert.equal(r.rows, 9); // the Meta row belongs to another source
+    assert.equal(r.rowsNoEmail, 1);
+    assert.equal(r.rowsExcluded, 2); // spam + TEST DMA
+    assert.equal(r.contacts, 6);
+    assert.deepEqual(lookups.sort(), ['adv@example.com', 'blank@example.com', 'consent@example.com', 'dead@example.com', 'full@example.com', 'ghost@example.com']);
+    assert.equal(r.contactsNotFound, 1);
+    assert.equal(r.contactsFound, 5);
+    assert.equal(r.rowsMatched, 5);
+    assert.equal(r.skippedGuard, 2); // advanced + dead deal
+    assert.equal(r.contactsFilled, 3); // blank, full (company only), consent
+    assert.equal(r.missing.eventType, 2); // adv, dead  (blank/consent filled, full already set)
+    assert.equal(r.missing.marketingConsent, 4); // never filled; consent@ already has No
+    const text = formatReport([r], { apply: false });
+    assert.match(text, /DRY RUN/);
+    assert.match(text, /contacts NOT found in GHL:\s+1/);
+    assert.match(text, /rows matched to a contact:\s+5/);
   });
 
-  test('--apply fills only blanks: c2 keeps its city and event type', async () => {
+  test('--apply fills only blanks, never creates, never overwrites, never writes consent', async () => {
     const updates = [];
     await backfillSource(WIX, deps(updates), { apply: true });
     const byId = Object.fromEntries(updates.map((u) => [u.id, u.body]));
-    assert.deepEqual(Object.keys(byId).sort(), ['c1', 'c2']);
+    assert.deepEqual(Object.keys(byId).sort(), ['c1', 'c2', 'c6']); // not c3 (advanced), c5 (dead), nor the missing ghost
     assert.equal(byId.c1.city, 'Toronto');
     assert.ok(byId.c1.customFields.some((f) => f.id === FIELDS.EVENT_TYPE && f.fieldValue === 'Gala'));
     assert.ok(byId.c1.customFields.some((f) => f.id === FIELDS.GUEST_COUNT && f.fieldValue === 90));
-    assert.equal(byId.c2.city, undefined);
+    assert.equal(byId.c2.city, undefined); // already Ottawa
     assert.equal(byId.c2.companyName, 'Acme'); // the one blank on c2
-    assert.ok(!byId.c2.customFields.some((f) => f.id === FIELDS.EVENT_TYPE));
-    // never sends tags / notes / lead source / status / last activity / consent default
+    assert.ok(!byId.c2.customFields.some((f) => f.id === FIELDS.EVENT_TYPE)); // already Gala
     updates.forEach((u) => {
       assert.equal(u.body.tags, undefined);
-      [FIELDS.LEAD_SOURCE, FIELDS.LEAD_STATUS, FIELDS.LAST_ACTIVITY, FIELDS.LEAD_SCORE]
-        .forEach((id) => assert.ok(!u.body.customFields.some((f) => f.id === id)));
-      assert.ok(!u.body.customFields.some((f) => f.id === FIELDS.MARKETING_CONSENT && f.fieldValue === 'Unknown'));
+      [FIELDS.LEAD_SOURCE, FIELDS.LEAD_STATUS, FIELDS.LAST_ACTIVITY, FIELDS.LEAD_SCORE, FIELDS.MARKETING_CONSENT]
+        .forEach((id) => assert.ok(!u.body.customFields.some((f) => f.id === id), `field ${id} not written`));
     });
   });
 
-  test('--limit stops the scan early', async () => {
-    const r = await backfillSource(WIX, deps([]), { limit: 2 });
-    assert.equal(r.scanned, 2);
+  test('--limit applies per source to contacts, newest first', async () => {
+    const lookups = [];
+    const r = await backfillSource(WIX, deps([], lookups), { limit: 2 });
+    assert.equal(r.contacts, 2);
+    assert.deepEqual(lookups, ['blank@example.com', 'full@example.com']);
+  });
+
+  test('several rows for one email are looked up once and merged, newest wins', async () => {
+    const lookups = [];
+    const rows = [wixRow('blank@example.com', { city: 'Toronto' }), wixRow('blank@example.com', { city: 'Old City', event_type: 'Gala' })];
+    const d = { ...deps([], lookups), rowsForSource: () => rows };
+    const updates = [];
+    d.updateContact = async (id, body) => updates.push(body);
+    const r = await backfillSource(WIX, d, { apply: true });
+    assert.deepEqual(lookups, ['blank@example.com']);
+    assert.equal(r.rowsMatched, 2);
+    assert.equal(updates[0].city, 'Toronto');
+    assert.ok(updates[0].customFields.some((f) => f.id === FIELDS.EVENT_TYPE && f.fieldValue === 'Gala'));
+  });
+
+  test('a GHL error on one contact is counted and does not stop the run', async () => {
+    const d = deps([]);
+    d.findContact = async (email) => { if (email === 'blank@example.com') throw new Error('boom'); return contacts[email] || null; };
+    const r = await backfillSource(WIX, d, {});
+    assert.equal(r.errors, 1);
+    assert.ok(r.contacts > 1);
   });
 });
 

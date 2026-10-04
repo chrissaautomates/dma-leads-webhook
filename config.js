@@ -49,4 +49,36 @@ function testLeadReason(lead, env = process.env) {
   return re ? `test lead (matches ${re})` : null;
 }
 
-module.exports = { CHECKCHERRY_ATTRIBUTES, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };
+// BuyAndRentRobots exclusion for the GHL push guard. EXCLUSION ONLY: a match keeps a
+// lead out of the DMA Events funnel; nothing here can pull a lead in or re-route a row.
+// It is checked IN ADDITION to the keyword list in db.js (BARR_PATTERN), which is
+// unchanged. Evidence for the starting values (2026-10-04 audit): all 4 BARR rows come
+// from source "BuyAndRentRobots Website"; no Wix form, Meta campaign or Google campaign
+// is BARR.
+//  - sourcePatterns:   tested against the lead's source.
+//  - campaignPatterns: tested against campaign and utm_campaign.
+//  - campaignNames:    exact campaign names or IDs (case-insensitive); add real BARR
+//                      campaigns here as they are identified. Empty on purpose for now.
+const BARR_EXCLUSION = {
+  sourcePatterns: [/^BuyAndRentRobots/i],
+  campaignPatterns: [/buyandrentrobots/i],
+  campaignNames: [],
+};
+
+// -> reason string when the config excludes this lead, else null.
+function barrExclusionReason(lead) {
+  const l = lead || {};
+  const source = String(l.source || '');
+  const sp = BARR_EXCLUSION.sourcePatterns.find((re) => re.test(source));
+  if (sp) return `source matches ${sp}`;
+  const campaigns = [l.campaign, l.utmCampaign].map((c) => String(c || '').trim()).filter(Boolean);
+  const names = BARR_EXCLUSION.campaignNames.map((n) => String(n).trim().toLowerCase());
+  for (const c of campaigns) {
+    const cp = BARR_EXCLUSION.campaignPatterns.find((re) => re.test(c));
+    if (cp) return `campaign matches ${cp}`;
+    if (names.includes(c.toLowerCase())) return `campaign "${c}" is listed as BuyAndRentRobots`;
+  }
+  return null;
+}
+
+module.exports = { BARR_EXCLUSION, barrExclusionReason, CHECKCHERRY_ATTRIBUTES, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };

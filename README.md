@@ -139,6 +139,13 @@ Lead Score is never written, so it is reported as "by design", not blank.
 A range guest count (`100-150`) writes the **high end** and keeps the original text in
 the note.
 
+**BuyAndRentRobots exclusion** (push guard only, exclusion only): besides the keyword list in
+`db.js` (`BARR_PATTERN`, unchanged), `BARR_EXCLUSION` in `config.js` excludes by source pattern
+(`/^BuyAndRentRobots/i`), campaign pattern (`/buyandrentrobots/i`) and exact `campaignNames`
+(empty until real BARR campaigns are identified). For **CheckCherry** leads the keyword scan covers
+only source, campaign/UTM and the lead's own inquiry (packages, event type, their own message),
+never staff notes, company or venue — a Won DMA booking with "Humanoid Bot" in its notes is not BARR.
+
 **Test / internal leads** never enter the funnel (terminal state `excluded_test`;
 dry run logs `WOULD EXCLUDE … — reason`): anything matching `TEST DMA` in name, email or
 company, plus exact addresses / `@domain`s in `INTERNAL_EXCLUDE` (`config.js`) or the

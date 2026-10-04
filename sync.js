@@ -114,6 +114,9 @@ function mapCheckCherryLead(record) {
     status,
     owner: strictAttr(attrs, 'owner', missing),
     notes: attrs.notes || attrs.message || '',
+    // The lead's OWN message, kept separate from staff notes for the BARR guard only
+    // (transient: not stored in the database).
+    inquiryText: attrs.message || '',
     // Normalized shape (lead-shape.js), read STRICTLY via config.js
     // CHECKCHERRY_ATTRIBUTES — see strictAttr().
     city: strictAttr(attrs, 'city', missing),

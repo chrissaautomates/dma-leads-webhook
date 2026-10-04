@@ -973,3 +973,77 @@ describe('BuyAndRentRobots keywords in the new shape fields are still caught', (
     assert.equal(push.isBarrLead({ source: 'Wix Form - X', interest: 'Robotics, Glambot' }, null), false);
   });
 });
+
+describe('BARR exclusion config (config.js) and the CheckCherry scan scope', () => {
+  const config = require('../config');
+  const { BARR_PATTERN } = require('../db');
+  const ccLead = (over = {}) => ({
+    source: 'CheckCherry', name: 'Won Client', email: `won${++seq}@example.com`, status: 'Won', interest: 'APOLLO The Intelligent Event Robot Experience',
+    notes: '', dateReceived: '2026-10-05', ...over,
+  });
+  const assessCC = (lead) => {
+    const { id } = insert(lead);
+    process.env.GHL_CHECKCHERRY_SETTLE_MINUTES = '0';
+    try { return push.assess(lead, rowOf(id), push.getPushConfig({}), { proposalEmails: new Set() }); } finally { delete process.env.GHL_CHECKCHERRY_SETTLE_MINUTES; }
+  };
+
+  test('the keyword list is unchanged (no additions)', () => {
+    assert.equal(BARR_PATTERN.source, 'humanoid|robot rental|buyandrentrobots');
+  });
+
+  test('source pattern /^BuyAndRentRobots/i excludes, and only from the push (exclusion, not routing)', () => {
+    assert.ok(config.barrExclusionReason({ source: 'BuyAndRentRobots Website' }));
+    assert.ok(config.barrExclusionReason({ source: 'buyandrentrobots lead form' }));
+    assert.equal(config.barrExclusionReason({ source: 'Wix Form - Digital Mirror Homepage' }), null);
+    assert.equal(push.isBarrLead({ source: 'BuyAndRentRobots Quote Form', interest: 'Rocky' }, null), true);
+  });
+
+  test('campaign pattern /buyandrentrobots/i excludes via campaign or utm_campaign', () => {
+    assert.ok(config.barrExclusionReason({ source: 'Meta Ads', campaign: 'BuyAndRentRobots | Spring' }));
+    assert.ok(config.barrExclusionReason({ source: 'Google Ads', utmCampaign: 'buyandrentrobots_search' }));
+    assert.equal(config.barrExclusionReason({ source: 'Meta Ads', campaign: 'DMA | Retargeting | DigitalMirror + CheckCherry | Leads' }), null);
+  });
+
+  test('campaignNames (exact names / IDs, case-insensitive) exclude; the list ships empty', () => {
+    assert.deepEqual(config.BARR_EXCLUSION.campaignNames, []);
+    config.BARR_EXCLUSION.campaignNames.push('Rental Fleet 12345');
+    try {
+      assert.ok(config.barrExclusionReason({ source: 'Google Ads', campaign: 'rental fleet 12345' }));
+      assert.equal(config.barrExclusionReason({ source: 'Google Ads', campaign: 'Rental Fleet 123456' }), null, 'exact match, not substring');
+    } finally { config.BARR_EXCLUSION.campaignNames.length = 0; }
+  });
+
+  test('the config can only exclude: a non-matching lead is still pushed', async () => {
+    const lead = newLead({ source: 'Meta Ads', campaign: 'DMA | Retargeting' });
+    assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'dry-run');
+  });
+
+  test('a Won DMA CheckCherry lead with "Humanoid Bot" in its staff NOTES is NOT excluded', () => {
+    const lead = ccLead({ notes: 'Humanoid Bot: Claire (attendant) arriving on site 3:15-3:30pm' });
+    assert.equal(push.isBarrLead(lead, null), false);
+    const decision = assessCC(lead);
+    assert.equal(decision.kind, 'push', JSON.stringify(decision));
+  });
+
+  test('CheckCherry: the same words in the lead\'s own inquiry (interest / message) or campaign DO exclude', () => {
+    assert.equal(push.isBarrLead(ccLead({ interest: 'Humanoid robot rental' }), null), true);
+    assert.equal(push.isBarrLead(ccLead({ inquiryText: 'do you rent a humanoid?' }), null), true);
+    assert.equal(push.isBarrLead(ccLead({ utmCampaign: 'BuyAndRentRobots' }), null), true);
+    assert.equal(assessCC(ccLead({ interest: 'Humanoid robot rental' })).kind, 'exclude');
+  });
+
+  test('CheckCherry: company and venue text are not scanned either', () => {
+    assert.equal(push.isBarrLead(ccLead({ company: 'Humanoid Labs Inc', location: 'Humanoid Hall' }), null), false);
+  });
+
+  test('other sources still scan notes (unchanged)', () => {
+    assert.equal(push.isBarrLead({ source: 'Wix Form - X', notes: 'we want a humanoid' }, null), true);
+    assert.equal(push.isBarrLead({ source: 'Meta Ads', notes: 'we want a humanoid' }, null), true);
+  });
+
+  test('the mapper keeps the lead\'s own message separate from staff notes', () => {
+    const lead = require('../sync').mapCheckCherryLead({ id: '1', attributes: { email: 'a@b.c', notes: 'staff: Humanoid Bot', message: 'hello' } });
+    assert.equal(lead.inquiryText, 'hello');
+    assert.equal(push.isBarrLead({ ...lead, source: 'CheckCherry' }, null), false);
+  });
+});

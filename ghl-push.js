@@ -27,7 +27,7 @@
 const ghl = require('./ghl-client');
 const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
 const { formNameFromSource } = require('./lead-shape');
-const { testLeadReason } = require('./config');
+const { testLeadReason, barrExclusionReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
 const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
 
@@ -138,6 +138,21 @@ function normEmail(v) {
 // be trusted to reveal a BARR lead. Over-excluding is the safe direction here.
 function isBarrLead(lead, row) {
   if (row && row.target === 'BARR') return true;
+  if (barrExclusionReason(lead)) return true; // config.js BARR_EXCLUSION (source / campaign), exclusion only
+
+  // CheckCherry leads: scan ONLY source, campaign/attribution and the lead's own
+  // inquiry (the packages/services they asked for, event type, and their own
+  // message). NEVER staff notes, company or venue: staff write things like "Humanoid
+  // Bot: attendant" into a DMA booking, which is not a BuyAndRentRobots lead.
+  // (`inquiryText` is the lead's own message, set transiently by the mapper.)
+  if (lead.source === 'CheckCherry') {
+    const inquiry = [
+      lead.source, lead.campaign, lead.utmSource, lead.utmMedium, lead.utmCampaign, lead.utmContent, lead.utmTerm,
+      lead.interest, lead.secondaryInterest, lead.eventType, lead.leadType, lead.inquiryText,
+    ].filter(Boolean).join(' ');
+    return BARR_PATTERN.test(inquiry);
+  }
+
   // Every text field a keyword could now sit in: answers that used to be folded
   // into `interest` live in the shape fields and `extra`.
   const haystack = [

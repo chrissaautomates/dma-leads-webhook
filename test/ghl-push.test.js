@@ -821,34 +821,50 @@ describe('test / internal lead exclusion', () => {
   });
 });
 
-describe('dry-run lines show which of the 17 standard fields are set / blank', () => {
-  test('WOULD CREATE lists set and blank fields', async () => {
-    const lead = newLead({ phone: '5551234', eventType: 'Gala', city: 'Toronto' });
+describe('dry-run lines show which of the 19 standard fields are set / blank', () => {
+  const parse = (line) => {
+    const m = line.match(/fields (\d+)\/19 set=\[([^\]]*)\] blank=\[([^\]]*)\] not-written-by-design=\[([^\]]*)\]/);
+    assert.ok(m, `line has the 19-field report: ${line}`);
+    const list = (x) => (x ? x.split(', ') : []);
+    return { n: Number(m[1]), set: list(m[2]), blank: list(m[3]), byDesign: list(m[4]) };
+  };
+
+  test('WOULD CREATE reports n/19 with the GHL field names; Lead Score is by design, not blank', async () => {
+    const lead = newLead({ phone: '5551234', eventType: 'Gala', city: 'Toronto', interest: 'Glambot', secondaryInterest: 'Robotics' });
     await push.pushAfterUpsert(lead, insert(lead));
-    const line = logs.find((l) => l.includes('WOULD CREATE'));
-    assert.match(line, /fields \d+\/17 set=\[[^\]]*\] blank=\[[^\]]*\]/);
-    const [, set, blank] = line.match(/set=\[([^\]]*)\] blank=\[([^\]]*)\]/);
-    const setList = set.split(', ');
-    const blankList = blank.split(', ');
-    assert.equal(setList.length + blankList.length, 17);
-    ['name', 'email', 'phone', 'city', 'eventType', 'leadSource', 'leadStatus', 'lastActivity', 'marketingConsent'].forEach((k) => assert.ok(setList.includes(k), `${k} set`));
-    ['company', 'eventDate', 'budgetRange', 'owner', 'leadType'].forEach((k) => assert.ok(blankList.includes(k), `${k} blank`));
+    const r = parse(logs.find((l) => l.includes('WOULD CREATE')));
+    assert.equal(r.n, r.set.length);
+    assert.equal(r.set.length + r.blank.length + r.byDesign.length, 19);
+    assert.deepEqual(r.byDesign, ['Lead Score']);
+    assert.ok(!r.blank.includes('Lead Score') && !r.set.includes('Lead Score'));
+    ['Contact', 'Email', 'Mobile', 'City', 'Event Type', 'Lead Source', 'Status', 'Last Activity', 'Marketing Consent', 'Interested In', 'Secondary Interest']
+      .forEach((k) => assert.ok(r.set.includes(k), `${k} set`));
+    ['Company', 'Event Date', 'Budget Range', 'Sales Owner', 'Lead Type', 'Campaign'].forEach((k) => assert.ok(r.blank.includes(k), `${k} blank`));
   });
 
-  test('WOULD UPDATE (existing contact) lists them too; a minimal update shows only last activity set', async () => {
+  test('Interested In and Secondary Interest are tracked separately', async () => {
+    const lead = newLead({ interest: 'Glambot' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    const r = parse(logs.find((l) => l.includes('WOULD CREATE')));
+    assert.ok(r.set.includes('Interested In'));
+    assert.ok(r.blank.includes('Secondary Interest'));
+  });
+
+  test('WOULD UPDATE lists them too; a minimal update shows only Last Activity set', async () => {
     ghl.duplicate = 'ghl-1';
     ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'New' }] };
     const a = newLead({ budgetRange: '$5,000-$10,000' });
     await push.pushAfterUpsert(a, insert(a));
-    const upd = logs.find((l) => l.includes('WOULD UPDATE contact ghl-1'));
-    assert.match(upd, /fields \d+\/17 set=\[[^\]]*budgetRange[^\]]*\]/);
+    const upd = parse(logs.find((l) => l.includes('WOULD UPDATE contact ghl-1')));
+    assert.ok(upd.set.includes('Budget Range'));
 
     logs = []; resetGhl();
     ghl.duplicate = 'ghl-2';
     ghl.contact = { tags: ['deposit'], customFields: [] };
     const b = newLead({ budgetRange: '$5,000-$10,000' });
     await push.pushAfterUpsert(b, insert(b));
-    const min = logs.find((l) => l.includes('MINIMAL'));
-    assert.match(min, /fields 1\/17 set=\[lastActivity\]/);
+    const min = parse(logs.find((l) => l.includes('MINIMAL')));
+    assert.deepEqual(min.set, ['Last Activity']);
+    assert.equal(min.n, 1);
   });
 });

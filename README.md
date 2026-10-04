@@ -131,9 +131,11 @@ not written. Last Activity reads like `Wix Form Submission — <form> — <what 
 For existing, non-advanced contacts the plan's `fillBlank` list is written only into
 fields that are blank in GHL.
 
-**17 standard fields** (what dry-run lines report as `set=[…] blank=[…]`): name, email,
-phone, company, city, leadSource, leadStatus, lastActivity, campaign, eventDate,
-eventType, budgetRange, interest, marketingConsent, guestCount, leadType, owner.
+**19 standard fields** (what dry-run lines report as `fields n/19 set=[…] blank=[…]
+not-written-by-design=[Lead Score]`): Lead Source, Campaign, Lead Type, Company, Contact,
+Email, Mobile, Event Date, City, Guest Count, Interested In, Secondary Interest, Budget
+Range, Event Type, Lead Score, Sales Owner, Status, Last Activity, Marketing Consent.
+Lead Score is never written, so it is reported as "by design", not blank.
 A range guest count (`100-150`) writes the **high end** and keeps the original text in
 the note.
 
@@ -154,9 +156,11 @@ One-time setup / maintenance (both **dry-run by default**, `--apply` to write):
   `GHL_FIELD_GUEST_COUNT_ID` and `GHL_FIELD_LEAD_TYPE_ID`. Until those are set,
   Lead Type is not written and Guest Count is kept in the note.
 - `railway run node scripts/backfill-ghl-fields.js [--source wix|meta|google|checkcherry] [--limit N] [--apply]`
-  — fills blank fields on `source-*` contacts from the stored lead rows (never
-  overwrites, skips advanced / dead-deal contacts) and reports, per source, how many
-  contacts are still missing each field.
+  — walks the stored lead rows (not GHL tags), looks each contact up in GHL by email,
+  fills only blank fields (never overwrites; skips advanced / dead-deal contacts, rows
+  with no email, and BARR / spam / test rows) and reports, per source, rows matched,
+  contacts not found in GHL, and how many contacts are still missing each field.
+  `--limit N` = first N contacts (newest first) per source.
 - `CHECKCHERRY_API_KEY=… node scripts/inspect-checkcherry-leads.js` — lists the real
   `/leads` attribute names, then set them in `CHECKCHERRY_ATTRIBUTES` (`config.js`).
 

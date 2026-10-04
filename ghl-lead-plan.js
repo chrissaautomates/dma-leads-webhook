@@ -324,6 +324,8 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     if (unmatched.length) unmapped.push({ label, value: unmatched.join(', ') });
   });
   if (interestOptions.length) setField(FIELDS.INTEREST, interestOptions, 'interest');
+  const interestSet = interestTokens(body.interest).hits.length > 0;
+  const secondaryInterestSet = interestTokens(body.secondaryInterest).hits.length > 0;
 
   // --- Lead Type (single select) ---
   const leadTypeKey = normalizeKey(body.leadType);
@@ -364,6 +366,8 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
       contactFields: {},
       customFields: customFields.filter((f) => f.id === FIELDS.LAST_ACTIVITY),
       fillBlank: [],
+      interestSet: false,
+      secondaryInterestSet: false,
       tags: reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : [],
       note,
       warnings,
@@ -378,6 +382,8 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     // Existing, non-advanced contacts only: candidates to write where the
     // contact's field is blank. See resolveFillBlank().
     fillBlank: isNewContact ? [] : mapped,
+    interestSet,
+    secondaryInterestSet,
     tags: [...new Set(tags)],
     note,
     warnings,
@@ -454,42 +460,53 @@ function isBlankOnContact(contact, tracked) {
   return Array.isArray(v) ? v.length === 0 : !normalize(v);
 }
 
-// The 17 standard fields a lead is judged on (Lead Score is deliberately not
-// among them: it is never written until real scoring exists). `name` counts as
-// set when either first or last name is written.
+// The 19 standard fields a lead is judged on, under their GHL names. `Contact` is
+// the person's name (set when first or last name is written), `Mobile` is the
+// phone. Lead Score is in the schema but never written (no real scoring yet), so
+// it is reported as "not written by design", never as blank. Interested In and
+// Secondary Interest share one multi-select field in GHL; each counts as set when
+// its own answer matched an option (plan.interestSet / plan.secondaryInterestSet).
 const STANDARD_FIELDS = [
-  { key: 'name', contact: ['firstName', 'lastName'] },
-  { key: 'email', contact: ['email'] },
-  { key: 'phone', contact: ['phone'] },
-  { key: 'company', contact: ['companyName'] },
-  { key: 'city', contact: ['city'] },
-  { key: 'leadSource', id: FIELDS.LEAD_SOURCE },
-  { key: 'leadStatus', id: FIELDS.LEAD_STATUS },
-  { key: 'lastActivity', id: FIELDS.LAST_ACTIVITY },
-  { key: 'campaign', id: FIELDS.CAMPAIGN },
-  { key: 'eventDate', id: FIELDS.EVENT_DATE },
-  { key: 'eventType', id: FIELDS.EVENT_TYPE },
-  { key: 'budgetRange', id: FIELDS.BUDGET_RANGE },
-  { key: 'interest', id: FIELDS.INTEREST },
-  { key: 'marketingConsent', id: FIELDS.MARKETING_CONSENT },
-  { key: 'guestCount', id: FIELDS.GUEST_COUNT },
-  { key: 'leadType', id: FIELDS.LEAD_TYPE },
-  { key: 'owner', id: FIELDS.OWNER },
+  { name: 'Lead Source', id: FIELDS.LEAD_SOURCE },
+  { name: 'Campaign', id: FIELDS.CAMPAIGN },
+  { name: 'Lead Type', id: FIELDS.LEAD_TYPE },
+  { name: 'Company', contact: ['companyName'] },
+  { name: 'Contact', contact: ['firstName', 'lastName'] },
+  { name: 'Email', contact: ['email'] },
+  { name: 'Mobile', contact: ['phone'] },
+  { name: 'Event Date', id: FIELDS.EVENT_DATE },
+  { name: 'City', contact: ['city'] },
+  { name: 'Guest Count', id: FIELDS.GUEST_COUNT },
+  { name: 'Interested In', plan: 'interestSet' },
+  { name: 'Secondary Interest', plan: 'secondaryInterestSet' },
+  { name: 'Budget Range', id: FIELDS.BUDGET_RANGE },
+  { name: 'Event Type', id: FIELDS.EVENT_TYPE },
+  { name: 'Lead Score', byDesign: true },
+  { name: 'Sales Owner', id: FIELDS.OWNER },
+  { name: 'Status', id: FIELDS.LEAD_STATUS },
+  { name: 'Last Activity', id: FIELDS.LAST_ACTIVITY },
+  { name: 'Marketing Consent', id: FIELDS.MARKETING_CONSENT },
 ];
-const STANDARD_FIELD_COUNT = STANDARD_FIELDS.length;
+const STANDARD_FIELD_COUNT = STANDARD_FIELDS.length; // 19
 
-// Which of the 17 this push writes ("set") and which it does not ("blank"),
-// counting what the plan sends plus any fill-blank additions. For the dry-run logs.
+// Which of the 19 this push writes ("set"), which it does not ("blank"), and the
+// by-design exception, counting what the plan sends plus any fill-blank
+// additions. For the dry-run logs.
 function standardFieldReport(plan, fill) {
   const contact = { ...plan.contactFields, ...((fill && fill.contactFields) || {}) };
   const ids = new Set([...plan.customFields, ...((fill && fill.customFields) || [])].map((f) => f.id));
   const set = [];
   const blank = [];
+  const notWritten = [];
   STANDARD_FIELDS.forEach((f) => {
-    const isSet = f.contact ? f.contact.some((k) => contact[k]) : (f.id && ids.has(f.id));
-    (isSet ? set : blank).push(f.key);
+    if (f.byDesign) { notWritten.push(f.name); return; }
+    let isSet;
+    if (f.contact) isSet = f.contact.some((k) => contact[k]);
+    else if (f.plan) isSet = !!plan[f.plan];
+    else isSet = !!(f.id && ids.has(f.id));
+    (isSet ? set : blank).push(f.name);
   });
-  return { set, blank };
+  return { set, blank, notWritten };
 }
 
 module.exports = {

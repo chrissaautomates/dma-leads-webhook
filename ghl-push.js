@@ -356,7 +356,7 @@ function describeOutcome(lead, profile, outcome) {
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
     outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
-    `fields ${std.set.length}/${STANDARD_FIELD_COUNT} set=[${std.set.join(', ')}] blank=[${std.blank.join(', ')}]`,
+    `fields ${std.set.length}/${STANDARD_FIELD_COUNT} set=[${std.set.join(', ')}] blank=[${std.blank.join(', ')}] not-written-by-design=[${std.notWritten.join(', ')}]`,
     outcome.fill && outcome.fill.keys.length ? `fill-blank=[${outcome.fill.keys.join(', ')}]` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');

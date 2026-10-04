@@ -99,15 +99,16 @@ function validDate(y, mo, d) {
   return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-// "150" -> 150; "100-150" / "100 to 150" / "100+" -> lower bound (the field is a
-// single number; callers keep the raw answer in the note when it isn't plain).
-// Returns { value: number|null, exact: boolean }.
+// "150" -> 150; "100-150" / "100 to 150" -> 150 (the HIGH end: the low end would
+// understate large events); "100+" / "up to 200" -> that number. The field is a
+// single number, so callers keep the original text in the note unless the answer
+// was a plain integer. Returns { value: number|null, exact: boolean }.
 function parseGuestCount(value) {
-  const v = str(value).replace(/,/g, '');
+  const v = str(value).replace(/(\d),(?=\d{3}\b)/g, '$1');
   if (!v) return { value: null, exact: false };
   if (/^\d+$/.test(v)) return { value: Number(v), exact: true };
-  const m = v.match(/\d+/);
-  return m ? { value: Number(m[0]), exact: false } : { value: null, exact: false };
+  const nums = (v.match(/\d+/g) || []).map(Number);
+  return nums.length ? { value: Math.max(...nums), exact: false } : { value: null, exact: false };
 }
 
 // "Label: value | Label: value" (the legacy folded form) -> [{label, value}].

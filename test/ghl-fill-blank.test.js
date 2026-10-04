@@ -28,10 +28,19 @@ describe('Guest Count and Lead Type fields', () => {
     assert.equal(plan.note, null);
   });
 
-  test('a range writes its lower bound and keeps the original answer in the note', () => {
+  test('a range writes its HIGH end (never understate a large event) and keeps the original text in the note', () => {
     const plan = buildLeadPlan({ ...base, guestCount: '100-150' }, { isNewContact: true, profile: WIX });
-    assert.equal(val(plan, FIELDS.GUEST_COUNT), 100);
+    assert.equal(val(plan, FIELDS.GUEST_COUNT), 150);
     assert.match(plan.note, /Guest Count \(submitted\): 100-150/);
+  });
+
+  test('other range spellings also take the high end', () => {
+    const g = (guestCount) => val(buildLeadPlan({ ...base, guestCount }, { isNewContact: true, profile: WIX }), FIELDS.GUEST_COUNT);
+    assert.equal(g('100 to 150'), 150);
+    assert.equal(g('50 – 100'), 100);
+    assert.equal(g('1,000-2,500'), 2500);
+    assert.equal(g('200+'), 200);
+    assert.equal(g('up to 300'), 300);
   });
 
   test('text with no number goes to the note only', () => {

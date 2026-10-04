@@ -4,6 +4,7 @@
 
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert } = require('./ghl-push');
+const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
 
 const status = {};
 
@@ -68,6 +69,20 @@ const SYNC_ONLY_STATUSES = ['New', 'Converted', 'Spam', 'Archived'];
 // CheckCherry wraps each lead as { id, type, attributes: {...} } (JSON:API
 // style) — the real fields live under attributes, not on the record itself.
 // Falls back to the record itself in case the shape ever comes back flat.
+const CC_EVENT_DATE_KEYS = ['event_date', 'lead_event_date', 'start_date', 'event_start_date', 'date_of_event'];
+const CC_GUEST_KEYS = ['guest_count', 'guests', 'number_of_guests', 'lead_guest_count', 'expected_guests', 'attendees'];
+const CC_BUDGET_KEYS = ['budget', 'lead_budget', 'budget_range'];
+const CC_OWNER_KEYS = ['owner', 'assigned_to', 'owner_name', 'assigned_user_name'];
+
+// First non-blank attribute among candidate names, as text ('' when none).
+function firstAttr(attrs, keys) {
+  for (const k of keys) {
+    const v = attrs[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
+
 function mapCheckCherryLead(record) {
   const attrs = (record && record.attributes) || record || {};
 
@@ -77,8 +92,9 @@ function mapCheckCherryLead(record) {
   const venueParts = [attrs.venue_city, attrs.venue_state].filter(Boolean).join(', ');
   const location = attrs.location || venueParts || attrs.city || attrs.venue || attrs.venue_name || '';
 
-  const interest = attrs.interest || attrs.package_name || attrs.service_name
-    || attrs.lead_event_type || attrs.event_type || attrs.notes || attrs.message || '';
+  // What they want from us (service/package) — NOT the event type, which has
+  // its own field now.
+  const interest = attrs.interest || attrs.package_name || attrs.service_name || '';
 
   let status = attrs.status || 'New';
   if (attrs.spam) status = 'Spam';
@@ -94,8 +110,18 @@ function mapCheckCherryLead(record) {
     location,
     interest,
     status,
-    owner: attrs.owner || attrs.assigned_to || '',
+    owner: firstAttr(attrs, CC_OWNER_KEYS),
     notes: attrs.notes || attrs.message || '',
+    // Normalized shape (lead-shape.js). Only venue_city / lead_event_type /
+    // event_type / package_name / created_at / utm_* are confirmed against live
+    // data (see the comments in this file); the *_KEYS candidates below are
+    // best guesses — run scripts/inspect-checkcherry-leads.js against the live
+    // /leads feed and trim them to the real names.
+    city: attrs.venue_city || '',
+    eventDate: toIsoDate(firstAttr(attrs, CC_EVENT_DATE_KEYS)),
+    eventType: attrs.lead_event_type || attrs.event_type || '',
+    guestCount: firstAttr(attrs, CC_GUEST_KEYS),
+    budgetRange: firstAttr(attrs, CC_BUDGET_KEYS),
     nextFollowUp: 'Yes',
     // Real field, verified against live /leads data on 2026-09-10 (same
     // field mapCheckCherryProposalEvent() below already uses for /events).
@@ -232,6 +258,7 @@ function mapCheckCherryProposalEvent(record) {
     email: firstOf(attrs.customer_emails),
     phone: firstOf(attrs.customer_phones),
     location: venueParts,
+    city: attrs.venue_city || '',
     interest: attrs.package_name || attrs.service_name || attrs.title || '',
     notes: attrs.private_notes || attrs.public_notes || '',
     nextFollowUp: 'Yes',
@@ -735,23 +762,24 @@ function mapMetaAdsRow(rowObj) {
   const email = pick(rowObj, ['email']);
   if (!email && !name) return null; // malformed/unmapped record — never write a junk row
 
-  // Three separate free-text columns each carry real signal — combine all
-  // three rather than picking one and losing the other two.
-  const interestParts = [
-    ['Services', pick(rowObj, ['what_services_are_you_interested_in?'])],
-    ['Planning', pick(rowObj, ['what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)'])],
-    ['Goal', pick(rowObj, ['tell_us_about_your_event_goal?'])],
-  ].filter(([, v]) => v);
-  const interest = interestParts.map(([label, v]) => `${label}: ${v}`).join(' | ');
+  // Services question -> interest, planning question -> eventType. The
+  // event-goal free text has no field: kept in `extra` (-> GHL note).
+  const services = pick(rowObj, ['what_services_are_you_interested_in?']);
+  const planning = pick(rowObj, ['what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)']);
+  const goal = pick(rowObj, ['tell_us_about_your_event_goal?']);
 
   return {
     source: 'Meta Ads',
     name,
-    company: '',
+    company: pick(rowObj, ['company_name', 'company']),
     email,
     phone: stripPhonePrefix(pick(rowObj, ['phone'])),
     location: '',
-    interest,
+    city: pick(rowObj, ['city']),
+    interest: services,
+    eventType: planning,
+    campaign: pick(rowObj, ['campaign_name']),
+    extra: goal ? `Event goal: ${goal}` : '',
     status: 'New',
     owner: '',
     notes: '',
@@ -930,12 +958,29 @@ function classifyField(fieldMeta, tagged) {
   const byType = CONTACT_FIELD_TYPES[fieldMeta.fieldType];
   if (byType) return byType;
 
+  // A consent question ("Can we send you information and promotion emails?")
+  // must be recognised BEFORE the label fallbacks below: its wording contains
+  // "email". Other shape fields (budget, guests, event type/date, interest,
+  // lead type, city) are classified last, after the contact categories.
+  if (classifyLabel(fieldMeta.label) === 'marketingConsent') return 'marketingConsent';
+
   const normalized = (fieldMeta.label || '').toLowerCase();
   if (!tagged.firstName && normalized.includes('first') && normalized.includes('name')) return 'firstName';
   if (!tagged.lastName && normalized.includes('last') && normalized.includes('name')) return 'lastName';
   if (!tagged.email && normalized.includes('email')) return 'email';
   if (!tagged.phone && normalized.includes('phone')) return 'phone';
-  return 'other';
+  return classifyLabel(fieldMeta.label);
+}
+
+// Wix field values aren't always strings: checkbox groups are arrays, address
+// fields are objects.
+function wixValueText(value) {
+  if (Array.isArray(value)) return value.map(wixValueText).filter(Boolean).join(', ');
+  if (value && typeof value === 'object') {
+    return String(value.formattedAddress || value.formatted
+      || Object.values(value).filter((v) => typeof v === 'string' && v).join(', '));
+  }
+  return String(value);
 }
 
 // Wix's Form Submission Service wraps each entry's actual field values
@@ -964,19 +1009,44 @@ function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
   let lastName = '';
   let email = '';
   let phone = '';
+  const shape = {};
   const otherParts = [];
+  // First answer wins a shape field; a second "interest" answer becomes the
+  // secondary interest; anything else that can't be placed is kept as
+  // "Label: value" in `extra`.
+  const place = (key, text, label) => {
+    if (!shape[key]) shape[key] = text;
+    else if (key === 'interest' && !shape.secondaryInterest) shape.secondaryInterest = text;
+    else otherParts.push(`${label}: ${text}`);
+  };
 
   Object.keys(values).forEach((target) => {
-    const value = values[target];
-    if (value === null || value === undefined || value === '') return;
+    const raw = values[target];
+    if (raw === null || raw === undefined || raw === '') return;
+    const value = wixValueText(raw).trim();
+    if (!value) return;
     const fieldMeta = fieldMetaByTarget[target];
     if (!fieldMeta) return; // no real label to identify this field by — never guess what it is
-    switch (classifyField(fieldMeta, tagged)) {
-      case 'firstName': firstName = firstName || String(value); break;
-      case 'lastName': lastName = lastName || String(value); break;
-      case 'email': email = email || String(value); break;
-      case 'phone': phone = phone || String(value); break;
-      default: otherParts.push(`${fieldMeta.label}: ${value}`);
+    const category = classifyField(fieldMeta, tagged);
+    switch (category) {
+      case 'firstName': firstName = firstName || value; break;
+      case 'lastName': lastName = lastName || value; break;
+      case 'email': email = email || value; break;
+      case 'phone': phone = phone || value; break;
+      case 'marketingConsent': {
+        const consent = parseConsent(value);
+        if (consent) place('marketingConsent', consent, fieldMeta.label);
+        else otherParts.push(`${fieldMeta.label}: ${value}`);
+        break;
+      }
+      case 'eventDate': {
+        const iso = toIsoDate(value);
+        if (iso) place('eventDate', iso, fieldMeta.label);
+        else otherParts.push(`${fieldMeta.label}: ${value}`);
+        break;
+      }
+      case 'other': otherParts.push(`${fieldMeta.label}: ${value}`); break;
+      default: place(category, value, fieldMeta.label);
     }
   });
 
@@ -997,7 +1067,8 @@ function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
     email,
     phone,
     location: '',
-    interest: otherParts.join(' | '),
+    ...shape,
+    extra: otherParts.join(' | '),
     status: 'New',
     owner: '',
     notes: '',
@@ -1125,4 +1196,12 @@ async function runFullSync() {
   return getSyncStatus();
 }
 
-module.exports = { runFullSync, getSyncStatus, buildProposalEmailSet, buildProposalIndex, fetchCheckCherryEvents, PROPOSAL_STATUSES };
+module.exports = {
+  mapCheckCherryLead, mapCheckCherryProposalEvent, mapMetaAdsRow, mapWixFormSubmission, buildFieldMetaMap, taggedCategoriesInForm,
+  runFullSync,
+  getSyncStatus,
+  buildProposalEmailSet,
+  buildProposalIndex,
+  fetchCheckCherryEvents,
+  PROPOSAL_STATUSES,
+};

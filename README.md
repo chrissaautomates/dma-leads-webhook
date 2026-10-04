@@ -119,6 +119,32 @@ leads always need this cycle's fresh set.
 Active always wins: a contact that is both a dead deal and active (e.g. `proposal
 expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
 
+**Standard lead shape.** Every source fills the same 11 fields — `eventDate`,
+`eventType`, `guestCount`, `budgetRange`, `city`, `interest`, `secondaryInterest`,
+`leadType`, `marketingConsent`, `campaign`, `owner` (`lead-shape.js`; stored as real
+`leads` columns). Answers no field can take go to `leads.extra` and the GHL note.
+`toPlanBody` passes all of them to `buildLeadPlan`, which matches picklists
+(event type, budget, interest, lead type), writes Guest Count as a number, and
+keeps anything unmatched in the note. Marketing Consent is `Unknown` on a brand-new
+contact when nothing explicit was supplied, never on an existing one. Lead Score is
+not written. Last Activity reads like `Wix Form Submission — <form> — <what they asked for>`.
+For existing, non-advanced contacts the plan's `fillBlank` list is written only into
+fields that are blank in GHL.
+
+One-time setup / maintenance (both **dry-run by default**, `--apply` to write):
+
+- `node scripts/create-ghl-fields.js` — creates Guest Count (number) and Lead Type
+  (single select), adds Glambot / Robotics / LED Tunnel / DMA Engage / Holiday /
+  Headshot to the interest picklist, prints the IDs to set as
+  `GHL_FIELD_GUEST_COUNT_ID` and `GHL_FIELD_LEAD_TYPE_ID`. Until those are set the
+  two values are kept in the note instead.
+- `railway run node scripts/backfill-ghl-fields.js [--source wix|meta|google|checkcherry] [--limit N] [--apply]`
+  — fills blank fields on `source-*` contacts from the stored lead rows (never
+  overwrites, skips advanced / dead-deal contacts) and reports, per source, how many
+  contacts are still missing each field.
+- `CHECKCHERRY_API_KEY=… node scripts/inspect-checkcherry-leads.js` — lists the real
+  `/leads` attribute names (see `CC_*_KEYS` in `sync.js`).
+
 `newsletter-reengagement` only *tags* the contact. The monthly newsletter itself
 is a separate GHL workflow/broadcast that must also check **DMA Marketing Consent
 = Yes** (CASL) before sending.

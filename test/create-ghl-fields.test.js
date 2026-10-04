@@ -2,6 +2,9 @@
 // existing options, and a field must never be created twice.
 
 process.env.DB_PATH = ':memory:';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { run, mergeOptions } = require('../scripts/create-ghl-fields');
@@ -89,6 +92,23 @@ describe('create-ghl-fields: picklist updates preserve existing options', () => 
     assert.equal(g.state.created.length, 0);
     assert.ok(lines.some((l) => /WOULD ADD to DMA_Interest/.test(l)));
     assert.ok(lines.some((l) => /WOULD CREATE "Guest Count"/.test(l)));
+  });
+});
+
+describe('create-ghl-fields: saves the current picklist first', () => {
+  test('writes the current interest options to a JSON file before any change, in dry run too', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ghl-bk-'));
+    const g = fakeGhl({ fields: baseFields() });
+    const order = [];
+    const realUpdate = g.updateCustomField;
+    g.updateCustomField = async (...a) => { order.push(fs.readdirSync(dir).length ? 'file-existed' : 'no-file'); return realUpdate(...a); };
+    const dry = await run(g, { apply: false, backupDir: dir });
+    const saved = JSON.parse(fs.readFileSync(dry.backupFile, 'utf8'));
+    assert.equal(saved.fieldId, FIELDS.INTEREST);
+    assert.deepEqual(saved.options, CURRENT_INTEREST);
+    await run(g, { apply: true, backupDir: dir, now: new Date('2030-01-01T00:00:00Z') });
+    assert.deepEqual(order, ['file-existed']); // the backup predates the update call
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 

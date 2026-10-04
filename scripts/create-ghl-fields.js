@@ -22,9 +22,14 @@
 //    never just the additions. After an --apply update it re-reads the field and, if
 //    any original option is missing, immediately re-sends the full list and fails
 //    loudly.
+//  - Before anything else (dry run included) the current DMA_Interest options are
+//    saved to ghl-backups/interest-options-<timestamp>.json (git-ignored), so the
+//    list can be restored by hand if GHL ever mangles it.
 //  - The custom-field endpoints (ghl-client.js) are unexercised from this project:
 //    read the dry-run output first and watch the first --apply.
 
+const fs = require('fs');
+const path = require('path');
 const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
 
 const optionLabel = (o) => (typeof o === 'string' ? o : (o && (o.label || o.value || o.name)) || '');
@@ -41,13 +46,23 @@ function mergeOptions(current, wanted) {
 }
 
 // deps: { listCustomFields, createCustomField, updateCustomField }
-async function run(deps, { apply = false, log = () => {} } = {}) {
-  const result = { created: [], updated: null, existing: [] };
+async function run(deps, { apply = false, log = () => {}, backupDir = path.join(__dirname, '..', 'ghl-backups'), now = new Date() } = {}) {
+  const result = { created: [], updated: null, existing: [], backupFile: null };
   const existing = await deps.listCustomFields();
   if (!existing.length) {
     throw new Error('GHL returned no custom fields — refusing to continue (an empty listing could create duplicates)');
   }
   log(`${apply ? 'APPLY' : 'DRY-RUN'} — ${existing.length} contact custom fields found\n`);
+
+  // Save the current interest options FIRST, whatever happens next.
+  const interestNow = existing.find((f) => f.id === FIELDS.INTEREST);
+  if (interestNow) {
+    fs.mkdirSync(backupDir, { recursive: true });
+    const file = path.join(backupDir, `interest-options-${now.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)}.json`);
+    fs.writeFileSync(file, JSON.stringify({ fieldId: interestNow.id, name: interestNow.name, savedAt: now.toISOString(), options: optionsOf(interestNow), raw: interestNow.picklistOptions || interestNow.options || [] }, null, 2));
+    result.backupFile = file;
+    log(`saved current DMA_Interest options (${optionsOf(interestNow).length}) to ${file}\n`);
+  }
 
   const findByName = (fields, name) => fields.find((f) => norm(f.name) === norm(name));
 

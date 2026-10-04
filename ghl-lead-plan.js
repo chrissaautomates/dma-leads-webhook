@@ -274,6 +274,10 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     if (!consent) setField(FIELDS.MARKETING_CONSENT, 'Unknown');
   }
 
+  // City is fill-blank only on an EXISTING contact: it stays out of the update
+  // body (the fill-blank pass writes it only if the contact's city is empty).
+  if (!isNewContact) delete contactFields.city;
+
   // --- Always safe to update: describes the most recent event, not a
   // cumulative/regressable state ---
   setField(FIELDS.LAST_ACTIVITY, `${describeActivity(body, profile)} — ${new Date().toISOString()}`);
@@ -414,6 +418,30 @@ function customFieldValue(contact, fieldId) {
   return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
 }
 
+// Current values of a multi-select custom field on a GHL contact ([] when blank).
+function customFieldValues(contact, fieldId) {
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
+  if (!entry) return [];
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  return (Array.isArray(v) ? v : [v]).map((x) => String(x == null ? '' : x).trim()).filter(Boolean);
+}
+
+// Existing contact: the plan's Interest write must ADD to what the contact already
+// has, not replace it. Returns plan.customFields with the interest entry replaced by
+// existing values first (their own spelling), then new ones not already present.
+function mergeInterestWithExisting(plan, contact) {
+  const have = customFieldValues(contact, FIELDS.INTEREST);
+  if (!have.length) return plan.customFields;
+  return plan.customFields.map((f) => {
+    if (f.id !== FIELDS.INTEREST) return f;
+    const merged = [...have];
+    (Array.isArray(f.fieldValue) ? f.fieldValue : [f.fieldValue]).forEach((o) => {
+      if (!merged.some((m) => m.toLowerCase() === String(o).toLowerCase())) merged.push(o);
+    });
+    return { ...f, fieldValue: merged };
+  });
+}
+
 // Which plan.fillBlank entries to actually send for this existing contact:
 // only those whose field is blank on the contact AND that the plan isn't
 // already writing in customFields/contactFields (pass { standalone: true } when
@@ -515,6 +543,7 @@ module.exports = {
   buildLeadPlan,
   decideNewLead,
   resolveFillBlank,
+  mergeInterestWithExisting,
   customFieldValue,
   isBlankOnContact,
   TRACKED_FIELDS,

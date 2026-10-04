@@ -25,7 +25,7 @@
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
-const { buildLeadPlan, resolveFillBlank, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
+const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
 const { formNameFromSource } = require('./lead-shape');
 const { testLeadReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
@@ -315,6 +315,8 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
+  // Existing contact: interest is merged into what they already have, never replaced.
+  if (existing && plan.route !== 'skip' && plan.route !== 'reengage') plan.customFields = mergeInterestWithExisting(plan, existing);
   const action = isNewContact ? 'create' : ((ctx.advancedReason || ctx.reengageReason) ? 'update-minimal' : 'update');
   // Existing non-advanced contact: also fill any blank mapped field (never
   // overwrites — see resolveFillBlank).

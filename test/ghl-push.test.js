@@ -868,3 +868,88 @@ describe('dry-run lines show which of the 19 standard fields are set / blank', (
     assert.equal(min.n, 1);
   });
 });
+
+describe('existing contacts: city is fill-blank only, interest is merged', () => {
+  const live = () => setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+  const put = () => calls.find((c) => c.method === 'PUT');
+  const interestOf = (body) => { const f = body.customFields.find((x) => x.id === FIELDS.INTEREST); return f && f.fieldValue; };
+
+  test('city is never overwritten when the contact already has one', async () => {
+    live();
+    ghl.duplicate = 'ghl-city1';
+    ghl.contact = { tags: [], city: 'Ottawa', customFields: [] };
+    const lead = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.ok(put());
+    assert.equal(put().body.city, undefined);
+  });
+
+  test('city fills in when the contact has none (also whitespace-only)', async () => {
+    for (const blank of [undefined, '', '   ']) {
+      resetGhl(); live();
+      ghl.duplicate = 'ghl-city2';
+      ghl.contact = { tags: [], city: blank, customFields: [] };
+      const lead = newLead({ city: 'Toronto' });
+      await push.pushAfterUpsert(lead, insert(lead));
+      assert.equal(put().body.city, 'Toronto', `blank=${JSON.stringify(blank)}`);
+    }
+  });
+
+  test('a brand-new contact still gets its city on create', async () => {
+    live();
+    const lead = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(calls.find((c) => c.method === 'POST' && c.url.endsWith('/contacts/')).body.city, 'Toronto');
+  });
+
+  test('dry-run report counts City as set only when it would really be written', async () => {
+    ghl.duplicate = 'ghl-city3';
+    ghl.contact = { tags: [], city: 'Ottawa', customFields: [] };
+    const a = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(a, insert(a));
+    assert.match(logs.find((l) => l.includes('WOULD UPDATE')), /blank=\[[^\]]*City/);
+  });
+
+  test('interest is merged into the contact\'s existing values, not replaced', async () => {
+    live();
+    ghl.duplicate = 'ghl-int1';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar', 'Mosaic'] }] };
+    const lead = newLead({ interest: 'Glambot, mosaic' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(interestOf(put().body), ['Hat Bar', 'Mosaic', 'Glambot']); // existing first; Mosaic not duplicated
+  });
+
+  test('existing value outside our picklist is kept; no existing interest just writes the new ones', async () => {
+    live();
+    ghl.duplicate = 'ghl-int2';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Legacy Option'] }] };
+    const a = newLead({ interest: 'Robotics' });
+    await push.pushAfterUpsert(a, insert(a));
+    assert.deepEqual(interestOf(put().body), ['Legacy Option', 'Robotics']);
+
+    resetGhl(); live();
+    ghl.duplicate = 'ghl-int3';
+    ghl.contact = { tags: [], customFields: [] };
+    const b = newLead({ interest: 'Robotics' });
+    await push.pushAfterUpsert(b, insert(b));
+    assert.deepEqual(interestOf(put().body), ['Robotics']);
+  });
+
+  test('a lead with no recognised interest leaves the existing interest untouched', async () => {
+    live();
+    ghl.duplicate = 'ghl-int4';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar'] }] };
+    const lead = newLead({ interest: 'Fire Dancers' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(interestOf(put().body), undefined);
+  });
+
+  test('a single-string existing value (not an array) is also merged', async () => {
+    live();
+    ghl.duplicate = 'ghl-int5';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: 'Hat Bar' }] };
+    const lead = newLead({ interest: 'Glambot' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(interestOf(put().body), ['Hat Bar', 'Glambot']);
+  });
+});

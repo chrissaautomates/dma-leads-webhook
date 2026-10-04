@@ -25,7 +25,9 @@
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
-const { buildLeadPlan } = require('./ghl-lead-plan');
+const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
+const { formNameFromSource } = require('./lead-shape');
+const { testLeadReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
 const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
 
@@ -188,6 +190,8 @@ function settleWindowMinutes(env = process.env) {
 function assess(lead, row, cfg, context) {
   const profile = profileForSource(lead.source);
   if (!profile) return { kind: 'exclude', terminal: 'excluded_source', reason: `source "${lead.source || ''}" is not pushed to GHL` };
+  const testReason = testLeadReason(lead);
+  if (testReason) return { kind: 'exclude', terminal: 'excluded_test', reason: `${testReason} — never enters the funnel` };
   if (isBarrLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_barr', reason: 'BuyAndRentRobots lead — not for the DMA Events funnel' };
   if (isSpamLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_spam', reason: 'lead is marked Spam — never enters the funnel' };
   if (cfg.cutoff && row && row.date_received < cfg.cutoff) {
@@ -229,13 +233,6 @@ const REENGAGE_STATUS_SET = new Set(REENGAGE_STATUSES.map((x) => x.toLowerCase()
 const ADVANCED_TAG_SET = new Set(ADVANCED_TAGS.map((t) => t.trim().toLowerCase()));
 const DEAD_DEAL_TAG_SET = new Set(DEAD_DEAL_TAGS.map((t) => t.trim().toLowerCase()));
 
-function customFieldValue(contact, fieldId) {
-  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
-  if (!entry) return '';
-  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
-  return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
-}
-
 const tagKey = (t) => String(t).trim().toLowerCase();
 
 // Which of the three buckets an EXISTING contact is in:
@@ -264,21 +261,34 @@ function classifyContact(contact) {
 
 // --- The shared push --------------------------------------------------------
 
-// Adapts a stored/synced lead ({name, email, phone, company, location,
-// interest, notes, utm*, source}) into the input buildLeadPlan expects.
-// Free-text interest and location go to the note, not into structured fields:
-// they aren't picklist values, and a venue city isn't the contact's city.
+// Adapts a stored/synced lead (the normalized shape from lead-shape.js plus
+// name/email/phone/company/location/notes/utm*/source) into the input
+// buildLeadPlan expects: every shape field is passed straight through so the
+// picklist matching in buildLeadPlan actually runs. Free-text location and
+// notes (which now hold only what no field could take) go to the note.
 function toPlanBody(lead) {
   return {
     name: lead.name,
     email: lead.email,
     phone: lead.phone,
     company: lead.company,
-    campaign: lead.utmCampaign,
+    // the 11 standard shape fields
+    eventDate: lead.eventDate,
+    eventType: lead.eventType,
+    guestCount: lead.guestCount,
+    budgetRange: lead.budgetRange,
+    city: lead.city,
+    interest: lead.interest,
+    secondaryInterest: lead.secondaryInterest,
+    leadType: lead.leadType,
+    marketingConsent: lead.marketingConsent,
+    campaign: lead.campaign || lead.utmCampaign,
+    owner: lead.owner,
+    formName: formNameFromSource(lead.source),
     noteLines: [
-      lead.interest && `Interest / form answers: ${lead.interest}`,
       lead.location && `Location: ${lead.location}`,
       lead.notes && `Notes: ${lead.notes}`,
+      lead.extra && `Other form answers: ${lead.extra}`,
       lead.source && `Original source: ${lead.source}`,
     ].filter(Boolean),
   };
@@ -305,13 +315,22 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
+  // Existing contact: interest is merged into what they already have, never replaced.
+  if (existing && plan.route !== 'skip' && plan.route !== 'reengage') plan.customFields = mergeInterestWithExisting(plan, existing);
   const action = isNewContact ? 'create' : ((ctx.advancedReason || ctx.reengageReason) ? 'update-minimal' : 'update');
-  const outcome = { action, contactId: existing ? existing.id : null, plan, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
+  // Existing non-advanced contact: also fill any blank mapped field (never
+  // overwrites — see resolveFillBlank).
+  const fill = existing ? resolveFillBlank(plan, existing) : { contactFields: {}, customFields: [], keys: [] };
+  const outcome = { action, contactId: existing ? existing.id : null, plan, fill, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
   if (dryRun) return { ...outcome, dryRun: true };
 
   let contactId;
   if (existing) {
-    await ghl.updateContact(existing.id, { ...plan.contactFields, customFields: plan.customFields });
+    await ghl.updateContact(existing.id, {
+      ...plan.contactFields,
+      ...fill.contactFields,
+      customFields: [...plan.customFields, ...fill.customFields],
+    });
     contactId = existing.id;
   } else {
     const result = await ghl.createContact({ ...plan.contactFields, customFields: plan.customFields });
@@ -327,6 +346,7 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
 function describeOutcome(lead, profile, outcome) {
   const { plan } = outcome;
   const verb = { create: 'CREATE contact', update: 'UPDATE contact', 'update-minimal': 'UPDATE contact (MINIMAL: last-activity + note only)' }[outcome.action];
+  const std = standardFieldReport(plan, outcome.fill);
   return [
     `${verb}${outcome.contactId ? ` ${outcome.contactId}` : ''}`,
     `email=${lead.email || '-'}`,
@@ -338,6 +358,8 @@ function describeOutcome(lead, profile, outcome) {
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
     outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
+    `fields ${std.set.length}/${STANDARD_FIELD_COUNT} set=[${std.set.join(', ')}] blank=[${std.blank.join(', ')}] not-written-by-design=[${std.notWritten.join(', ')}]`,
+    outcome.fill && outcome.fill.keys.length ? `fill-blank=[${outcome.fill.keys.join(', ')}]` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');
 }
@@ -434,6 +456,7 @@ module.exports = {
   proposalLookup,
   assess,
   classifyContact,
+  toPlanBody,
   pushLeadToGhl,
   pushAfterUpsert,
   previewLead,

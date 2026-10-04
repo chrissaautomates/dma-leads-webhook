@@ -119,6 +119,51 @@ leads always need this cycle's fresh set.
 Active always wins: a contact that is both a dead deal and active (e.g. `proposal
 expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
 
+**Standard lead shape.** Every source fills the same 11 fields — `eventDate`,
+`eventType`, `guestCount`, `budgetRange`, `city`, `interest`, `secondaryInterest`,
+`leadType`, `marketingConsent`, `campaign`, `owner` (`lead-shape.js`; stored as real
+`leads` columns). Answers no field can take go to `leads.extra` and the GHL note.
+`toPlanBody` passes all of them to `buildLeadPlan`, which matches picklists
+(event type, budget, interest, lead type), writes Guest Count as a number, and
+keeps anything unmatched in the note. Marketing Consent is `Unknown` on a brand-new
+contact when nothing explicit was supplied, never on an existing one. Lead Score is
+not written. Last Activity reads like `Wix Form Submission — <form> — <what they asked for>`.
+For existing, non-advanced contacts the plan's `fillBlank` list is written only into
+fields that are blank in GHL.
+
+**19 standard fields** (what dry-run lines report as `fields n/19 set=[…] blank=[…]
+not-written-by-design=[Lead Score]`): Lead Source, Campaign, Lead Type, Company, Contact,
+Email, Mobile, Event Date, City, Guest Count, Interested In, Secondary Interest, Budget
+Range, Event Type, Lead Score, Sales Owner, Status, Last Activity, Marketing Consent.
+Lead Score is never written, so it is reported as "by design", not blank.
+A range guest count (`100-150`) writes the **high end** and keeps the original text in
+the note.
+
+**Test / internal leads** never enter the funnel (terminal state `excluded_test`;
+dry run logs `WOULD EXCLUDE … — reason`): anything matching `TEST DMA` in name, email or
+company, plus exact addresses / `@domain`s in `INTERNAL_EXCLUDE` (`config.js`) or the
+`GHL_EXCLUDE_EMAILS` env var (comma-separated).
+
+**CheckCherry attributes** are read strictly from `CHECKCHERRY_ATTRIBUTES` in `config.js`
+(one exact name per field, no fall-through; a missing attribute leaves the field blank and
+logs one `[checkcherry-mapper]` line per lead). `null` entries stay blank until confirmed.
+
+One-time setup / maintenance (both **dry-run by default**, `--apply` to write):
+
+- `node scripts/create-ghl-fields.js` — (re-checks for an existing field of the same name right before every create, so it never duplicates; sends the *full* merged option list when updating a picklist and verifies afterwards that no original option was lost) creates Guest Count (number) and Lead Type
+  (single select), adds Glambot / Robotics / LED Tunnel / DMA Engage / Holiday /
+  Headshot to the interest picklist, prints the IDs to set as
+  `GHL_FIELD_GUEST_COUNT_ID` and `GHL_FIELD_LEAD_TYPE_ID`. Until those are set,
+  Lead Type is not written and Guest Count is kept in the note.
+- `railway run node scripts/backfill-ghl-fields.js [--source wix|meta|google|checkcherry] [--limit N] [--apply]`
+  — walks the stored lead rows (not GHL tags), looks each contact up in GHL by email,
+  fills only blank fields (never overwrites; skips advanced / dead-deal contacts, rows
+  with no email, and BARR / spam / test rows) and reports, per source, rows matched,
+  contacts not found in GHL, and how many contacts are still missing each field.
+  `--limit N` = first N contacts (newest first) per source.
+- `CHECKCHERRY_API_KEY=… node scripts/inspect-checkcherry-leads.js` — lists the real
+  `/leads` attribute names, then set them in `CHECKCHERRY_ATTRIBUTES` (`config.js`).
+
 `newsletter-reengagement` only *tags* the contact. The monthly newsletter itself
 is a separate GHL workflow/broadcast that must also check **DMA Marketing Consent
 = Yes** (CASL) before sending.
@@ -141,7 +186,7 @@ under the BARR tab), Chat Lead (already in GHL), manual `/admin` entries,
 The `leads.ghl_pushed` column records push state per row. On first boot after
 this change every existing row is stamped `legacy` (in the same transaction as
 the `ALTER TABLE`), so the back catalog can never be sent. `NULL` = pending.
-Other terminal values: `pushed`, `excluded_barr`, `excluded_source`,
+Other terminal values: `pushed`, `excluded_barr`, `excluded_source`, `excluded_test`,
 `excluded_proposal`, `excluded_spam`, `skipped_no_contact`. A pending row that fails (GHL error)
 or is deferred (CheckCherry events unavailable / settle window) is retried on
 the next 15-minute cycle.

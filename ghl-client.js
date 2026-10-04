@@ -186,7 +186,38 @@ async function createNote(contactId, body) {
   if (!res.ok) throw new GhlApiError(`GHL create-note HTTP ${res.status}`, res.status, res.text().slice(0, 500));
 }
 
+// Custom-field definitions (used only by scripts/create-ghl-fields.js).
+// UNVERIFIED against a live call from this project — the script's dry-run
+// prints what it would send, and its first --apply should be watched.
+async function listCustomFields() {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields?model=contact`, { headers: authHeaders(apiKey) });
+  if (!res.ok) throw new GhlApiError(`GHL list-custom-fields HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customFields || [];
+}
+
+async function createCustomField(def) {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields`, {
+    method: 'POST', headers: authHeaders(apiKey), body: JSON.stringify({ model: 'contact', ...def }),
+  });
+  if (!res.ok) throw new GhlApiError(`GHL create-custom-field HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customField;
+}
+
+async function updateCustomField(id, def) {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields/${encodeURIComponent(id)}`, {
+    method: 'PUT', headers: authHeaders(apiKey), body: JSON.stringify(def),
+  });
+  if (!res.ok) throw new GhlApiError(`GHL update-custom-field HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customField;
+}
+
 module.exports = {
+  listCustomFields,
+  createCustomField,
+  updateCustomField,
   GhlApiError,
   findDuplicateContact,
   getContact,

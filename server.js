@@ -24,6 +24,7 @@
 
 const express = require('express');
 const { upsertLead } = require('./db');
+const { toIsoDate } = require('./lead-shape');
 const adminRouter = require('./admin');
 const { runFullSync } = require('./sync');
 const { pushAfterUpsert, describeMode } = require('./ghl-push');
@@ -106,13 +107,24 @@ function pickGoogleField(flat, aliases) {
   return '';
 }
 
-function mapGoogleAdsLead(userColumnData) {
+// Attribution ids Google sends at the top level of the webhook body, folded
+// into the one DMA Campaign text field.
+function googleCampaign(body) {
+  const b = body || {};
+  return [['campaign_id', b.campaign_id], ['adgroup_id', b.adgroup_id], ['creative_id', b.creative_id]]
+    .filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')
+    .map(([k, v]) => `${k}=${String(v).trim()}`)
+    .join(', ');
+}
+
+function mapGoogleAdsLead(userColumnData, body) {
   const flat = flattenUserColumnData(userColumnData);
 
   const name = pickGoogleField(flat, ['fullname', 'name'])
     || [flat.firstname, flat.lastname].filter(Boolean).join(' ');
 
-  const location = [flat.city, flat.region || flat.state, flat.postalcode || flat.zipcode]
+  const city = flat.city || '';
+  const location = [city, flat.region || flat.state, flat.postalcode || flat.zipcode]
     .filter(Boolean).join(', ') || pickGoogleField(flat, ['location']);
 
   return {
@@ -122,8 +134,13 @@ function mapGoogleAdsLead(userColumnData) {
     phone: pickGoogleField(flat, ['phonenumber', 'userphone', 'workphonenumber', 'phone', 'mobilephone']),
     company: pickGoogleField(flat, ['companyname', 'company', 'businessname', 'organization']),
     location,
-    interest: pickGoogleField(flat, ['interest', 'message', 'whatareyouinterestedin', 'whattypeofeventareyouplanning', 'request', 'jobtitle']),
-    notes: flat.whenisyoureventdate ? `Event date: ${flat.whenisyoureventdate}` : '',
+    city,
+    // The event-type question is its own field; interest is only a services answer.
+    eventType: pickGoogleField(flat, ['whattypeofeventareyouplanning', 'eventtype']),
+    // Real payload shows MM/DD/YYYY ("05/30/2027"); stored as ISO.
+    eventDate: toIsoDate(pickGoogleField(flat, ['whenisyoureventdate', 'eventdate']), { order: 'mdy' }),
+    interest: pickGoogleField(flat, ['interest', 'message', 'whatareyouinterestedin', 'request', 'jobtitle']),
+    campaign: googleCampaign(body),
   };
 }
 
@@ -167,7 +184,7 @@ app.post('/webhook/google-ads-lead', (req, res) => {
   let lead;
   let result;
   try {
-    lead = mapGoogleAdsLead(req.body.user_column_data);
+    lead = mapGoogleAdsLead(req.body.user_column_data, req.body);
     result = upsertLead(lead);
   } catch (err) {
     console.error('Google Ads lead webhook: upsert failed', err);

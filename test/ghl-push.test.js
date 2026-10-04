@@ -710,3 +710,246 @@ describe('buildProposalIndex — every match traces to a real event', () => {
     assert.equal(idx.get('r@x.com').length, 2);
   });
 });
+
+describe('live mode cannot be reached by accident — including the fill-blank path', () => {
+  // An existing, non-advanced contact with every mapped field blank: the case where
+  // plan.fillBlank has the most to write.
+  const richLead = () => newLead({ eventType: 'Gala', eventDate: '2027-05-30', budgetRange: '$5,000-$10,000', city: 'Toronto', company: 'Acme', interest: 'Glambot', campaign: 'c1' });
+  const blankContact = () => { ghl.duplicate = 'ghl-blank'; ghl.contact = { tags: [], customFields: [] }; };
+
+  for (const [label, env] of [
+    ['no env at all', {}],
+    ['GHL_PUSH_LIVE=true without a cutoff', { GHL_PUSH_LIVE: 'true' }],
+    ['GHL_PUSH_LIVE=true with an invalid cutoff', { GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: 'soon' }],
+    ['GHL_PUSH_LIVE=false with a valid cutoff', { GHL_PUSH_LIVE: 'false', GHL_PUSH_CUTOFF_DATE: '2026-10-01' }],
+    ['kill switch on', { GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01', GHL_PUSH_DISABLED: 'true' }],
+  ]) {
+    test(`${label}: zero GHL writes for an existing contact with blanks, row stays pending`, async () => {
+      setEnv(env);
+      blankContact();
+      const lead = richLead();
+      const result = insert(lead);
+      await push.pushAfterUpsert(lead, result);
+      assert.deepEqual(writes(), [], 'no POST/PUT of any kind');
+      assert.equal(rowOf(result.id).ghl_pushed, null);
+    });
+  }
+
+  test('pushLeadToGhl defaults to dry-run when called without options', async () => {
+    blankContact();
+    const out = await push.pushLeadToGhl(richLead(), { profile: push.SOURCE_PROFILES.meta });
+    assert.equal(out.dryRun, true);
+    assert.deepEqual(writes(), []);
+  });
+
+  test('only GHL_PUSH_LIVE=true plus a valid cutoff writes (and then the contact is updated)', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    blankContact();
+    const lead = richLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    const put = calls.find((c) => c.method === 'PUT');
+    assert.ok(put, 'live mode did update');
+    assert.ok(put.body.customFields.some((f) => f.id === FIELDS.EVENT_TYPE && f.fieldValue === 'Gala'));
+  });
+});
+
+describe('Marketing Consent is never downgraded on an existing contact', () => {
+  for (const existingConsent of ['Yes', 'No']) {
+    test(`existing contact with ${existingConsent}, lead gives no answer: consent is not in the update at all`, async () => {
+      setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+      ghl.duplicate = 'ghl-consent';
+      ghl.contact = { tags: [], customFields: [{ id: FIELDS.MARKETING_CONSENT, value: existingConsent }] };
+      const lead = newLead({ eventType: 'Gala' });
+      await push.pushAfterUpsert(lead, insert(lead));
+      const put = calls.find((c) => c.method === 'PUT');
+      assert.ok(put, 'the contact was updated');
+      assert.ok(!put.body.customFields.some((f) => f.id === FIELDS.MARKETING_CONSENT), 'no consent write, so no Unknown');
+      assert.ok(!JSON.stringify(put.body).includes('Unknown'));
+    });
+  }
+
+  test('a brand-new contact with no explicit answer gets Unknown', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/contacts/'));
+    assert.equal(post.body.customFields.find((f) => f.id === FIELDS.MARKETING_CONSENT).fieldValue, 'Unknown');
+  });
+});
+
+describe('test / internal lead exclusion', () => {
+  const config = require('../config');
+  const reasonLine = () => logs.find((l) => l.includes('WOULD EXCLUDE'));
+
+  test('anything containing TEST DMA (name, email or company, any separator) is excluded, with the reason in the dry-run log', async () => {
+    for (const over of [{ name: 'TEST DMA Lead' }, { email: 'test.dma@gmail.com' }, { company: 'Test_DMA Inc' }, { name: 'test-dma' }]) {
+      logs = [];
+      const lead = newLead(over);
+      const result = insert(lead);
+      assert.equal(await push.pushAfterUpsert(lead, result), 'excluded_test', JSON.stringify(over));
+      assert.match(reasonLine(), /WOULD EXCLUDE .*test lead/);
+      assert.equal(calls.length, 0, 'excluded before any GHL read');
+      assert.equal(rowOf(result.id).ghl_pushed, null, 'dry run marks nothing');
+    }
+  });
+
+  test('exact internal addresses and @domains from GHL_EXCLUDE_EMAILS are excluded', async () => {
+    process.env.GHL_EXCLUDE_EMAILS = 'boss@dma.test, @internal.example';
+    try {
+      for (const email of ['boss@dma.test', 'anyone@internal.example']) {
+        logs = [];
+        const lead = newLead({ email });
+        assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'excluded_test', email);
+        assert.match(reasonLine(), /internal address/);
+      }
+      const ok = newLead({ email: 'client@notinternal.example' });
+      assert.equal(await push.pushAfterUpsert(ok, insert(ok)), 'dry-run');
+    } finally { delete process.env.GHL_EXCLUDE_EMAILS; }
+  });
+
+  test('live mode marks the row excluded_test and sends nothing', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    const lead = newLead({ name: 'TEST DMA' });
+    const result = insert(lead);
+    await push.pushAfterUpsert(lead, result);
+    assert.equal(rowOf(result.id).ghl_pushed, 'excluded_test');
+    assert.deepEqual(writes(), []);
+  });
+
+  test('an ordinary lead is not excluded', () => {
+    assert.equal(config.testLeadReason({ name: 'Jane Doe', email: 'jane@acme.com', company: 'Acme' }), null);
+  });
+});
+
+describe('dry-run lines show which of the 19 standard fields are set / blank', () => {
+  const parse = (line) => {
+    const m = line.match(/fields (\d+)\/19 set=\[([^\]]*)\] blank=\[([^\]]*)\] not-written-by-design=\[([^\]]*)\]/);
+    assert.ok(m, `line has the 19-field report: ${line}`);
+    const list = (x) => (x ? x.split(', ') : []);
+    return { n: Number(m[1]), set: list(m[2]), blank: list(m[3]), byDesign: list(m[4]) };
+  };
+
+  test('WOULD CREATE reports n/19 with the GHL field names; Lead Score is by design, not blank', async () => {
+    const lead = newLead({ phone: '5551234', eventType: 'Gala', city: 'Toronto', interest: 'Glambot', secondaryInterest: 'Robotics' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    const r = parse(logs.find((l) => l.includes('WOULD CREATE')));
+    assert.equal(r.n, r.set.length);
+    assert.equal(r.set.length + r.blank.length + r.byDesign.length, 19);
+    assert.deepEqual(r.byDesign, ['Lead Score']);
+    assert.ok(!r.blank.includes('Lead Score') && !r.set.includes('Lead Score'));
+    ['Contact', 'Email', 'Mobile', 'City', 'Event Type', 'Lead Source', 'Status', 'Last Activity', 'Marketing Consent', 'Interested In', 'Secondary Interest']
+      .forEach((k) => assert.ok(r.set.includes(k), `${k} set`));
+    ['Company', 'Event Date', 'Budget Range', 'Sales Owner', 'Lead Type', 'Campaign'].forEach((k) => assert.ok(r.blank.includes(k), `${k} blank`));
+  });
+
+  test('Interested In and Secondary Interest are tracked separately', async () => {
+    const lead = newLead({ interest: 'Glambot' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    const r = parse(logs.find((l) => l.includes('WOULD CREATE')));
+    assert.ok(r.set.includes('Interested In'));
+    assert.ok(r.blank.includes('Secondary Interest'));
+  });
+
+  test('WOULD UPDATE lists them too; a minimal update shows only Last Activity set', async () => {
+    ghl.duplicate = 'ghl-1';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'New' }] };
+    const a = newLead({ budgetRange: '$5,000-$10,000' });
+    await push.pushAfterUpsert(a, insert(a));
+    const upd = parse(logs.find((l) => l.includes('WOULD UPDATE contact ghl-1')));
+    assert.ok(upd.set.includes('Budget Range'));
+
+    logs = []; resetGhl();
+    ghl.duplicate = 'ghl-2';
+    ghl.contact = { tags: ['deposit'], customFields: [] };
+    const b = newLead({ budgetRange: '$5,000-$10,000' });
+    await push.pushAfterUpsert(b, insert(b));
+    const min = parse(logs.find((l) => l.includes('MINIMAL')));
+    assert.deepEqual(min.set, ['Last Activity']);
+    assert.equal(min.n, 1);
+  });
+});
+
+describe('existing contacts: city is fill-blank only, interest is merged', () => {
+  const live = () => setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+  const put = () => calls.find((c) => c.method === 'PUT');
+  const interestOf = (body) => { const f = body.customFields.find((x) => x.id === FIELDS.INTEREST); return f && f.fieldValue; };
+
+  test('city is never overwritten when the contact already has one', async () => {
+    live();
+    ghl.duplicate = 'ghl-city1';
+    ghl.contact = { tags: [], city: 'Ottawa', customFields: [] };
+    const lead = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.ok(put());
+    assert.equal(put().body.city, undefined);
+  });
+
+  test('city fills in when the contact has none (also whitespace-only)', async () => {
+    for (const blank of [undefined, '', '   ']) {
+      resetGhl(); live();
+      ghl.duplicate = 'ghl-city2';
+      ghl.contact = { tags: [], city: blank, customFields: [] };
+      const lead = newLead({ city: 'Toronto' });
+      await push.pushAfterUpsert(lead, insert(lead));
+      assert.equal(put().body.city, 'Toronto', `blank=${JSON.stringify(blank)}`);
+    }
+  });
+
+  test('a brand-new contact still gets its city on create', async () => {
+    live();
+    const lead = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(calls.find((c) => c.method === 'POST' && c.url.endsWith('/contacts/')).body.city, 'Toronto');
+  });
+
+  test('dry-run report counts City as set only when it would really be written', async () => {
+    ghl.duplicate = 'ghl-city3';
+    ghl.contact = { tags: [], city: 'Ottawa', customFields: [] };
+    const a = newLead({ city: 'Toronto' });
+    await push.pushAfterUpsert(a, insert(a));
+    assert.match(logs.find((l) => l.includes('WOULD UPDATE')), /blank=\[[^\]]*City/);
+  });
+
+  test('interest is merged into the contact\'s existing values, not replaced', async () => {
+    live();
+    ghl.duplicate = 'ghl-int1';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar', 'Mosaic'] }] };
+    const lead = newLead({ interest: 'Glambot, mosaic' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(interestOf(put().body), ['Hat Bar', 'Mosaic', 'Glambot']); // existing first; Mosaic not duplicated
+  });
+
+  test('existing value outside our picklist is kept; no existing interest just writes the new ones', async () => {
+    live();
+    ghl.duplicate = 'ghl-int2';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Legacy Option'] }] };
+    const a = newLead({ interest: 'Robotics' });
+    await push.pushAfterUpsert(a, insert(a));
+    assert.deepEqual(interestOf(put().body), ['Legacy Option', 'Robotics']);
+
+    resetGhl(); live();
+    ghl.duplicate = 'ghl-int3';
+    ghl.contact = { tags: [], customFields: [] };
+    const b = newLead({ interest: 'Robotics' });
+    await push.pushAfterUpsert(b, insert(b));
+    assert.deepEqual(interestOf(put().body), ['Robotics']);
+  });
+
+  test('a lead with no recognised interest leaves the existing interest untouched', async () => {
+    live();
+    ghl.duplicate = 'ghl-int4';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar'] }] };
+    const lead = newLead({ interest: 'Fire Dancers' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.equal(interestOf(put().body), undefined);
+  });
+
+  test('a single-string existing value (not an array) is also merged', async () => {
+    live();
+    ghl.duplicate = 'ghl-int5';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.INTEREST, value: 'Hat Bar' }] };
+    const lead = newLead({ interest: 'Glambot' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    assert.deepEqual(interestOf(put().body), ['Hat Bar', 'Glambot']);
+  });
+});

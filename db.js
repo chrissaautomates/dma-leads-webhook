@@ -14,6 +14,10 @@ const Database = require('better-sqlite3');
 const DB_PATH = process.env.DB_PATH || '/data/leads.db';
 const db = new Database(DB_PATH);
 
+// Before ANY schema change: a one-time safety copy of the existing database
+// (/data/backups/leads-pre-ghl-<timestamp>.db). See db-backup.js.
+require('./db-backup').backupBeforeMigration(db, DB_PATH);
+
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -75,6 +79,20 @@ UTM_COLUMNS.forEach((col) => {
   if (!existingColumns.includes(col)) {
     db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
   }
+});
+
+// Migration: the normalized lead shape (see lead-shape.js). Same ADD COLUMN
+// approach as UTM above: no-op once present, never rewrites existing rows.
+// Old rows keep these blank; backfill-ghl-fields.js re-derives what it can
+// from their legacy interest/notes text.
+const SHAPE_COLUMNS = [
+  'event_date', 'event_type', 'guest_count', 'budget_range', 'city',
+  'secondary_interest', 'lead_type', 'marketing_consent', 'campaign',
+  'extra', // form answers no field could take (kept off `notes`, which staff edit and syncs would overwrite)
+];
+const columnsNow = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
+SHAPE_COLUMNS.forEach((col) => {
+  if (!columnsNow.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
 });
 
 // Migration: ghl_pushed records whether a lead has been pushed to GHL (see
@@ -195,11 +213,13 @@ function recordDeletion(email, target, source) {
 const insertLead = db.prepare(`
   INSERT INTO leads (
     target, date_received, source, name, company, email, phone, location, interest,
-    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed,
+    event_date, event_type, guest_count, budget_range, city, secondary_interest, lead_type, marketing_consent, campaign, extra
   )
   VALUES (
     @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
-    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed,
+    @event_date, @event_type, @guest_count, @budget_range, @city, @secondary_interest, @lead_type, @marketing_consent, @campaign, @extra
   )
 `);
 
@@ -214,6 +234,16 @@ const updateLeadFields = db.prepare(`
     utm_campaign = COALESCE(NULLIF(@utm_campaign, ''), utm_campaign),
     utm_content = COALESCE(NULLIF(@utm_content, ''), utm_content),
     utm_term = COALESCE(NULLIF(@utm_term, ''), utm_term),
+    event_date = COALESCE(NULLIF(@event_date, ''), event_date),
+    event_type = COALESCE(NULLIF(@event_type, ''), event_type),
+    guest_count = COALESCE(NULLIF(@guest_count, ''), guest_count),
+    budget_range = COALESCE(NULLIF(@budget_range, ''), budget_range),
+    city = COALESCE(NULLIF(@city, ''), city),
+    secondary_interest = COALESCE(NULLIF(@secondary_interest, ''), secondary_interest),
+    lead_type = COALESCE(NULLIF(@lead_type, ''), lead_type),
+    marketing_consent = COALESCE(NULLIF(@marketing_consent, ''), marketing_consent),
+    campaign = COALESCE(NULLIF(@campaign, ''), campaign),
+    extra = COALESCE(NULLIF(@extra, ''), extra),
     updated_at = datetime('now')
   WHERE id = @id
 `);
@@ -262,6 +292,17 @@ function findLead(email, target) {
   return findByEmailAndTarget.get(normalizedEmail, target);
 }
 
+// camelCase shape fields on a lead -> snake_case columns (blank when absent).
+function shapeParams(data) {
+  const v = (x) => (x == null ? '' : String(x).trim());
+  return {
+    event_date: v(data.eventDate), event_type: v(data.eventType), guest_count: v(data.guestCount),
+    budget_range: v(data.budgetRange), city: v(data.city), secondary_interest: v(data.secondaryInterest),
+    lead_type: v(data.leadType), marketing_consent: v(data.marketingConsent), campaign: v(data.campaign),
+    extra: v(data.extra),
+  };
+}
+
 function upsertLead(data) {
   const target = computeTarget(data);
   const email = (data.email || '').toString().trim().toLowerCase();
@@ -294,6 +335,7 @@ function upsertLead(data) {
       utm_campaign: data.utmCampaign || '',
       utm_content: data.utmContent || '',
       utm_term: data.utmTerm || '',
+      ...shapeParams(data),
     });
     return { action: 'updated', id: existing.id, target };
   }
@@ -328,6 +370,7 @@ function upsertLead(data) {
     // NULL = pending push. Callers that know a row must never be pushed
     // (e.g. CheckCherry proposal-event rows) pass an explicit terminal value.
     ghl_pushed: data.ghlPushed || null,
+    ...shapeParams(data),
   });
   return { action: 'inserted', id: info.lastInsertRowid, target };
 }
@@ -403,6 +446,7 @@ function addLeadFromAdmin(fields) {
     utm_content: fields.utm_content || '',
     utm_term: fields.utm_term || '',
     ghl_pushed: 'excluded_source', // manual entries are never pushed to GHL
+    ...shapeParams({}),
   });
   return info.lastInsertRowid;
 }

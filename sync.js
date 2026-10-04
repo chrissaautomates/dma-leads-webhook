@@ -4,6 +4,8 @@
 
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert } = require('./ghl-push');
+const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
+const { CHECKCHERRY_ATTRIBUTES } = require('./config');
 
 const status = {};
 
@@ -68,6 +70,20 @@ const SYNC_ONLY_STATUSES = ['New', 'Converted', 'Spam', 'Archived'];
 // CheckCherry wraps each lead as { id, type, attributes: {...} } (JSON:API
 // style) — the real fields live under attributes, not on the record itself.
 // Falls back to the record itself in case the shape ever comes back flat.
+// Strict attribute lookup (config.js CHECKCHERRY_ATTRIBUTES): one exact name per
+// shape field, never a fallback to a different attribute. Returns the value
+// ('' when the name is unconfigured or the lead lacks it) and records a lead's
+// missing mapped attributes in `missing` so the caller can log one line.
+function strictAttr(attrs, shapeKey, missing) {
+  const name = CHECKCHERRY_ATTRIBUTES[shapeKey];
+  if (!name) return '';
+  const v = attrs[name];
+  if (v === undefined || v === null || String(v).trim() === '') { missing.push(`${shapeKey}(${name})`); return ''; }
+  return String(v).trim();
+}
+
+const warnedCheckCherry = new Set();
+
 function mapCheckCherryLead(record) {
   const attrs = (record && record.attributes) || record || {};
 
@@ -77,15 +93,17 @@ function mapCheckCherryLead(record) {
   const venueParts = [attrs.venue_city, attrs.venue_state].filter(Boolean).join(', ');
   const location = attrs.location || venueParts || attrs.city || attrs.venue || attrs.venue_name || '';
 
-  const interest = attrs.interest || attrs.package_name || attrs.service_name
-    || attrs.lead_event_type || attrs.event_type || attrs.notes || attrs.message || '';
+  // What they want from us (service/package) — NOT the event type, which has
+  // its own field now.
+  const interest = attrs.interest || attrs.package_name || attrs.service_name || '';
 
+  const missing = [];
   let status = attrs.status || 'New';
   if (attrs.spam) status = 'Spam';
   else if (attrs.converted_to_event) status = 'Converted';
   else if (attrs.archived) status = 'Archived';
 
-  return {
+  const lead = {
     source: 'CheckCherry',
     name,
     company: attrs.company || attrs.company_name || '',
@@ -94,8 +112,15 @@ function mapCheckCherryLead(record) {
     location,
     interest,
     status,
-    owner: attrs.owner || attrs.assigned_to || '',
+    owner: strictAttr(attrs, 'owner', missing),
     notes: attrs.notes || attrs.message || '',
+    // Normalized shape (lead-shape.js), read STRICTLY via config.js
+    // CHECKCHERRY_ATTRIBUTES — see strictAttr().
+    city: strictAttr(attrs, 'city', missing),
+    eventDate: toIsoDate(strictAttr(attrs, 'eventDate', missing)),
+    eventType: strictAttr(attrs, 'eventType', missing),
+    guestCount: strictAttr(attrs, 'guestCount', missing),
+    budgetRange: strictAttr(attrs, 'budgetRange', missing),
     nextFollowUp: 'Yes',
     // Real field, verified against live /leads data on 2026-09-10 (same
     // field mapCheckCherryProposalEvent() below already uses for /events).
@@ -119,6 +144,14 @@ function mapCheckCherryLead(record) {
     utmContent: attrs.utm_content || '',
     utmTerm: attrs.utm_term || '',
   };
+  // One line per lead, never one per attribute; ids only (no personal data in logs).
+  // The sync re-reads every open lead each cycle, so warn once per lead per process.
+  const warnKey = `${(record && record.id) || attrs.id || '?'}:${missing.join(',')}`;
+  if (missing.length && !warnedCheckCherry.has(warnKey)) {
+    warnedCheckCherry.add(warnKey);
+    console.warn(`[checkcherry-mapper] lead ${(record && record.id) || attrs.id || '?'}: mapped attribute(s) missing or blank, left blank: ${missing.join(', ')}`);
+  }
+  return lead;
 }
 
 // Fetches every open CheckCherry lead (raw records). Split from the upsert
@@ -232,6 +265,7 @@ function mapCheckCherryProposalEvent(record) {
     email: firstOf(attrs.customer_emails),
     phone: firstOf(attrs.customer_phones),
     location: venueParts,
+    city: attrs.venue_city || '',
     interest: attrs.package_name || attrs.service_name || attrs.title || '',
     notes: attrs.private_notes || attrs.public_notes || '',
     nextFollowUp: 'Yes',
@@ -699,7 +733,7 @@ function pick(obj, aliases) {
 // Meta's "Send Test Data" placeholder marker, and the id prefix its own
 // test rows use — either one means skip, never import.
 function isMetaTestRow(rowObj) {
-  const id = pick(rowObj, ['id']);
+  const id = pick(rowObj, [META_COLUMNS.id]);
   if (/^test/i.test(id)) return true;
   return Object.values(rowObj).some((v) => String(v).includes('<test lead:'));
 }
@@ -727,36 +761,52 @@ function parseDateReceived(v) {
 // CheckCherry Lead ID / Synced At / Sync Error belong to a separate,
 // human-managed CheckCherry workflow and are ignored here entirely.
 // Returns null for a row that should be skipped (a test submission).
+// The ONLY columns mapMetaAdsRow reads, all confirmed present in the real sheet
+// header (24 columns, checked 2026-10-04 via META_ADS_CSV_URL; names only). A
+// test pins this list against that header so a column that isn't really there
+// can't creep back in.
+const META_COLUMNS = {
+  id: 'id',
+  createdTime: 'created_time',
+  campaign: 'campaign_name',
+  services: 'what_services_are_you_interested_in?',
+  planning: 'what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)',
+  goal: 'tell_us_about_your_event_goal?',
+  email: 'email',
+  phone: 'phone',
+  firstName: 'first_name',
+  lastName: 'last_name',
+};
+
 function mapMetaAdsRow(rowObj) {
   if (isMetaTestRow(rowObj)) return null;
 
-  const name = pick(rowObj, ['name', 'full name'])
-    || [pick(rowObj, ['first_name']), pick(rowObj, ['last_name'])].filter(Boolean).join(' ');
-  const email = pick(rowObj, ['email']);
+  const name = [pick(rowObj, [META_COLUMNS.firstName]), pick(rowObj, [META_COLUMNS.lastName])].filter(Boolean).join(' ');
+  const email = pick(rowObj, [META_COLUMNS.email]);
   if (!email && !name) return null; // malformed/unmapped record — never write a junk row
 
-  // Three separate free-text columns each carry real signal — combine all
-  // three rather than picking one and losing the other two.
-  const interestParts = [
-    ['Services', pick(rowObj, ['what_services_are_you_interested_in?'])],
-    ['Planning', pick(rowObj, ['what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)'])],
-    ['Goal', pick(rowObj, ['tell_us_about_your_event_goal?'])],
-  ].filter(([, v]) => v);
-  const interest = interestParts.map(([label, v]) => `${label}: ${v}`).join(' | ');
+  // Services question -> interest, planning question -> eventType, campaign_name ->
+  // campaign. The event-goal free text has no field: kept in `extra` (-> GHL note).
+  const services = pick(rowObj, [META_COLUMNS.services]);
+  const planning = pick(rowObj, [META_COLUMNS.planning]);
+  const goal = pick(rowObj, [META_COLUMNS.goal]);
 
   return {
     source: 'Meta Ads',
     name,
     company: '',
     email,
-    phone: stripPhonePrefix(pick(rowObj, ['phone'])),
+    phone: stripPhonePrefix(pick(rowObj, [META_COLUMNS.phone])),
     location: '',
-    interest,
+    interest: services,
+    eventType: planning,
+    campaign: pick(rowObj, [META_COLUMNS.campaign]),
+    extra: goal ? `Event goal: ${goal}` : '',
     status: 'New',
     owner: '',
     notes: '',
     nextFollowUp: 'Yes',
-    dateReceived: parseDateReceived(pick(rowObj, ['created_time'])),
+    dateReceived: parseDateReceived(pick(rowObj, [META_COLUMNS.createdTime])),
   };
 }
 
@@ -930,12 +980,29 @@ function classifyField(fieldMeta, tagged) {
   const byType = CONTACT_FIELD_TYPES[fieldMeta.fieldType];
   if (byType) return byType;
 
+  // A consent question ("Can we send you information and promotion emails?")
+  // must be recognised BEFORE the label fallbacks below: its wording contains
+  // "email". Other shape fields (budget, guests, event type/date, interest,
+  // lead type, city) are classified last, after the contact categories.
+  if (classifyLabel(fieldMeta.label) === 'marketingConsent') return 'marketingConsent';
+
   const normalized = (fieldMeta.label || '').toLowerCase();
   if (!tagged.firstName && normalized.includes('first') && normalized.includes('name')) return 'firstName';
   if (!tagged.lastName && normalized.includes('last') && normalized.includes('name')) return 'lastName';
   if (!tagged.email && normalized.includes('email')) return 'email';
   if (!tagged.phone && normalized.includes('phone')) return 'phone';
-  return 'other';
+  return classifyLabel(fieldMeta.label);
+}
+
+// Wix field values aren't always strings: checkbox groups are arrays, address
+// fields are objects.
+function wixValueText(value) {
+  if (Array.isArray(value)) return value.map(wixValueText).filter(Boolean).join(', ');
+  if (value && typeof value === 'object') {
+    return String(value.formattedAddress || value.formatted
+      || Object.values(value).filter((v) => typeof v === 'string' && v).join(', '));
+  }
+  return String(value);
 }
 
 // Wix's Form Submission Service wraps each entry's actual field values
@@ -964,19 +1031,44 @@ function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
   let lastName = '';
   let email = '';
   let phone = '';
+  const shape = {};
   const otherParts = [];
+  // First answer wins a shape field; a second "interest" answer becomes the
+  // secondary interest; anything else that can't be placed is kept as
+  // "Label: value" in `extra`.
+  const place = (key, text, label) => {
+    if (!shape[key]) shape[key] = text;
+    else if (key === 'interest' && !shape.secondaryInterest) shape.secondaryInterest = text;
+    else otherParts.push(`${label}: ${text}`);
+  };
 
   Object.keys(values).forEach((target) => {
-    const value = values[target];
-    if (value === null || value === undefined || value === '') return;
+    const raw = values[target];
+    if (raw === null || raw === undefined || raw === '') return;
+    const value = wixValueText(raw).trim();
+    if (!value) return;
     const fieldMeta = fieldMetaByTarget[target];
     if (!fieldMeta) return; // no real label to identify this field by — never guess what it is
-    switch (classifyField(fieldMeta, tagged)) {
-      case 'firstName': firstName = firstName || String(value); break;
-      case 'lastName': lastName = lastName || String(value); break;
-      case 'email': email = email || String(value); break;
-      case 'phone': phone = phone || String(value); break;
-      default: otherParts.push(`${fieldMeta.label}: ${value}`);
+    const category = classifyField(fieldMeta, tagged);
+    switch (category) {
+      case 'firstName': firstName = firstName || value; break;
+      case 'lastName': lastName = lastName || value; break;
+      case 'email': email = email || value; break;
+      case 'phone': phone = phone || value; break;
+      case 'marketingConsent': {
+        const consent = parseConsent(value);
+        if (consent) place('marketingConsent', consent, fieldMeta.label);
+        else otherParts.push(`${fieldMeta.label}: ${value}`);
+        break;
+      }
+      case 'eventDate': {
+        const iso = toIsoDate(value);
+        if (iso) place('eventDate', iso, fieldMeta.label);
+        else otherParts.push(`${fieldMeta.label}: ${value}`);
+        break;
+      }
+      case 'other': otherParts.push(`${fieldMeta.label}: ${value}`); break;
+      default: place(category, value, fieldMeta.label);
     }
   });
 
@@ -997,7 +1089,8 @@ function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
     email,
     phone,
     location: '',
-    interest: otherParts.join(' | '),
+    ...shape,
+    extra: otherParts.join(' | '),
     status: 'New',
     owner: '',
     notes: '',
@@ -1125,4 +1218,14 @@ async function runFullSync() {
   return getSyncStatus();
 }
 
-module.exports = { runFullSync, getSyncStatus, buildProposalEmailSet, buildProposalIndex, fetchCheckCherryEvents, PROPOSAL_STATUSES };
+module.exports = {
+  resetCheckCherryWarnings: () => warnedCheckCherry.clear(),
+  META_COLUMNS,
+  mapCheckCherryLead, mapCheckCherryProposalEvent, mapMetaAdsRow, mapWixFormSubmission, buildFieldMetaMap, taggedCategoriesInForm,
+  runFullSync,
+  getSyncStatus,
+  buildProposalEmailSet,
+  buildProposalIndex,
+  fetchCheckCherryEvents,
+  PROPOSAL_STATUSES,
+};

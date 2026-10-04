@@ -18,7 +18,7 @@ const FIELDS = {
   EVENT_TYPE: '2RrUkfZp9fxlxJACtbqt', // "Event Type", SINGLE_OPTIONS
   INTEREST: '85yxy9C2z42HfOv36Pif', // "DMA_Interest", MULTIPLE_OPTIONS
   LEAD_SCORE: 'yF3w9QsksBuReeauCq4x', // "Lead Score", NUMERICAL
-  OWNER: 'uqFqlFzXExP1rpyRCgFY', // "Owner", SINGLE_OPTIONS — not written by this webhook (see ghl-lead-plan.js)
+  OWNER: 'uqFqlFzXExP1rpyRCgFY', // "Owner", SINGLE_OPTIONS — only written when the value matches FIELD_OPTIONS.OWNER
 
   // --- Part 2: new fields created in Phase 1 Step 2 ---
   CAMPAIGN: 'bPznSu7NvOYe7fWMXM4K', // "DMA Campaign", TEXT
@@ -26,6 +26,13 @@ const FIELDS = {
   LEAD_STATUS: 'hRXXDKAyi7R8ojbX3aGL', // "DMA Lead Status", SINGLE_OPTIONS
   LAST_ACTIVITY: 'CGG7sfEOdmOLfcDKl9Ro', // "DMA Last Activity", TEXT
   MARKETING_CONSENT: 'sLslU39MFpmNYlrWkErB', // "DMA Marketing Consent", SINGLE_OPTIONS
+
+  // --- Part 3: created by scripts/create-ghl-fields.js (not yet in GHL until
+  // that script is run with --apply). Paste the printed IDs into Railway as
+  // GHL_FIELD_GUEST_COUNT_ID / GHL_FIELD_LEAD_TYPE_ID. Until set, the plan
+  // skips the field and keeps the value in the contact note instead. ---
+  GUEST_COUNT: process.env.GHL_FIELD_GUEST_COUNT_ID || null, // "Guest Count", NUMERICAL
+  LEAD_TYPE: process.env.GHL_FIELD_LEAD_TYPE_ID || null, // "Lead Type", SINGLE_OPTIONS
 };
 
 // Legacy/duplicate field IDs that must NEVER be written by this webhook —
@@ -69,14 +76,41 @@ const FIELD_OPTIONS = {
     'Verbal Yes', 'Contract / Deposit', 'Won', 'Not Ready', 'Lost',
   ],
   MARKETING_CONSENT: ['Yes', 'No', 'Unknown'],
-  // DMA_Interest's real option list. Note several canonical interest TAGS
-  // (Glambot, Robotics, DMA Engage, Holiday, Headshot, LED Tunnel) have no
-  // matching option here — see INTEREST_MAP in ghl-lead-plan.js for how
-  // that gap is handled (tag still applied, field falls back to "Other").
+  // DMA_Interest's option list. The last six were added to GHL by
+  // scripts/create-ghl-fields.js; see INTEREST_MAP below.
   INTEREST: [
     'Hat Bar', 'AI Photo Booth', 'Trading Cards', '360 Booth', 'Laser Engraving',
-    'Mosaic', 'Trade Show Engagement', 'Event Photo/Video', 'Other',
+    'Mosaic', 'Trade Show Engagement', 'Event Photo / Video', 'Other', // spelled as in live GHL (checked 2026-10-04)
+    // Added by scripts/create-ghl-fields.js (must exist in GHL before they are written).
+    'Glambot', 'Robotics', 'LED Tunnel', 'DMA Engage', 'Holiday', 'Headshot',
   ],
+  // Lead Type picklist, one option per TAGS.LEAD_TYPE concept.
+  LEAD_TYPE: ['Event Planner', 'Agency', 'Corporate', 'Conference', 'Brand', 'Venue', 'Social'],
+  // Owner picklist. The real option names have not been copied into this repo;
+  // until they are, an owner value is kept in the note, never written.
+  OWNER: [],
+};
+
+// Free-text event types seen on the forms -> the real Event Type option.
+// Deliberately short: only unambiguous wording. Anything else stays in the note.
+const EVENT_TYPE_ALIASES = {
+  conference: 'Corporate',
+  'corporate event': 'Corporate',
+  meeting: 'Corporate',
+  tradeshow: 'Trade Show',
+  'trade show': 'Trade Show',
+  'product launch': 'Product Launch',
+  launch: 'Product Launch',
+  'brand activation': 'Brand Activation',
+  activation: 'Brand Activation',
+  festival: 'Others',
+  'private event': 'Others',
+  'private party': 'Others',
+  wedding: 'Others',
+  birthday: 'Others',
+  'bar mitzvah': 'Others',
+  'bat mitzvah': 'Others',
+  other: 'Others',
 };
 
 // Canonical tags. Values are the ACTUAL tag name strings GHL's API expects
@@ -157,29 +191,28 @@ const REENGAGE_STATUSES = ['Lost', 'Not Ready'];
 
 // Interest input -> { tag, fieldOption }. `tag` is null where no canonical
 // interest-* tag exists for that concept (none defined in Phase 1's
-// taxonomy) but the value is still a real DMA_Interest option. `fieldOption`
-// is 'Other' where the reverse is true (a canonical tag exists but
-// DMA_Interest's picklist has no matching option) — flagged inline. Lookup
+// taxonomy) but the value is still a real DMA_Interest option. Lookup
 // keys are lowercased; ghl-lead-plan.js normalizes input the same way.
 const INTEREST_MAP = {
   'ai photo booth': { tag: 'interest-ai', fieldOption: 'AI Photo Booth' },
   ai: { tag: 'interest-ai', fieldOption: 'AI Photo Booth' },
-  glambot: { tag: 'interest-glambot', fieldOption: 'Other' }, // no matching DMA_Interest option
+  glambot: { tag: 'interest-glambot', fieldOption: 'Glambot' },
   'trading cards': { tag: 'trading cards', fieldOption: 'Trading Cards' }, // REUSED legacy tag name
-  robotics: { tag: 'interest-robotics', fieldOption: 'Other' }, // no matching DMA_Interest option
-  'dma engage': { tag: 'interest-dma-engage', fieldOption: 'Other' }, // no matching DMA_Interest option
-  holiday: { tag: 'interest-holiday', fieldOption: 'Other' }, // no matching DMA_Interest option
-  headshot: { tag: 'interest-headshot', fieldOption: 'Other' }, // no matching DMA_Interest option
+  robotics: { tag: 'interest-robotics', fieldOption: 'Robotics' },
+  'dma engage': { tag: 'interest-dma-engage', fieldOption: 'DMA Engage' },
+  holiday: { tag: 'interest-holiday', fieldOption: 'Holiday' },
+  headshot: { tag: 'interest-headshot', fieldOption: 'Headshot' },
   mosaic: { tag: 'interest-mosaic', fieldOption: 'Mosaic' },
-  'led tunnel': { tag: 'interest-led-tunnel', fieldOption: 'Other' }, // no matching DMA_Interest option
+  'led tunnel': { tag: 'interest-led-tunnel', fieldOption: 'LED Tunnel' },
   // Real DMA_Interest options with no canonical interest-* tag defined in
   // Phase 1 at all — field gets set, no tag applied.
   'hat bar': { tag: null, fieldOption: 'Hat Bar' },
   '360 booth': { tag: null, fieldOption: '360 Booth' },
   'laser engraving': { tag: null, fieldOption: 'Laser Engraving' },
   'trade show engagement': { tag: null, fieldOption: 'Trade Show Engagement' },
-  'event photo/video': { tag: null, fieldOption: 'Event Photo/Video' },
-  'event photo': { tag: null, fieldOption: 'Event Photo/Video' },
+  'event photo/video': { tag: null, fieldOption: 'Event Photo / Video' },
+  'event photo / video': { tag: null, fieldOption: 'Event Photo / Video' },
+  'event photo': { tag: null, fieldOption: 'Event Photo / Video' },
 };
 
 module.exports = {
@@ -192,4 +225,5 @@ module.exports = {
   DEAD_DEAL_TAGS,
   REENGAGE_STATUSES,
   INTEREST_MAP,
+  EVENT_TYPE_ALIASES,
 };

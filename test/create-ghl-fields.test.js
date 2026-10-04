@@ -5,12 +5,13 @@ process.env.DB_PATH = ':memory:';
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+process.env.GHL_BACKUP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ghl-bk-default-')); // tests never write into the repo
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { run, mergeOptions } = require('../scripts/create-ghl-fields');
 const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
 
-const CURRENT_INTEREST = ['Hat Bar', 'AI Photo Booth', 'Trading Cards', '360 Booth', 'Laser Engraving', 'Mosaic', 'Trade Show Engagement', 'Event Photo/Video', 'Other', 'Legacy Staff Option'];
+const CURRENT_INTEREST = ['Hat Bar', 'AI Photo Booth', 'Trading Cards', '360 Booth', 'Laser Engraving', 'Mosaic', 'Trade Show Engagement', 'Event Photo / Video', 'Other', 'Legacy Staff Option'];
 const NEW_OPTIONS = ['Glambot', 'Robotics', 'LED Tunnel', 'DMA Engage', 'Holiday', 'Headshot'];
 
 function fakeGhl({ fields, replaces = true, dropsOriginalsOnUpdate = false } = {}) {
@@ -113,6 +114,28 @@ describe('create-ghl-fields: saves the current picklist first', () => {
 });
 
 describe('create-ghl-fields: never creates a duplicate field', () => {
+  test('a differently-spelled existing option (Event Photo / Video vs Event Photo/Video) is not added again', async () => {
+    const fields = baseFields();
+    fields[0].picklistOptions = fields[0].picklistOptions.filter((o) => o !== 'Legacy Staff Option');
+    const g = fakeGhl({ fields });
+    await run(g, { apply: true });
+    const sent = g.state.updates[0].body.options;
+    assert.equal(sent.filter((o) => /event photo/i.test(o)).length, 1);
+    assert.deepEqual(sent.slice(-6), NEW_OPTIONS);
+  });
+
+  test('a similar existing field ("DMA Lead Type") blocks creating "Lead Type" unless --allow-similar', async () => {
+    const fields = [...baseFields(), { id: 'dlt', name: 'DMA Lead Type', dataType: 'SINGLE_OPTIONS', picklistOptions: ['New Business', 'Other'] }];
+    const g = fakeGhl({ fields });
+    const lines = [];
+    const r = await run(g, { apply: true, log: (l) => lines.push(l) });
+    assert.ok(!g.state.created.some((d) => d.name === 'Lead Type'));
+    assert.equal(r.similar[0].id, 'dlt');
+    assert.ok(lines.some((l) => /NOT CREATING "Lead Type".*DMA Lead Type.*New Business/.test(l)));
+    await run(g, { apply: true, allowSimilar: true });
+    assert.ok(g.state.created.some((d) => d.name === 'Lead Type'));
+  });
+
   test('creates Guest Count and Lead Type when absent; a second run creates nothing', async () => {
     const g = fakeGhl({ fields: baseFields() });
     const first = await run(g, { apply: true });

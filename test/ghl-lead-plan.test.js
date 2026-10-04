@@ -146,6 +146,14 @@ describe('buildLeadPlan — interest / secondary interest', () => {
     }
   });
 
+  test('Event Photo/Video is written with the live GHL spelling "Event Photo / Video"', () => {
+    for (const v of ['Event Photo/Video', 'event photo / video', 'Event Photo']) {
+      const plan = buildLeadPlan({ email: 'a@example.com', interest: v }, { isNewContact: true, profile: WIX });
+      assert.deepEqual(fieldValue(plan.customFields, FIELDS.INTEREST), ['Event Photo / Video'], v);
+    }
+    assert.ok(FIELD_OPTIONS.INTEREST.includes('Event Photo / Video'));
+  });
+
   test('a multi-select interest answer ("Glambot, LED Tunnel") applies every recognized choice', () => {
     const plan = buildLeadPlan({ email: 'a@example.com', interest: 'Glambot, led_tunnel, Fire Dancers' }, { isNewContact: true, profile: WIX });
     assert.deepEqual(fieldValue(plan.customFields, FIELDS.INTEREST).sort(), ['Glambot', 'LED Tunnel']);

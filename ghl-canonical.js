@@ -80,7 +80,7 @@ const FIELD_OPTIONS = {
   // scripts/create-ghl-fields.js; see INTEREST_MAP below.
   INTEREST: [
     'Hat Bar', 'AI Photo Booth', 'Trading Cards', '360 Booth', 'Laser Engraving',
-    'Mosaic', 'Trade Show Engagement', 'Event Photo/Video', 'Other',
+    'Mosaic', 'Trade Show Engagement', 'Event Photo / Video', 'Other', // spelled as in live GHL (checked 2026-10-04)
     // Added by scripts/create-ghl-fields.js (must exist in GHL before they are written).
     'Glambot', 'Robotics', 'LED Tunnel', 'DMA Engage', 'Holiday', 'Headshot',
   ],
@@ -210,8 +210,9 @@ const INTEREST_MAP = {
   '360 booth': { tag: null, fieldOption: '360 Booth' },
   'laser engraving': { tag: null, fieldOption: 'Laser Engraving' },
   'trade show engagement': { tag: null, fieldOption: 'Trade Show Engagement' },
-  'event photo/video': { tag: null, fieldOption: 'Event Photo/Video' },
-  'event photo': { tag: null, fieldOption: 'Event Photo/Video' },
+  'event photo/video': { tag: null, fieldOption: 'Event Photo / Video' },
+  'event photo / video': { tag: null, fieldOption: 'Event Photo / Video' },
+  'event photo': { tag: null, fieldOption: 'Event Photo / Video' },
 };
 
 module.exports = {

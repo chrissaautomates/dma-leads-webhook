@@ -3,6 +3,7 @@
 //
 //   node scripts/create-ghl-fields.js            # show the plan
 //   node scripts/create-ghl-fields.js --apply    # do it
+//   (--allow-similar: create a field even if one with a similar name exists)
 //
 // Needs GHL_API_KEY + GHL_LOCATION_ID (e.g. `railway run node ...`). It:
 //   1. creates "Guest Count" (NUMERICAL) — only if no contact field with that name exists
@@ -35,7 +36,9 @@ const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
 const optionLabel = (o) => (typeof o === 'string' ? o : (o && (o.label || o.value || o.name)) || '');
 const optionsOf = (f) => (f.picklistOptions || f.options || []).map(optionLabel).filter(Boolean);
 const norm = (s) => String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, ' ');
-const hasOption = (list, o) => list.some((x) => norm(x) === norm(o));
+// Option comparison ignores ALL whitespace, so "Event Photo / Video" == "Event Photo/Video".
+const optKey = (s) => norm(s).replace(/\s/g, '');
+const hasOption = (list, o) => list.some((x) => optKey(x) === optKey(o));
 
 // Full option list to send: every current option (original order and spelling),
 // then each wanted option not already there (case/spacing-insensitive).
@@ -46,7 +49,7 @@ function mergeOptions(current, wanted) {
 }
 
 // deps: { listCustomFields, createCustomField, updateCustomField }
-async function run(deps, { apply = false, log = () => {}, backupDir = path.join(__dirname, '..', 'ghl-backups'), now = new Date() } = {}) {
+async function run(deps, { apply = false, allowSimilar = false, log = () => {}, backupDir = process.env.GHL_BACKUP_DIR || path.join(__dirname, '..', 'ghl-backups'), now = new Date() } = {}) {
   const result = { created: [], updated: null, existing: [], backupFile: null };
   const existing = await deps.listCustomFields();
   if (!existing.length) {
@@ -65,6 +68,9 @@ async function run(deps, { apply = false, log = () => {}, backupDir = path.join(
   }
 
   const findByName = (fields, name) => fields.find((f) => norm(f.name) === norm(name));
+  // A field whose name merely CONTAINS ours ("DMA Lead Type" vs "Lead Type") is a
+  // probable duplicate in spirit: never create over it unless --allow-similar.
+  const findSimilar = (fields, name) => fields.find((f) => norm(f.name) !== norm(name) && (norm(f.name).includes(norm(name)) || norm(name).includes(norm(f.name))));
 
   for (const [name, env, def] of [
     ['Guest Count', 'GHL_FIELD_GUEST_COUNT_ID', { name: 'Guest Count', dataType: 'NUMERICAL' }],
@@ -74,6 +80,12 @@ async function run(deps, { apply = false, log = () => {}, backupDir = path.join(
     if (found) {
       result.existing.push({ name, id: found.id });
       log(`"${name}" already exists: id=${found.id}  -> set ${env}=${found.id}`);
+      continue;
+    }
+    const similar = findSimilar(existing, name);
+    if (similar && !allowSimilar) {
+      result.similar = [...(result.similar || []), { name, existingName: similar.name, id: similar.id, dataType: similar.dataType, options: optionsOf(similar) }];
+      log(`NOT CREATING "${name}": a similar field already exists — "${similar.name}" (id=${similar.id}, ${similar.dataType}${optionsOf(similar).length ? `, options: ${optionsOf(similar).join(' | ')}` : ''}). Decide whether to reuse it; pass --allow-similar to create "${name}" anyway.`);
       continue;
     }
     log(`WOULD CREATE "${name}": ${JSON.stringify(def)}`);
@@ -116,7 +128,7 @@ async function run(deps, { apply = false, log = () => {}, backupDir = path.join(
 
 if (require.main === module) {
   const ghl = require('../ghl-client');
-  run(ghl, { apply: process.argv.includes('--apply'), log: console.log })
+  run(ghl, { apply: process.argv.includes('--apply'), allowSimilar: process.argv.includes('--allow-similar'), log: console.log })
     .then(() => { if (!process.argv.includes('--apply')) console.log('\nDry run only. Re-run with --apply to write.'); })
     .catch((err) => { console.error(err.message, err.body || ''); process.exit(1); });
 }

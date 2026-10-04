@@ -117,6 +117,9 @@ async function main() {
   const only = arg('--source');
   const limit = arg('--limit') ? Number(arg('--limit')) : Infinity;
 
+  if (apply && /^(1|true|yes|on)$/i.test(String(process.env.GHL_PUSH_DISABLED || '').trim())) {
+    throw new Error('GHL_PUSH_DISABLED (kill switch) is on — refusing --apply');
+  }
   const ghl = require('../ghl-client');
   const { db } = require('../db');
   const findRowsStmt = db.prepare('SELECT * FROM leads WHERE email = ? ORDER BY id DESC');

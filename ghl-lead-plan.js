@@ -454,7 +454,47 @@ function isBlankOnContact(contact, tracked) {
   return Array.isArray(v) ? v.length === 0 : !normalize(v);
 }
 
+// The 17 standard fields a lead is judged on (Lead Score is deliberately not
+// among them: it is never written until real scoring exists). `name` counts as
+// set when either first or last name is written.
+const STANDARD_FIELDS = [
+  { key: 'name', contact: ['firstName', 'lastName'] },
+  { key: 'email', contact: ['email'] },
+  { key: 'phone', contact: ['phone'] },
+  { key: 'company', contact: ['companyName'] },
+  { key: 'city', contact: ['city'] },
+  { key: 'leadSource', id: FIELDS.LEAD_SOURCE },
+  { key: 'leadStatus', id: FIELDS.LEAD_STATUS },
+  { key: 'lastActivity', id: FIELDS.LAST_ACTIVITY },
+  { key: 'campaign', id: FIELDS.CAMPAIGN },
+  { key: 'eventDate', id: FIELDS.EVENT_DATE },
+  { key: 'eventType', id: FIELDS.EVENT_TYPE },
+  { key: 'budgetRange', id: FIELDS.BUDGET_RANGE },
+  { key: 'interest', id: FIELDS.INTEREST },
+  { key: 'marketingConsent', id: FIELDS.MARKETING_CONSENT },
+  { key: 'guestCount', id: FIELDS.GUEST_COUNT },
+  { key: 'leadType', id: FIELDS.LEAD_TYPE },
+  { key: 'owner', id: FIELDS.OWNER },
+];
+const STANDARD_FIELD_COUNT = STANDARD_FIELDS.length;
+
+// Which of the 17 this push writes ("set") and which it does not ("blank"),
+// counting what the plan sends plus any fill-blank additions. For the dry-run logs.
+function standardFieldReport(plan, fill) {
+  const contact = { ...plan.contactFields, ...((fill && fill.contactFields) || {}) };
+  const ids = new Set([...plan.customFields, ...((fill && fill.customFields) || [])].map((f) => f.id));
+  const set = [];
+  const blank = [];
+  STANDARD_FIELDS.forEach((f) => {
+    const isSet = f.contact ? f.contact.some((k) => contact[k]) : (f.id && ids.has(f.id));
+    (isSet ? set : blank).push(f.key);
+  });
+  return { set, blank };
+}
+
 module.exports = {
+  standardFieldReport,
+  STANDARD_FIELD_COUNT,
   buildLeadPlan,
   decideNewLead,
   resolveFillBlank,

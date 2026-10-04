@@ -25,8 +25,9 @@
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
-const { buildLeadPlan, resolveFillBlank, customFieldValue } = require('./ghl-lead-plan');
+const { buildLeadPlan, resolveFillBlank, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
 const { formNameFromSource } = require('./lead-shape');
+const { testLeadReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
 const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
 
@@ -189,6 +190,8 @@ function settleWindowMinutes(env = process.env) {
 function assess(lead, row, cfg, context) {
   const profile = profileForSource(lead.source);
   if (!profile) return { kind: 'exclude', terminal: 'excluded_source', reason: `source "${lead.source || ''}" is not pushed to GHL` };
+  const testReason = testLeadReason(lead);
+  if (testReason) return { kind: 'exclude', terminal: 'excluded_test', reason: `${testReason} — never enters the funnel` };
   if (isBarrLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_barr', reason: 'BuyAndRentRobots lead — not for the DMA Events funnel' };
   if (isSpamLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_spam', reason: 'lead is marked Spam — never enters the funnel' };
   if (cfg.cutoff && row && row.date_received < cfg.cutoff) {
@@ -341,6 +344,7 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
 function describeOutcome(lead, profile, outcome) {
   const { plan } = outcome;
   const verb = { create: 'CREATE contact', update: 'UPDATE contact', 'update-minimal': 'UPDATE contact (MINIMAL: last-activity + note only)' }[outcome.action];
+  const std = standardFieldReport(plan, outcome.fill);
   return [
     `${verb}${outcome.contactId ? ` ${outcome.contactId}` : ''}`,
     `email=${lead.email || '-'}`,
@@ -352,6 +356,7 @@ function describeOutcome(lead, profile, outcome) {
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
     outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
+    `fields ${std.set.length}/${STANDARD_FIELD_COUNT} set=[${std.set.join(', ')}] blank=[${std.blank.join(', ')}]`,
     outcome.fill && outcome.fill.keys.length ? `fill-blank=[${outcome.fill.keys.join(', ')}]` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');

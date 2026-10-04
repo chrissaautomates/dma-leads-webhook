@@ -752,3 +752,103 @@ describe('live mode cannot be reached by accident — including the fill-blank p
     assert.ok(put.body.customFields.some((f) => f.id === FIELDS.EVENT_TYPE && f.fieldValue === 'Gala'));
   });
 });
+
+describe('Marketing Consent is never downgraded on an existing contact', () => {
+  for (const existingConsent of ['Yes', 'No']) {
+    test(`existing contact with ${existingConsent}, lead gives no answer: consent is not in the update at all`, async () => {
+      setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+      ghl.duplicate = 'ghl-consent';
+      ghl.contact = { tags: [], customFields: [{ id: FIELDS.MARKETING_CONSENT, value: existingConsent }] };
+      const lead = newLead({ eventType: 'Gala' });
+      await push.pushAfterUpsert(lead, insert(lead));
+      const put = calls.find((c) => c.method === 'PUT');
+      assert.ok(put, 'the contact was updated');
+      assert.ok(!put.body.customFields.some((f) => f.id === FIELDS.MARKETING_CONSENT), 'no consent write, so no Unknown');
+      assert.ok(!JSON.stringify(put.body).includes('Unknown'));
+    });
+  }
+
+  test('a brand-new contact with no explicit answer gets Unknown', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    const lead = newLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/contacts/'));
+    assert.equal(post.body.customFields.find((f) => f.id === FIELDS.MARKETING_CONSENT).fieldValue, 'Unknown');
+  });
+});
+
+describe('test / internal lead exclusion', () => {
+  const config = require('../config');
+  const reasonLine = () => logs.find((l) => l.includes('WOULD EXCLUDE'));
+
+  test('anything containing TEST DMA (name, email or company, any separator) is excluded, with the reason in the dry-run log', async () => {
+    for (const over of [{ name: 'TEST DMA Lead' }, { email: 'test.dma@gmail.com' }, { company: 'Test_DMA Inc' }, { name: 'test-dma' }]) {
+      logs = [];
+      const lead = newLead(over);
+      const result = insert(lead);
+      assert.equal(await push.pushAfterUpsert(lead, result), 'excluded_test', JSON.stringify(over));
+      assert.match(reasonLine(), /WOULD EXCLUDE .*test lead/);
+      assert.equal(calls.length, 0, 'excluded before any GHL read');
+      assert.equal(rowOf(result.id).ghl_pushed, null, 'dry run marks nothing');
+    }
+  });
+
+  test('exact internal addresses and @domains from GHL_EXCLUDE_EMAILS are excluded', async () => {
+    process.env.GHL_EXCLUDE_EMAILS = 'boss@dma.test, @internal.example';
+    try {
+      for (const email of ['boss@dma.test', 'anyone@internal.example']) {
+        logs = [];
+        const lead = newLead({ email });
+        assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'excluded_test', email);
+        assert.match(reasonLine(), /internal address/);
+      }
+      const ok = newLead({ email: 'client@notinternal.example' });
+      assert.equal(await push.pushAfterUpsert(ok, insert(ok)), 'dry-run');
+    } finally { delete process.env.GHL_EXCLUDE_EMAILS; }
+  });
+
+  test('live mode marks the row excluded_test and sends nothing', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    const lead = newLead({ name: 'TEST DMA' });
+    const result = insert(lead);
+    await push.pushAfterUpsert(lead, result);
+    assert.equal(rowOf(result.id).ghl_pushed, 'excluded_test');
+    assert.deepEqual(writes(), []);
+  });
+
+  test('an ordinary lead is not excluded', () => {
+    assert.equal(config.testLeadReason({ name: 'Jane Doe', email: 'jane@acme.com', company: 'Acme' }), null);
+  });
+});
+
+describe('dry-run lines show which of the 17 standard fields are set / blank', () => {
+  test('WOULD CREATE lists set and blank fields', async () => {
+    const lead = newLead({ phone: '5551234', eventType: 'Gala', city: 'Toronto' });
+    await push.pushAfterUpsert(lead, insert(lead));
+    const line = logs.find((l) => l.includes('WOULD CREATE'));
+    assert.match(line, /fields \d+\/17 set=\[[^\]]*\] blank=\[[^\]]*\]/);
+    const [, set, blank] = line.match(/set=\[([^\]]*)\] blank=\[([^\]]*)\]/);
+    const setList = set.split(', ');
+    const blankList = blank.split(', ');
+    assert.equal(setList.length + blankList.length, 17);
+    ['name', 'email', 'phone', 'city', 'eventType', 'leadSource', 'leadStatus', 'lastActivity', 'marketingConsent'].forEach((k) => assert.ok(setList.includes(k), `${k} set`));
+    ['company', 'eventDate', 'budgetRange', 'owner', 'leadType'].forEach((k) => assert.ok(blankList.includes(k), `${k} blank`));
+  });
+
+  test('WOULD UPDATE (existing contact) lists them too; a minimal update shows only last activity set', async () => {
+    ghl.duplicate = 'ghl-1';
+    ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'New' }] };
+    const a = newLead({ budgetRange: '$5,000-$10,000' });
+    await push.pushAfterUpsert(a, insert(a));
+    const upd = logs.find((l) => l.includes('WOULD UPDATE contact ghl-1'));
+    assert.match(upd, /fields \d+\/17 set=\[[^\]]*budgetRange[^\]]*\]/);
+
+    logs = []; resetGhl();
+    ghl.duplicate = 'ghl-2';
+    ghl.contact = { tags: ['deposit'], customFields: [] };
+    const b = newLead({ budgetRange: '$5,000-$10,000' });
+    await push.pushAfterUpsert(b, insert(b));
+    const min = logs.find((l) => l.includes('MINIMAL'));
+    assert.match(min, /fields 1\/17 set=\[lastActivity\]/);
+  });
+});

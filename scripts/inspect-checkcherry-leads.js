@@ -1,8 +1,7 @@
 // Read-only: lists every attribute key CheckCherry's /leads feed actually
 // returns, how many leads have it non-null, and one sample value — to confirm
-// the attribute names mapCheckCherryLead() (sync.js) guesses at for event date,
-// guest count, budget and owner (CC_*_KEYS), then trim those lists to the real
-// names.
+// the attribute names to set in CHECKCHERRY_ATTRIBUTES (config.js) for event
+// date, event type, guest count, budget and owner.
 //
 //   CHECKCHERRY_API_KEY=... node scripts/inspect-checkcherry-leads.js
 //

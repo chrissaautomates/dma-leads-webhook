@@ -5,6 +5,7 @@
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert } = require('./ghl-push');
 const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
+const { CHECKCHERRY_ATTRIBUTES } = require('./config');
 
 const status = {};
 
@@ -69,18 +70,16 @@ const SYNC_ONLY_STATUSES = ['New', 'Converted', 'Spam', 'Archived'];
 // CheckCherry wraps each lead as { id, type, attributes: {...} } (JSON:API
 // style) — the real fields live under attributes, not on the record itself.
 // Falls back to the record itself in case the shape ever comes back flat.
-const CC_EVENT_DATE_KEYS = ['event_date', 'lead_event_date', 'start_date', 'event_start_date', 'date_of_event'];
-const CC_GUEST_KEYS = ['guest_count', 'guests', 'number_of_guests', 'lead_guest_count', 'expected_guests', 'attendees'];
-const CC_BUDGET_KEYS = ['budget', 'lead_budget', 'budget_range'];
-const CC_OWNER_KEYS = ['owner', 'assigned_to', 'owner_name', 'assigned_user_name'];
-
-// First non-blank attribute among candidate names, as text ('' when none).
-function firstAttr(attrs, keys) {
-  for (const k of keys) {
-    const v = attrs[k];
-    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
-  }
-  return '';
+// Strict attribute lookup (config.js CHECKCHERRY_ATTRIBUTES): one exact name per
+// shape field, never a fallback to a different attribute. Returns the value
+// ('' when the name is unconfigured or the lead lacks it) and records a lead's
+// missing mapped attributes in `missing` so the caller can log one line.
+function strictAttr(attrs, shapeKey, missing) {
+  const name = CHECKCHERRY_ATTRIBUTES[shapeKey];
+  if (!name) return '';
+  const v = attrs[name];
+  if (v === undefined || v === null || String(v).trim() === '') { missing.push(`${shapeKey}(${name})`); return ''; }
+  return String(v).trim();
 }
 
 function mapCheckCherryLead(record) {
@@ -96,12 +95,13 @@ function mapCheckCherryLead(record) {
   // its own field now.
   const interest = attrs.interest || attrs.package_name || attrs.service_name || '';
 
+  const missing = [];
   let status = attrs.status || 'New';
   if (attrs.spam) status = 'Spam';
   else if (attrs.converted_to_event) status = 'Converted';
   else if (attrs.archived) status = 'Archived';
 
-  return {
+  const lead = {
     source: 'CheckCherry',
     name,
     company: attrs.company || attrs.company_name || '',
@@ -110,18 +110,15 @@ function mapCheckCherryLead(record) {
     location,
     interest,
     status,
-    owner: firstAttr(attrs, CC_OWNER_KEYS),
+    owner: strictAttr(attrs, 'owner', missing),
     notes: attrs.notes || attrs.message || '',
-    // Normalized shape (lead-shape.js). Only venue_city / lead_event_type /
-    // event_type / package_name / created_at / utm_* are confirmed against live
-    // data (see the comments in this file); the *_KEYS candidates below are
-    // best guesses — run scripts/inspect-checkcherry-leads.js against the live
-    // /leads feed and trim them to the real names.
-    city: attrs.venue_city || '',
-    eventDate: toIsoDate(firstAttr(attrs, CC_EVENT_DATE_KEYS)),
-    eventType: attrs.lead_event_type || attrs.event_type || '',
-    guestCount: firstAttr(attrs, CC_GUEST_KEYS),
-    budgetRange: firstAttr(attrs, CC_BUDGET_KEYS),
+    // Normalized shape (lead-shape.js), read STRICTLY via config.js
+    // CHECKCHERRY_ATTRIBUTES — see strictAttr().
+    city: strictAttr(attrs, 'city', missing),
+    eventDate: toIsoDate(strictAttr(attrs, 'eventDate', missing)),
+    eventType: strictAttr(attrs, 'eventType', missing),
+    guestCount: strictAttr(attrs, 'guestCount', missing),
+    budgetRange: strictAttr(attrs, 'budgetRange', missing),
     nextFollowUp: 'Yes',
     // Real field, verified against live /leads data on 2026-09-10 (same
     // field mapCheckCherryProposalEvent() below already uses for /events).
@@ -145,6 +142,9 @@ function mapCheckCherryLead(record) {
     utmContent: attrs.utm_content || '',
     utmTerm: attrs.utm_term || '',
   };
+  // One line per lead, never one per attribute; ids only (no personal data in logs).
+  if (missing.length) console.warn(`[checkcherry-mapper] lead ${(record && record.id) || attrs.id || '?'}: mapped attribute(s) missing or blank, left blank: ${missing.join(', ')}`);
+  return lead;
 }
 
 // Fetches every open CheckCherry lead (raw records). Split from the upsert
@@ -771,14 +771,12 @@ function mapMetaAdsRow(rowObj) {
   return {
     source: 'Meta Ads',
     name,
-    company: pick(rowObj, ['company_name', 'company']),
+    company: '',
     email,
     phone: stripPhonePrefix(pick(rowObj, ['phone'])),
     location: '',
-    city: pick(rowObj, ['city']),
     interest: services,
     eventType: planning,
-    campaign: pick(rowObj, ['campaign_name']),
     extra: goal ? `Event goal: ${goal}` : '',
     status: 'New',
     owner: '',

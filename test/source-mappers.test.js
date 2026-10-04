@@ -86,7 +86,6 @@ describe('Meta mapper', () => {
     'what_services_are_you_interested_in?': 'glambot, ai_photo_booth',
     'what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)': 'product_launch',
     'tell_us_about_your_event_goal?': 'Wow our clients',
-    campaign_name: 'Fall 2026 Corporate',
   };
 
   test('services -> interest, planning -> eventType, goal -> extra', () => {
@@ -94,7 +93,6 @@ describe('Meta mapper', () => {
     assert.equal(lead.interest, 'glambot, ai_photo_booth');
     assert.equal(lead.eventType, 'product_launch');
     assert.equal(lead.extra, 'Event goal: Wow our clients');
-    assert.equal(lead.campaign, 'Fall 2026 Corporate');
     assert.equal(lead.phone, '+14165551212');
   });
 
@@ -102,8 +100,14 @@ describe('Meta mapper', () => {
     const plan = planFor(sync.mapMetaAdsRow(ROW), 'meta');
     assert.equal(val(plan, FIELDS.EVENT_TYPE), 'Product Launch');
     assert.deepEqual(val(plan, FIELDS.INTEREST).sort(), ['AI Photo Booth', 'Glambot']);
-    assert.equal(val(plan, FIELDS.CAMPAIGN), 'Fall 2026 Corporate');
     assert.match(val(plan, FIELDS.LAST_ACTIVITY), /^Meta Lead Form Submission — glambot, ai_photo_booth — /);
+  });
+
+  test('only reads columns that are in the real sheet: no guessed campaign/city/company', () => {
+    const lead = sync.mapMetaAdsRow({ ...ROW, campaign_name: 'X', city: 'Y', company_name: 'Z' });
+    assert.equal(lead.campaign, undefined);
+    assert.equal(lead.city, undefined);
+    assert.equal(lead.company, '');
   });
 
   test('skips Meta test rows', () => {
@@ -141,36 +145,73 @@ describe('Google Ads mapper', () => {
   });
 });
 
-describe('CheckCherry mapper', () => {
+describe('CheckCherry mapper (strict, config-driven)', () => {
+  const config = require('../config');
   const REC = {
     id: '9', type: 'leads',
     attributes: {
       first_name: 'Cy', last_name: 'Chen', email: 'cy@example.com', phone_normalized: '+14165550000',
-      venue_city: 'Toronto', venue_state: 'ON', lead_event_type: 'Gala', package_name: 'Glambot',
+      venue_city: 'Toronto', venue_state: 'ON', package_name: 'Glambot',
+      // decoys: look plausible but are NOT the configured names
       event_date: '2027-03-12T00:00:00Z', guest_count: 200, budget: '$10,000-$25,000', owner: 'Richard',
       created_at: '2026-10-02T09:00:00Z', utm_campaign: 'cc-fall',
     },
   };
+  const realAttrs = { ...config.CHECKCHERRY_ATTRIBUTES };
+  const warnings = [];
+  const realWarn = console.warn;
+  test.beforeEach(() => { warnings.length = 0; console.warn = (m) => warnings.push(m); });
+  test.afterEach(() => { console.warn = realWarn; Object.assign(config.CHECKCHERRY_ATTRIBUTES, realAttrs); });
 
-  test('maps venue city, event date, event type, budget, guest count and owner', () => {
+  test('unconfigured attributes (null) stay blank — a plausible-looking attribute is never guessed', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: null, guestCount: null, budgetRange: null, owner: null, eventType: null });
     const lead = sync.mapCheckCherryLead(REC);
     assert.equal(lead.city, 'Toronto');
-    assert.equal(lead.location, 'Toronto, ON');
-    assert.equal(lead.eventDate, '2027-03-12');
-    assert.equal(lead.eventType, 'Gala');
-    assert.equal(lead.budgetRange, '$10,000-$25,000');
-    assert.equal(lead.guestCount, '200');
-    assert.equal(lead.owner, 'Richard');
+    assert.equal(lead.eventDate, '');
+    assert.equal(lead.guestCount, '');
+    assert.equal(lead.budgetRange, '');
+    assert.equal(lead.owner, '');
+    assert.equal(lead.eventType, '');
     assert.equal(lead.interest, 'Glambot'); // the service, not the event type
+    assert.deepEqual(warnings, []);
   });
 
-  test('event type is no longer used as the interest', () => {
-    assert.equal(sync.mapCheckCherryLead({ attributes: { email: 'a@b.c', lead_event_type: 'Gala' } }).interest, '');
+  test('configured exact names are mapped', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: 'guest_count', budgetRange: 'budget', owner: 'owner', eventType: 'lead_event_type' });
+    const lead = sync.mapCheckCherryLead({ ...REC, attributes: { ...REC.attributes, lead_event_type: 'Gala' } });
+    assert.equal(lead.eventDate, '2027-03-12');
+    assert.equal(lead.guestCount, '200');
+    assert.equal(lead.budgetRange, '$10,000-$25,000');
+    assert.equal(lead.owner, 'Richard');
+    assert.equal(lead.eventType, 'Gala');
+    assert.deepEqual(warnings, []);
+  });
+
+  test('a configured attribute missing from a lead: blank, ONE warning line for the lead, no fall-through', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'lead_event_date', guestCount: 'lead_guests', budgetRange: 'budget', owner: null, eventType: null });
+    // `event_date` and `guest_count` exist but are not the configured names: must not be used.
+    const lead = sync.mapCheckCherryLead(REC);
+    assert.equal(lead.eventDate, '');
+    assert.equal(lead.guestCount, '');
+    assert.equal(lead.budgetRange, '$10,000-$25,000');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /lead 9/);
+    assert.match(warnings[0], /eventDate\(lead_event_date\)/);
+    assert.match(warnings[0], /guestCount\(lead_guests\)/);
+    assert.ok(!/budget/.test(warnings[0]));
+    assert.ok(!warnings[0].includes('cy@example.com'), 'no personal data in the log');
+  });
+
+  test('a null value counts as missing', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: null, budgetRange: null, owner: null, eventType: null });
+    const lead = sync.mapCheckCherryLead({ id: '5', attributes: { email: 'a@b.c', event_date: null } });
+    assert.equal(lead.eventDate, '');
+    assert.equal(warnings.length, 1);
   });
 
   test('flows through the plan; an owner with no configured option stays in the note', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: null, budgetRange: 'budget', owner: 'owner', eventType: null });
     const plan = planFor(sync.mapCheckCherryLead(REC), 'checkcherry');
-    assert.equal(val(plan, FIELDS.EVENT_TYPE), 'Gala');
     assert.equal(val(plan, FIELDS.BUDGET_RANGE), '$10,000-$25,000');
     assert.equal(val(plan, FIELDS.EVENT_DATE), '2027-03-12');
     assert.equal(val(plan, FIELDS.CAMPAIGN), 'cc-fall');

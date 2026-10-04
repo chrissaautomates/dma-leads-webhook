@@ -96,6 +96,34 @@ describe('create-ghl-fields: picklist updates preserve existing options', () => 
   });
 });
 
+describe('create-ghl-fields: read-after-write lag', () => {
+  test('a stale listing right after the update is retried, not reported as a failure', async () => {
+    const g = fakeGhl({ fields: baseFields() });
+    const realList = g.listCustomFields;
+    let staleReads = 2;
+    let updated = false;
+    const realUpdate = g.updateCustomField;
+    g.updateCustomField = async (...a) => { updated = true; return realUpdate(...a); };
+    g.listCustomFields = async () => {
+      if (updated && staleReads-- > 0) return JSON.parse(JSON.stringify(baseFields())); // old options still shown
+      return realList();
+    };
+    const r = await run(g, { apply: true, sleep: async () => {} });
+    assert.equal(g.state.updates.length, 1, 'no restore re-send for mere lag');
+    assert.ok(r.updated);
+  });
+
+  test('still fails loudly if the options never appear', async () => {
+    const g = fakeGhl({ fields: baseFields() });
+    const realList = g.listCustomFields;
+    let updated = false;
+    const realUpdate = g.updateCustomField;
+    g.updateCustomField = async () => { updated = true; };
+    g.listCustomFields = async () => (updated ? JSON.parse(JSON.stringify(baseFields())) : realList());
+    await assert.rejects(run(g, { apply: true, sleep: async () => {} }), /did not add/);
+  });
+});
+
 describe('create-ghl-fields: saves the current picklist first', () => {
   test('writes the current interest options to a JSON file before any change, in dry run too', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ghl-bk-'));

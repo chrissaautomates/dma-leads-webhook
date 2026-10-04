@@ -49,7 +49,7 @@ function mergeOptions(current, wanted) {
 }
 
 // deps: { listCustomFields, createCustomField, updateCustomField }
-async function run(deps, { apply = false, allowSimilar = false, log = () => {}, backupDir = process.env.GHL_BACKUP_DIR || path.join(__dirname, '..', 'ghl-backups'), now = new Date() } = {}) {
+async function run(deps, { apply = false, allowSimilar = false, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = () => {}, backupDir = process.env.GHL_BACKUP_DIR || path.join(__dirname, '..', 'ghl-backups'), now = new Date() } = {}) {
   const result = { created: [], updated: null, existing: [], backupFile: null };
   const existing = await deps.listCustomFields();
   if (!existing.length) {
@@ -113,9 +113,18 @@ async function run(deps, { apply = false, allowSimilar = false, log = () => {}, 
   if (!apply) return result;
 
   await deps.updateCustomField(interest.id, { name: interest.name, options: next });
-  const after = optionsOf((await deps.listCustomFields()).find((f) => f.id === interest.id) || {});
-  const lost = have.filter((o) => !hasOption(after, o));
-  const notAdded = missing.filter((o) => !hasOption(after, o));
+  // GHL's listing can lag a moment behind a write (seen live: an immediate re-read
+  // still showed the old list), so poll before judging.
+  let after = [];
+  let lost = [];
+  let notAdded = [];
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    after = optionsOf((await deps.listCustomFields()).find((f) => f.id === interest.id) || {});
+    lost = have.filter((o) => !hasOption(after, o));
+    notAdded = missing.filter((o) => !hasOption(after, o));
+    if (!lost.length && !notAdded.length) break;
+    if (attempt < 6) await sleep(1500);
+  }
   if (lost.length) {
     log(`  !! ORIGINAL OPTIONS MISSING after update: ${lost.join(', ')} — re-sending the full list`);
     await deps.updateCustomField(interest.id, { name: interest.name, options: next });

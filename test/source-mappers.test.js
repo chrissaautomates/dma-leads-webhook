@@ -82,10 +82,11 @@ describe('Wix mapper', () => {
 
 describe('Meta mapper', () => {
   const ROW = {
-    id: 'l:1', created_time: '2026-10-01T10:00:00-04:00', full_name: 'Bo Li', email: 'bo@example.com', phone: 'p:+14165551212',
+    id: 'l:1', created_time: '2026-10-01T10:00:00-04:00', first_name: 'Bo', last_name: 'Li', email: 'bo@example.com', phone: 'p:+14165551212',
     'what_services_are_you_interested_in?': 'glambot, ai_photo_booth',
     'what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)': 'product_launch',
     'tell_us_about_your_event_goal?': 'Wow our clients',
+    campaign_name: 'Fall 2026 Corporate',
   };
 
   test('services -> interest, planning -> eventType, goal -> extra', () => {
@@ -93,6 +94,7 @@ describe('Meta mapper', () => {
     assert.equal(lead.interest, 'glambot, ai_photo_booth');
     assert.equal(lead.eventType, 'product_launch');
     assert.equal(lead.extra, 'Event goal: Wow our clients');
+    assert.equal(lead.campaign, 'Fall 2026 Corporate'); // campaign_name IS in the real sheet
     assert.equal(lead.phone, '+14165551212');
   });
 
@@ -100,14 +102,28 @@ describe('Meta mapper', () => {
     const plan = planFor(sync.mapMetaAdsRow(ROW), 'meta');
     assert.equal(val(plan, FIELDS.EVENT_TYPE), 'Product Launch');
     assert.deepEqual(val(plan, FIELDS.INTEREST).sort(), ['AI Photo Booth', 'Glambot']);
+    assert.equal(val(plan, FIELDS.CAMPAIGN), 'Fall 2026 Corporate');
     assert.match(val(plan, FIELDS.LAST_ACTIVITY), /^Meta Lead Form Submission — glambot, ai_photo_booth — /);
   });
 
-  test('only reads columns that are in the real sheet: no guessed campaign/city/company', () => {
-    const lead = sync.mapMetaAdsRow({ ...ROW, campaign_name: 'X', city: 'Y', company_name: 'Z' });
-    assert.equal(lead.campaign, undefined);
+  // The real sheet's header row (names only), read from META_ADS_CSV_URL on 2026-10-04.
+  const REAL_HEADER = [
+    'id', 'created_time', 'ad_id', 'ad_name', 'adset_id', 'adset_name', 'campaign_id', 'campaign_name', 'form_id', 'form_name',
+    'is_organic', 'platform', 'what_services_are_you_interested_in?',
+    'what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)', 'tell_us_about_your_event_goal?',
+    'email', 'phone', 'first_name', 'last_name', 'lead_status', 'Synced', 'CheckCherry Lead ID', 'Synced At', 'Sync Error',
+  ];
+
+  test('the mapper reads only columns that really exist in the sheet header', () => {
+    Object.values(sync.META_COLUMNS).forEach((col) => assert.ok(REAL_HEADER.includes(col), `${col} is not in the real header`));
+  });
+
+  test('columns that are not in the sheet (city, company_name, full name) are ignored', () => {
+    const lead = sync.mapMetaAdsRow({ ...ROW, city: 'Y', company_name: 'Z', 'full name': 'Not Real', name: 'Nope' });
     assert.equal(lead.city, undefined);
     assert.equal(lead.company, '');
+    assert.equal(lead.name, 'Bo Li'); // from first_name + last_name only
+    assert.equal(sync.mapMetaAdsRow({ ...ROW, first_name: '', last_name: '', 'full name': 'Not Real' }).name, '');
   });
 
   test('skips Meta test rows', () => {

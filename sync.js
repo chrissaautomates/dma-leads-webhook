@@ -733,7 +733,7 @@ function pick(obj, aliases) {
 // Meta's "Send Test Data" placeholder marker, and the id prefix its own
 // test rows use — either one means skip, never import.
 function isMetaTestRow(rowObj) {
-  const id = pick(rowObj, ['id']);
+  const id = pick(rowObj, [META_COLUMNS.id]);
   if (/^test/i.test(id)) return true;
   return Object.values(rowObj).some((v) => String(v).includes('<test lead:'));
 }
@@ -761,35 +761,52 @@ function parseDateReceived(v) {
 // CheckCherry Lead ID / Synced At / Sync Error belong to a separate,
 // human-managed CheckCherry workflow and are ignored here entirely.
 // Returns null for a row that should be skipped (a test submission).
+// The ONLY columns mapMetaAdsRow reads, all confirmed present in the real sheet
+// header (24 columns, checked 2026-10-04 via META_ADS_CSV_URL; names only). A
+// test pins this list against that header so a column that isn't really there
+// can't creep back in.
+const META_COLUMNS = {
+  id: 'id',
+  createdTime: 'created_time',
+  campaign: 'campaign_name',
+  services: 'what_services_are_you_interested_in?',
+  planning: 'what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)',
+  goal: 'tell_us_about_your_event_goal?',
+  email: 'email',
+  phone: 'phone',
+  firstName: 'first_name',
+  lastName: 'last_name',
+};
+
 function mapMetaAdsRow(rowObj) {
   if (isMetaTestRow(rowObj)) return null;
 
-  const name = pick(rowObj, ['name', 'full name'])
-    || [pick(rowObj, ['first_name']), pick(rowObj, ['last_name'])].filter(Boolean).join(' ');
-  const email = pick(rowObj, ['email']);
+  const name = [pick(rowObj, [META_COLUMNS.firstName]), pick(rowObj, [META_COLUMNS.lastName])].filter(Boolean).join(' ');
+  const email = pick(rowObj, [META_COLUMNS.email]);
   if (!email && !name) return null; // malformed/unmapped record — never write a junk row
 
-  // Services question -> interest, planning question -> eventType. The
-  // event-goal free text has no field: kept in `extra` (-> GHL note).
-  const services = pick(rowObj, ['what_services_are_you_interested_in?']);
-  const planning = pick(rowObj, ['what_are_you_planning(e.g.,_gala,_conference,_festival,trade_show,_product_launch)']);
-  const goal = pick(rowObj, ['tell_us_about_your_event_goal?']);
+  // Services question -> interest, planning question -> eventType, campaign_name ->
+  // campaign. The event-goal free text has no field: kept in `extra` (-> GHL note).
+  const services = pick(rowObj, [META_COLUMNS.services]);
+  const planning = pick(rowObj, [META_COLUMNS.planning]);
+  const goal = pick(rowObj, [META_COLUMNS.goal]);
 
   return {
     source: 'Meta Ads',
     name,
     company: '',
     email,
-    phone: stripPhonePrefix(pick(rowObj, ['phone'])),
+    phone: stripPhonePrefix(pick(rowObj, [META_COLUMNS.phone])),
     location: '',
     interest: services,
     eventType: planning,
+    campaign: pick(rowObj, [META_COLUMNS.campaign]),
     extra: goal ? `Event goal: ${goal}` : '',
     status: 'New',
     owner: '',
     notes: '',
     nextFollowUp: 'Yes',
-    dateReceived: parseDateReceived(pick(rowObj, ['created_time'])),
+    dateReceived: parseDateReceived(pick(rowObj, [META_COLUMNS.createdTime])),
   };
 }
 
@@ -1203,6 +1220,7 @@ async function runFullSync() {
 
 module.exports = {
   resetCheckCherryWarnings: () => warnedCheckCherry.clear(),
+  META_COLUMNS,
   mapCheckCherryLead, mapCheckCherryProposalEvent, mapMetaAdsRow, mapWixFormSubmission, buildFieldMetaMap, taggedCategoriesInForm,
   runFullSync,
   getSyncStatus,

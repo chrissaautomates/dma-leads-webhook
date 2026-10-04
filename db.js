@@ -14,6 +14,10 @@ const Database = require('better-sqlite3');
 const DB_PATH = process.env.DB_PATH || '/data/leads.db';
 const db = new Database(DB_PATH);
 
+// Before ANY schema change: a one-time safety copy of the existing database
+// (/data/backups/leads-pre-ghl-<timestamp>.db). See db-backup.js.
+require('./db-backup').backupBeforeMigration(db, DB_PATH);
+
 db.pragma('journal_mode = WAL');
 
 db.exec(`

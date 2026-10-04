@@ -710,3 +710,45 @@ describe('buildProposalIndex — every match traces to a real event', () => {
     assert.equal(idx.get('r@x.com').length, 2);
   });
 });
+
+describe('live mode cannot be reached by accident — including the fill-blank path', () => {
+  // An existing, non-advanced contact with every mapped field blank: the case where
+  // plan.fillBlank has the most to write.
+  const richLead = () => newLead({ eventType: 'Gala', eventDate: '2027-05-30', budgetRange: '$5,000-$10,000', city: 'Toronto', company: 'Acme', interest: 'Glambot', campaign: 'c1' });
+  const blankContact = () => { ghl.duplicate = 'ghl-blank'; ghl.contact = { tags: [], customFields: [] }; };
+
+  for (const [label, env] of [
+    ['no env at all', {}],
+    ['GHL_PUSH_LIVE=true without a cutoff', { GHL_PUSH_LIVE: 'true' }],
+    ['GHL_PUSH_LIVE=true with an invalid cutoff', { GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: 'soon' }],
+    ['GHL_PUSH_LIVE=false with a valid cutoff', { GHL_PUSH_LIVE: 'false', GHL_PUSH_CUTOFF_DATE: '2026-10-01' }],
+    ['kill switch on', { GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01', GHL_PUSH_DISABLED: 'true' }],
+  ]) {
+    test(`${label}: zero GHL writes for an existing contact with blanks, row stays pending`, async () => {
+      setEnv(env);
+      blankContact();
+      const lead = richLead();
+      const result = insert(lead);
+      await push.pushAfterUpsert(lead, result);
+      assert.deepEqual(writes(), [], 'no POST/PUT of any kind');
+      assert.equal(rowOf(result.id).ghl_pushed, null);
+    });
+  }
+
+  test('pushLeadToGhl defaults to dry-run when called without options', async () => {
+    blankContact();
+    const out = await push.pushLeadToGhl(richLead(), { profile: push.SOURCE_PROFILES.meta });
+    assert.equal(out.dryRun, true);
+    assert.deepEqual(writes(), []);
+  });
+
+  test('only GHL_PUSH_LIVE=true plus a valid cutoff writes (and then the contact is updated)', async () => {
+    setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
+    blankContact();
+    const lead = richLead();
+    await push.pushAfterUpsert(lead, insert(lead));
+    const put = calls.find((c) => c.method === 'PUT');
+    assert.ok(put, 'live mode did update');
+    assert.ok(put.body.customFields.some((f) => f.id === FIELDS.EVENT_TYPE && f.fieldValue === 'Gala'));
+  });
+});

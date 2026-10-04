@@ -25,7 +25,8 @@
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
-const { buildLeadPlan } = require('./ghl-lead-plan');
+const { buildLeadPlan, resolveFillBlank, customFieldValue } = require('./ghl-lead-plan');
+const { formNameFromSource } = require('./lead-shape');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
 const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
 
@@ -229,13 +230,6 @@ const REENGAGE_STATUS_SET = new Set(REENGAGE_STATUSES.map((x) => x.toLowerCase()
 const ADVANCED_TAG_SET = new Set(ADVANCED_TAGS.map((t) => t.trim().toLowerCase()));
 const DEAD_DEAL_TAG_SET = new Set(DEAD_DEAL_TAGS.map((t) => t.trim().toLowerCase()));
 
-function customFieldValue(contact, fieldId) {
-  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
-  if (!entry) return '';
-  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
-  return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
-}
-
 const tagKey = (t) => String(t).trim().toLowerCase();
 
 // Which of the three buckets an EXISTING contact is in:
@@ -264,21 +258,34 @@ function classifyContact(contact) {
 
 // --- The shared push --------------------------------------------------------
 
-// Adapts a stored/synced lead ({name, email, phone, company, location,
-// interest, notes, utm*, source}) into the input buildLeadPlan expects.
-// Free-text interest and location go to the note, not into structured fields:
-// they aren't picklist values, and a venue city isn't the contact's city.
+// Adapts a stored/synced lead (the normalized shape from lead-shape.js plus
+// name/email/phone/company/location/notes/utm*/source) into the input
+// buildLeadPlan expects: every shape field is passed straight through so the
+// picklist matching in buildLeadPlan actually runs. Free-text location and
+// notes (which now hold only what no field could take) go to the note.
 function toPlanBody(lead) {
   return {
     name: lead.name,
     email: lead.email,
     phone: lead.phone,
     company: lead.company,
-    campaign: lead.utmCampaign,
+    // the 11 standard shape fields
+    eventDate: lead.eventDate,
+    eventType: lead.eventType,
+    guestCount: lead.guestCount,
+    budgetRange: lead.budgetRange,
+    city: lead.city,
+    interest: lead.interest,
+    secondaryInterest: lead.secondaryInterest,
+    leadType: lead.leadType,
+    marketingConsent: lead.marketingConsent,
+    campaign: lead.campaign || lead.utmCampaign,
+    owner: lead.owner,
+    formName: formNameFromSource(lead.source),
     noteLines: [
-      lead.interest && `Interest / form answers: ${lead.interest}`,
       lead.location && `Location: ${lead.location}`,
       lead.notes && `Notes: ${lead.notes}`,
+      lead.extra && `Other form answers: ${lead.extra}`,
       lead.source && `Original source: ${lead.source}`,
     ].filter(Boolean),
   };
@@ -306,12 +313,19 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
   const action = isNewContact ? 'create' : ((ctx.advancedReason || ctx.reengageReason) ? 'update-minimal' : 'update');
-  const outcome = { action, contactId: existing ? existing.id : null, plan, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
+  // Existing non-advanced contact: also fill any blank mapped field (never
+  // overwrites — see resolveFillBlank).
+  const fill = existing ? resolveFillBlank(plan, existing) : { contactFields: {}, customFields: [], keys: [] };
+  const outcome = { action, contactId: existing ? existing.id : null, plan, fill, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
   if (dryRun) return { ...outcome, dryRun: true };
 
   let contactId;
   if (existing) {
-    await ghl.updateContact(existing.id, { ...plan.contactFields, customFields: plan.customFields });
+    await ghl.updateContact(existing.id, {
+      ...plan.contactFields,
+      ...fill.contactFields,
+      customFields: [...plan.customFields, ...fill.customFields],
+    });
     contactId = existing.id;
   } else {
     const result = await ghl.createContact({ ...plan.contactFields, customFields: plan.customFields });
@@ -338,6 +352,7 @@ function describeOutcome(lead, profile, outcome) {
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
     outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
+    outcome.fill && outcome.fill.keys.length ? `fill-blank=[${outcome.fill.keys.join(', ')}]` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');
 }
@@ -434,6 +449,7 @@ module.exports = {
   proposalLookup,
   assess,
   classifyContact,
+  toPlanBody,
   pushLeadToGhl,
   pushAfterUpsert,
   previewLead,

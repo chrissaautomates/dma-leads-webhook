@@ -186,7 +186,63 @@ async function createNote(contactId, body) {
   if (!res.ok) throw new GhlApiError(`GHL create-note HTTP ${res.status}`, res.status, res.text().slice(0, 500));
 }
 
+// Every contact carrying `tag`, one page at a time (async generator).
+// POST /contacts/search with Version 'v3' and the tags/contains filter +
+// searchAfter paging — the exact form sync.js verified against the live API.
+async function* iterateContactsByTag(tag, { pageLimit = 100, maxPages = 500 } = {}) {
+  const { apiKey, locationId } = getConfig();
+  let searchAfter;
+  for (let page = 1; page <= maxPages; page++) {
+    const body = { locationId, pageLimit, filters: [{ field: 'tags', operator: 'contains', value: tag }] };
+    if (searchAfter) body.searchAfter = searchAfter;
+    const res = await fetchWithTimeout(`${GHL_API_BASE}/contacts/search`, {
+      method: 'POST',
+      headers: { ...authHeaders(apiKey), Version: 'v3' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new GhlApiError(`GHL contacts/search HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+    const contacts = (await res.json()).contacts || [];
+    if (!contacts.length) return;
+    yield* contacts;
+    const last = contacts[contacts.length - 1];
+    if (contacts.length < pageLimit || !last.searchAfter) return;
+    searchAfter = last.searchAfter;
+  }
+}
+
+// Custom-field definitions (used only by scripts/create-ghl-fields.js).
+// UNVERIFIED against a live call from this project — the script's dry-run
+// prints what it would send, and its first --apply should be watched.
+async function listCustomFields() {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields?model=contact`, { headers: authHeaders(apiKey) });
+  if (!res.ok) throw new GhlApiError(`GHL list-custom-fields HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customFields || [];
+}
+
+async function createCustomField(def) {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields`, {
+    method: 'POST', headers: authHeaders(apiKey), body: JSON.stringify({ model: 'contact', ...def }),
+  });
+  if (!res.ok) throw new GhlApiError(`GHL create-custom-field HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customField;
+}
+
+async function updateCustomField(id, def) {
+  const { apiKey, locationId } = getConfig();
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/locations/${locationId}/customFields/${encodeURIComponent(id)}`, {
+    method: 'PUT', headers: authHeaders(apiKey), body: JSON.stringify(def),
+  });
+  if (!res.ok) throw new GhlApiError(`GHL update-custom-field HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  return (await res.json()).customField;
+}
+
 module.exports = {
+  iterateContactsByTag,
+  listCustomFields,
+  createCustomField,
+  updateCustomField,
   GhlApiError,
   findDuplicateContact,
   getContact,

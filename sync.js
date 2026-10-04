@@ -146,7 +146,7 @@ function mapCheckCherryLead(record) {
   };
   // One line per lead, never one per attribute; ids only (no personal data in logs).
   // The sync re-reads every open lead each cycle, so warn once per lead per process.
-  const warnKey = `${(record && record.id) || attrs.id || '?'}:${missing.join(',')}`;
+  const warnKey = String((record && record.id) || attrs.id || '?'); // once per lead id
   if (missing.length && !warnedCheckCherry.has(warnKey)) {
     warnedCheckCherry.add(warnKey);
     console.warn(`[checkcherry-mapper] lead ${(record && record.id) || attrs.id || '?'}: mapped attribute(s) missing or blank, left blank: ${missing.join(', ')}`);

@@ -232,6 +232,14 @@ describe('CheckCherry mapper (strict, config-driven)', () => {
     assert.equal(warnings.length, 1);
   });
 
+  test('warns at warn level, once per lead id, even if the missing set changes', () => {
+    Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: 'estimated_number_guests', budgetRange: null, owner: null, eventType: null });
+    sync.mapCheckCherryLead({ id: '88', attributes: { email: 'a@b.c' } });
+    sync.mapCheckCherryLead({ id: '88', attributes: { email: 'a@b.c', event_date: '2027-01-01' } }); // different missing set, same lead
+    sync.mapCheckCherryLead({ id: '89', attributes: { email: 'd@e.f' } });
+    assert.equal(warnings.length, 2);
+  });
+
   test('a null value counts as missing', () => {
     Object.assign(config.CHECKCHERRY_ATTRIBUTES, { eventDate: 'event_date', guestCount: null, budgetRange: null, owner: null, eventType: null });
     const lead = sync.mapCheckCherryLead({ id: '5', attributes: { email: 'a@b.c', event_date: null } });

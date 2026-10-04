@@ -28,6 +28,12 @@ const { buildLeadPlan, resolveFillBlank, isBlankOnContact, TRACKED_FIELDS } = re
 const { rowToLead, SHAPE_FIELDS } = require('../lead-shape');
 const { testLeadReason } = require('../config');
 
+// First letter + stars ("j***@e***.com"): enough to eyeball a log line without exposing a contact.
+function maskEmail(email) {
+  const [local = '', domain = ''] = String(email).split('@');
+  return `${local.slice(0, 1)}***@${domain.slice(0, 1)}***`;
+}
+
 const MERGE_KEYS = [...SHAPE_FIELDS, 'company', 'phone', 'name', 'location', 'notes', 'extra', 'utmCampaign'];
 
 // Several stored rows can belong to one contact (e.g. two Wix forms, or a
@@ -92,7 +98,7 @@ async function backfillSource(profile, deps, { apply = false, limit = Infinity, 
         if (fill.keys.length) {
           report.contactsFilled++;
           report.valuesFilled += fill.keys.length;
-          log(`${apply ? 'FILL' : 'WOULD FILL'} ${contact.id} ${email}: ${fill.keys.join(', ')}`);
+          log(`${apply ? 'FILL' : 'WOULD FILL'} ${contact.id} ${maskEmail(email)}: ${fill.keys.join(', ')}`);
           if (apply) await deps.updateContact(contact.id, { ...fill.contactFields, customFields: fill.customFields });
         }
       }
@@ -101,7 +107,7 @@ async function backfillSource(profile, deps, { apply = false, limit = Infinity, 
       });
     } catch (err) {
       report.errors++;
-      log(`ERROR ${email}: ${err.message}`);
+      log(`ERROR ${maskEmail(email)}: ${err.message}`);
     }
   }
   return report;
@@ -166,4 +172,4 @@ if (require.main === module) {
   main().catch((err) => { console.error(err.message); process.exit(1); });
 }
 
-module.exports = { backfillSource, formatReport, mergeRows };
+module.exports = { backfillSource, formatReport, mergeRows, maskEmail };

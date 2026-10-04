@@ -138,8 +138,11 @@ function normEmail(v) {
 // be trusted to reveal a BARR lead. Over-excluding is the safe direction here.
 function isBarrLead(lead, row) {
   if (row && row.target === 'BARR') return true;
+  // Every text field a keyword could now sit in: answers that used to be folded
+  // into `interest` live in the shape fields and `extra`.
   const haystack = [
-    lead.source, lead.interest, lead.notes, lead.company,
+    lead.source, lead.interest, lead.secondaryInterest, lead.eventType, lead.budgetRange, lead.guestCount,
+    lead.leadType, lead.extra, lead.campaign, lead.location, lead.notes, lead.company,
     lead.utmSource, lead.utmMedium, lead.utmCampaign, lead.utmContent, lead.utmTerm,
   ].filter(Boolean).join(' ');
   return BARR_PATTERN.test(haystack);

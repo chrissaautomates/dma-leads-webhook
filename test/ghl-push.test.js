@@ -953,3 +953,23 @@ describe('existing contacts: city is fill-blank only, interest is merged', () =>
     assert.deepEqual(interestOf(put().body), ['Hat Bar', 'Glambot']);
   });
 });
+
+describe('BuyAndRentRobots keywords in the new shape fields are still caught', () => {
+  const { computeTarget } = require('../db');
+  for (const field of ['extra', 'eventType', 'secondaryInterest', 'leadType', 'budgetRange']) {
+    test(`keyword in ${field}: routed to BARR and never pushed`, async () => {
+      const lead = newLead({ source: 'Wix Form - Quote', [field]: 'looking at a humanoid robot' });
+      assert.equal(computeTarget(lead), 'BARR');
+      assert.equal(push.isBarrLead(lead, null), true);
+      assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'excluded_barr');
+      assert.equal(calls.filter((c) => c.method !== 'GET').length, 0);
+    });
+  }
+  test('a keyword only in campaign or location is excluded from the push (safe direction) but does not re-route the row', () => {
+    assert.equal(push.isBarrLead({ source: 'Meta Ads', campaign: 'BuyAndRentRobots spring' }, null), true);
+    assert.equal(computeTarget({ source: 'Meta Ads', campaign: 'BuyAndRentRobots spring' }), 'DMA');
+  });
+  test('ordinary DMA robotics interest is not BARR', () => {
+    assert.equal(push.isBarrLead({ source: 'Wix Form - X', interest: 'Robotics, Glambot' }, null), false);
+  });
+});

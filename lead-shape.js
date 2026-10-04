@@ -145,7 +145,12 @@ function rowToLead(row) {
   };
   const hasShape = ['eventDate', 'eventType', 'guestCount', 'budgetRange', 'city', 'secondaryInterest', 'leadType', 'marketingConsent', 'campaign']
     .some((k) => lead[k]);
-  if (hasShape) return lead;
+  // A row can have real shape columns AND a stale folded `interest` ("Services: x |
+  // Planning: y"): the sync fills the new columns on re-sync but never rewrites
+  // `interest`. So the folded text is detected on its own, not only when the shape is blank.
+  const interestIsFolded = /^(Services|Planning|Goal):\s/i.test(lead.interest)
+    || parseLabeledParts(lead.interest).some(({ label }) => label && classifyLabel(label) !== 'other');
+  if (hasShape && !interestIsFolded) return lead;
 
   if (/^Wix Form/i.test(lead.source) || lead.source === 'Meta Ads') {
     const META_LABELS = { services: 'interest', planning: 'eventType' };

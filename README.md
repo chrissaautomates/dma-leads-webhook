@@ -148,14 +148,21 @@ company, plus exact addresses / `@domain`s in `INTERNAL_EXCLUDE` (`config.js`) o
 (one exact name per field, no fall-through; a missing attribute leaves the field blank and
 logs one `[checkcherry-mapper]` line per lead). `null` entries stay blank until confirmed.
 
-One-time setup / maintenance (both **dry-run by default**, `--apply` to write):
+One-time setup / maintenance (both **dry-run by default**, `--apply` to write).
 
-- `node scripts/create-ghl-fields.js` — (re-checks for an existing field of the same name right before every create, so it never duplicates; sends the *full* merged option list when updating a picklist and verifies afterwards that no original option was lost) creates Guest Count (number) and Lead Type
+> **`railway ssh` vs `railway run`.** The leads database exists only on the Railway volume
+> (`/data/leads.db`, inside the container). Anything that touches the database must run
+> in the container with `railway ssh -- sh -c 'cd /app && node scripts/…'`. `railway run`
+> executes on your own machine (with Railway's variables), where that path does not exist.
+> `scripts/create-ghl-fields.js` is the one that works with `railway run`: it only calls GHL.
+
+
+- `railway run node scripts/create-ghl-fields.js` — (re-checks for an existing field of the same name right before every create, so it never duplicates; sends the *full* merged option list when updating a picklist and verifies afterwards that no original option was lost) creates Guest Count (number) and Lead Type
   (single select), adds Glambot / Robotics / LED Tunnel / DMA Engage / Holiday /
   Headshot to the interest picklist, prints the IDs to set as
   `GHL_FIELD_GUEST_COUNT_ID` and `GHL_FIELD_LEAD_TYPE_ID`. Until those are set,
   Lead Type is not written and Guest Count is kept in the note.
-- `railway run node scripts/backfill-ghl-fields.js [--source wix|meta|google|checkcherry] [--limit N] [--apply]`
+- `railway ssh -- sh -c 'cd /app && node scripts/backfill-ghl-fields.js [--source wix|meta|google|checkcherry] [--limit N] [--apply]'`
   — walks the stored lead rows (not GHL tags), looks each contact up in GHL by email,
   fills only blank fields (never overwrites; skips advanced / dead-deal contacts, rows
   with no email, and BARR / spam / test rows) and reports, per source, rows matched,

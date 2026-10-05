@@ -3,7 +3,7 @@
 // Each source is independent and best-effort.
 
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
-const { pushAfterUpsert } = require('./ghl-push');
+const { pushAfterUpsert, tagProposalSentContacts } = require('./ghl-push');
 const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
 const { CHECKCHERRY_ATTRIBUTES } = require('./config');
 
@@ -445,6 +445,9 @@ async function syncCheckCherryAll() {
       const total = await processCheckCherryProposals(events);
       recordStatus('CheckCherry Proposals', { ok: true, count: total });
       console.log(`syncCheckCherryProposals: done (${total} proposals)`);
+      // A proposal out for someone who already exists in GHL -> tag cc-proposal-sent
+      // (dry-run unless live; never creates a contact; never throws).
+      await tagProposalSentContacts(events);
     } catch (err) {
       recordStatus('CheckCherry Proposals', { ok: false, error: err.message, count: 0 });
     }

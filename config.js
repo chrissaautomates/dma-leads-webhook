@@ -49,6 +49,21 @@ function testLeadReason(lead, env = process.env) {
   return re ? `test lead (matches ${re})` : null;
 }
 
+// Source-form name -> tag. Matched against the form name (Wix: the name after
+// "Wix Form - "). Live Wix forms checked 2026-10-05: "Check Availability.  Get a Quote.
+// Secure Your Date." is the quote request; NO Wix form has "quiz" in its name, so
+// quiz-completed stays inert until the activation quiz's real form/source name is known
+// — add it here (a pattern, or extend the rule) when it is.
+const FORM_TAG_RULES = [
+  { pattern: /\b(quote|proposal)\b/i, tag: 'proposal-requested' },
+  { pattern: /\bquiz\b/i, tag: 'quiz-completed' },
+];
+
+function formTags(formName) {
+  const name = String(formName || '').trim();
+  return name ? FORM_TAG_RULES.filter((r) => r.pattern.test(name)).map((r) => r.tag) : [];
+}
+
 // BuyAndRentRobots exclusion for the GHL push guard. EXCLUSION ONLY: a match keeps a
 // lead out of the DMA Events funnel; nothing here can pull a lead in or re-route a row.
 // It is checked IN ADDITION to the keyword list in db.js (BARR_PATTERN), which is
@@ -81,4 +96,4 @@ function barrExclusionReason(lead) {
   return null;
 }
 
-module.exports = { BARR_EXCLUSION, barrExclusionReason, CHECKCHERRY_ATTRIBUTES, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };
+module.exports = { FORM_TAG_RULES, formTags, BARR_EXCLUSION, barrExclusionReason, CHECKCHERRY_ATTRIBUTES, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };

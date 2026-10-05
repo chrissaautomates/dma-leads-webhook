@@ -69,6 +69,7 @@
 
 const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = require('./ghl-canonical');
 const { parseConsent, toIsoDate, parseGuestCount } = require('./lead-shape');
+const { formTags } = require('./config');
 
 function normalize(value) {
   return String(value == null ? '' : value).trim();
@@ -200,7 +201,10 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
   if (!isNewContact && context.hasNewLeadTag) {
     return { applied: false, reason: 'existing contact already has the new-lead tag (not re-applied)' };
   }
-  return { applied: true, reason: isNewContact ? 'new contact' : 'existing contact, not advanced' };
+  // new-lead is applied ONLY when the contact is created. An existing contact that
+  // inquires again gets repeat-inquiry instead (buildLeadPlan), never new-lead.
+  if (!isNewContact) return { applied: false, reason: 'existing contact — repeat inquiry (new-lead is applied only on creation)' };
+  return { applied: true, reason: 'new contact' };
 }
 
 // Core mapping function. `isNewContact` must be determined by the caller
@@ -250,33 +254,41 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   // Every mapped (non-default) value, tagged with its shape key, so the
   // fill-blank pass and the backfill report can reason per field.
   const mapped = [];
+  // EXISTING contact: only Last Activity and Interest (merged additively, see
+  // mergeInterestWithExisting) are written directly. Every other mapped value goes
+  // to `mapped` -> plan.fillBlank, written only into an empty field (event date and
+  // guest count: also when newer, see resolveFillBlank). Lead Score / Status are
+  // never written to an existing contact, and Owner only fills an empty one.
+  const DIRECT_ON_EXISTING = new Set([FIELDS.LAST_ACTIVITY, FIELDS.INTEREST]);
   function setField(id, value, key) {
     if (!id) return; // field not created in GHL yet (see FIELDS.GUEST_COUNT / LEAD_TYPE)
     if (value === undefined || value === null || value === '') return;
-    customFields.push({ id, fieldValue: value });
+    if (isNewContact || DIRECT_ON_EXISTING.has(id)) customFields.push({ id, fieldValue: value });
     if (key) mapped.push({ key, kind: 'custom', id, value });
   }
-  Object.entries({ city: 'city', company: 'companyName', phone: 'phone' }).forEach(([key, field]) => {
+  Object.entries({ firstName: 'firstName', lastName: 'lastName', city: 'city', company: 'companyName', phone: 'phone' }).forEach(([key, field]) => {
     if (contactFields[field]) mapped.push({ key, kind: 'contact', field, value: contactFields[field] });
   });
 
-  // --- Consent: explicit answer, else "Unknown" on a NEW contact only
-  // (design decision #5) ---
+  // --- Consent: written as exactly "Yes" when consent was given, otherwise NOT
+  // written at all (the field stays empty: no "No", no "Unknown") ---
   const consentRaw = normalize(body.marketingConsent);
-  const consent = parseConsent(consentRaw);
-  if (consentRaw && !consent) unmapped.push({ label: 'Marketing Consent', value: consentRaw });
+  const consentAnswer = parseConsent(consentRaw);
+  if (consentRaw && !consentAnswer) unmapped.push({ label: 'Marketing Consent', value: consentRaw });
+  const consent = consentAnswer === 'Yes' ? 'Yes' : '';
 
   // --- New-lead-only defaults (see design decision #1). Lead Score is
   // intentionally NOT written: blank until real scoring exists. ---
   if (isNewContact) {
     setField(FIELDS.LEAD_SOURCE, profile.leadSourceOption);
     setField(FIELDS.LEAD_STATUS, 'New');
-    if (!consent) setField(FIELDS.MARKETING_CONSENT, 'Unknown');
   }
 
-  // City is fill-blank only on an EXISTING contact: it stays out of the update
-  // body (the fill-blank pass writes it only if the contact's city is empty).
-  if (!isNewContact) delete contactFields.city;
+  // EXISTING contact: no standard field is overwritten. They are all candidates for
+  // the fill-blank pass (plan.fillBlank), which writes only into empty fields.
+  if (!isNewContact) {
+    ['firstName', 'lastName', 'email', 'phone', 'companyName', 'city'].forEach((k) => { delete contactFields[k]; });
+  }
 
   // --- Always safe to update: describes the most recent event, not a
   // cumulative/regressable state ---
@@ -343,8 +355,7 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     else unmapped.push({ label: 'Owner', value: normalize(body.owner) });
   }
 
-  // --- Marketing Consent: explicit answers only (the "Unknown" default for a
-  // new contact was set above) ---
+  // --- Marketing Consent: only ever "Yes" ---
   if (consent) setField(FIELDS.MARKETING_CONSENT, consent, 'marketingConsent');
 
   // --- Tags: the source tag always; new-lead only through the gate in
@@ -356,6 +367,15 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   if (typeTag) tags.push(typeTag);
   else if (normalize(body.leadType)) unmapped.push({ label: 'Lead Type', value: normalize(body.leadType) });
   tags.push(...interestTags);
+  // Source-form tags (proposal request / quiz) apply to every lead, new or existing.
+  tags.push(...formTags(body.formName));
+  // Repeat inquiry: EVERY existing contact. Removed first when already present so the
+  // GHL "Tag Added" trigger fires again on each inquiry (the caller does remove -> add).
+  const removeTags = [];
+  if (!isNewContact) {
+    tags.push(TAGS.REPEAT_INQUIRY);
+    if (context.hasRepeatInquiryTag) removeTags.push(TAGS.REPEAT_INQUIRY);
+  }
 
   const note = buildNote(body, unmapped, profile.noteLabel, notedGuestCount);
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
@@ -372,7 +392,13 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
       fillBlank: [],
       interestSet: false,
       secondaryInterestSet: false,
-      tags: reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : [],
+      // No nurture/new-lead tags for these buckets; only the re-engagement tag (dead
+      // deals), plus the event tags: repeat inquiry and source-form tags.
+      tags: [...new Set([
+        ...(reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : []),
+        TAGS.REPEAT_INQUIRY, ...formTags(body.formName),
+      ])],
+      removeTags,
       note,
       warnings,
       newLead,
@@ -389,10 +415,11 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     interestSet,
     secondaryInterestSet,
     tags: [...new Set(tags)],
+    removeTags,
     note,
     warnings,
     newLead,
-    route: newLead.applied ? 'new-lead' : 'no-new-lead',
+    route: !isNewContact ? 'repeat-inquiry' : (newLead.applied ? 'new-lead' : 'no-new-lead'),
   };
 }
 
@@ -442,23 +469,60 @@ function mergeInterestWithExisting(plan, contact) {
   });
 }
 
+// Event date currently on the contact, as 'YYYY-MM-DD': '' when empty, null when
+// something is there that can't be read (then it is left alone). GHL returns DATE values
+// either as an ISO string or as epoch milliseconds — both handled.
+function existingEventDate(contact) {
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === FIELDS.EVENT_DATE);
+  if (!entry) return '';
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  if (v === undefined || v === null || String(v).trim() === '') return '';
+  if (typeof v === 'number' || /^\d{10,13}$/.test(String(v))) {
+    const ms = Number(v) < 1e11 ? Number(v) * 1000 : Number(v);
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+  return toIsoDate(String(v)) || null;
+}
+
 // Which plan.fillBlank entries to actually send for this existing contact:
-// only those whose field is blank on the contact AND that the plan isn't
-// already writing in customFields/contactFields (pass { standalone: true } when
-// those writes are NOT being sent — the backfill sends only the fill). Returns
-// { contactFields, customFields, keys } ready to merge into the update body.
-function resolveFillBlank(plan, contact, { standalone = false } = {}) {
+//  - a value goes into a field only if the field is EMPTY on the contact (never an
+//    overwrite), and the plan isn't already writing it in customFields/contactFields;
+//  - EXCEPT event date and guest count, which a NEWER inquiry replaces: the event date
+//    when the new date is later than the one on file; the guest count when the event
+//    isn't older (same or later date) — the guest count belongs to that event. With no
+//    new event date, a guest count only fills an empty field;
+//  - Marketing Consent ("Yes" only) also fills a field holding "Unknown", but never
+//    replaces an existing Yes/No.
+// Lead Score, Lead Status and Lead Source are never in plan.fillBlank. Pass
+// { standalone: true } when the plan's own writes are NOT being sent (the backfill),
+// and { blankOnly: true } to disable the newer-wins rule (the backfill never overwrites).
+// Returns { contactFields, customFields, keys } ready to merge into the update body.
+function resolveFillBlank(plan, contact, { standalone = false, blankOnly = false } = {}) {
   const out = { contactFields: {}, customFields: [], keys: [] };
   const alreadyCustom = new Set(standalone ? [] : (plan.customFields || []).map((f) => f.id));
   const planContact = standalone ? {} : (plan.contactFields || {});
-  (plan.fillBlank || []).forEach((entry) => {
+  const entries = plan.fillBlank || [];
+  const newDateEntry = entries.find((e) => e.key === 'eventDate');
+  const newDate = newDateEntry ? newDateEntry.value : '';
+  const haveDate = existingEventDate(contact);
+
+  entries.forEach((entry) => {
     if (entry.kind === 'contact') {
       if (normalize(contact[entry.field]) || planContact[entry.field] !== undefined) return;
       out.contactFields[entry.field] = entry.value;
-    } else {
-      if (alreadyCustom.has(entry.id) || customFieldValue(contact, entry.id)) return;
-      out.customFields.push({ id: entry.id, fieldValue: entry.value });
+      out.keys.push(entry.key);
+      return;
     }
+    if (alreadyCustom.has(entry.id)) return;
+    const current = customFieldValue(contact, entry.id);
+    let write = !current;
+    if (!write) {
+      if (entry.key === 'marketingConsent') write = current.toLowerCase() === 'unknown'; // "Unknown" counts as empty
+      else if (!blankOnly && entry.key === 'eventDate') write = haveDate !== null && !!entry.value && entry.value > haveDate;
+      else if (!blankOnly && entry.key === 'guestCount') write = !!newDate && haveDate !== null && newDate >= haveDate;
+    }
+    if (!write) return;
+    out.customFields.push({ id: entry.id, fieldValue: entry.value });
     out.keys.push(entry.key);
   });
   return out;

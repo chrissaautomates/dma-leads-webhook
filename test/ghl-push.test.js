@@ -222,10 +222,10 @@ describe('pushAfterUpsert — LIVE', () => {
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
     assert.ok(calls.some((c) => c.method === 'PUT'));
-    assert.deepEqual(tagsSent(), ['source-meta']);
+    assert.deepEqual(tagsSent(), ['source-meta', 'repeat-inquiry']);
   });
 
-  test('existing ADVANCED contact (Lead Status beyond New/Nurture): minimal update, no tags, note kept', async () => {
+  test('existing ADVANCED contact (Lead Status beyond New/Nurture): minimal update, only the repeat-inquiry event tag, note kept', async () => {
     ghl.duplicate = 'ghl-77';
     ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Sales Contacted' }] };
     const lead = newLead({ phone: '5551234', company: 'Acme', interest: 'Trade show booth' });
@@ -234,7 +234,7 @@ describe('pushAfterUpsert — LIVE', () => {
     assert.equal(put.body.firstName, undefined, 'no standard fields touched');
     assert.equal(put.body.phone, undefined);
     assert.deepEqual(put.body.customFields.map((f) => f.id), [FIELDS.LAST_ACTIVITY]);
-    assert.equal(tagsSent(), null, 'no tags call at all');
+    assert.deepEqual(tagsSent(), ['repeat-inquiry'], 'no source / new-lead / nurture tags, just the event tag');
     assert.ok(calls.some((c) => c.url.endsWith('/notes')), 'note still added');
   });
 
@@ -243,7 +243,7 @@ describe('pushAfterUpsert — LIVE', () => {
     ghl.contact = { tags: ['Proposal Sent'], customFields: [] }; // exact list entry 'proposal sent' (case-insensitive)
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
-    assert.equal(tagsSent(), null);
+    assert.deepEqual(tagsSent(), ['repeat-inquiry']);
   });
 
   test('advanced tags: every listed tag is advanced, matched by exact name (case-insensitive)', () => {
@@ -317,7 +317,7 @@ describe('pushAfterUpsert — LIVE', () => {
     const put = calls.find((c) => c.method === 'PUT');
     assert.equal(put.body.firstName, undefined, 'no standard fields touched');
     assert.deepEqual(put.body.customFields.map((f) => f.id), [FIELDS.LAST_ACTIVITY]);
-    assert.deepEqual(tagsSent(), ['newsletter-reengagement'], 'only the re-engagement tag: no new-lead, no source tag');
+    assert.deepEqual(tagsSent(), ['newsletter-reengagement', 'repeat-inquiry'], 're-engagement + repeat-inquiry only: no new-lead, no source tag');
     assert.ok(calls.some((c) => c.url.endsWith('/notes')));
     assert.equal(rowOf(result.id).ghl_pushed, 'pushed');
   });
@@ -329,7 +329,7 @@ describe('pushAfterUpsert — LIVE', () => {
       ghl.contact = { tags: [], customFields: [{ id: FIELDS.LEAD_STATUS, value: status }] };
       const lead = newLead();
       await push.pushAfterUpsert(lead, insert(lead));
-      assert.deepEqual(tagsSent(), ['newsletter-reengagement'], status);
+      assert.deepEqual(tagsSent(), ['newsletter-reengagement', 'repeat-inquiry'], status);
     }
   });
 
@@ -338,16 +338,16 @@ describe('pushAfterUpsert — LIVE', () => {
     ghl.contact = { tags: ['proposals-not-booked', 'Newsletter-Reengagement'], customFields: [] };
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
-    assert.equal(tagsSent(), null);
+    assert.deepEqual(tagsSent(), ['repeat-inquiry'], 're-engagement tag not re-added; only the event tag');
     assert.ok(calls.some((c) => c.method === 'PUT'));
   });
 
-  test('dead deal that ALSO has an active tag: skip bucket — no tags at all', async () => {
+  test('dead deal that ALSO has an active tag: skip bucket — only the repeat-inquiry event tag', async () => {
     ghl.duplicate = 'ghl-both';
     ghl.contact = { tags: ['proposal expired', 'call booked'], customFields: [{ id: FIELDS.LEAD_STATUS, value: 'Lost' }] };
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
-    assert.equal(tagsSent(), null);
+    assert.deepEqual(tagsSent(), ['repeat-inquiry']);
   });
 
   test('dry-run log names the route and the dead-deal reason', async () => {
@@ -359,7 +359,7 @@ describe('pushAfterUpsert — LIVE', () => {
     assert.deepEqual(writes(), []);
     const line = logs.find((l) => l.includes('WOULD'));
     assert.match(line, /route=reengage/);
-    assert.match(line, /tags=\[newsletter-reengagement\]/);
+    assert.match(line, /tags=\[newsletter-reengagement, repeat-inquiry\]/);
     assert.match(line, /new-lead: NO \(dead deal/);
     assert.match(line, /dead deal: tag "expired-proposal-batch-1"/);
   });
@@ -622,7 +622,7 @@ describe('same email from two sources: the proposal always wins (any source, any
       for (const [l, r, ctx] of steps) assert.equal(await push.pushAfterUpsert(l, r, ctx), 'pushed');
       assert.equal(calls.filter((c) => c.method === 'POST' && c.url.endsWith('/contacts/')).length, 1, 'contact created once');
       assert.ok(!contact.tags.includes('new-lead'), `tags: ${contact.tags}`);
-      assert.deepEqual([...contact.tags].sort(), ['source-checkcherry', 'source-wix']);
+      assert.deepEqual([...contact.tags].sort(), ['repeat-inquiry', 'source-checkcherry', 'source-wix']); // second arrival = repeat inquiry
     });
   }
 
@@ -768,12 +768,12 @@ describe('Marketing Consent is never downgraded on an existing contact', () => {
     });
   }
 
-  test('a brand-new contact with no explicit answer gets Unknown', async () => {
+  test('a brand-new contact with no explicit answer: consent is left empty (not Unknown)', async () => {
     setEnv({ GHL_PUSH_LIVE: 'true', GHL_PUSH_CUTOFF_DATE: '2026-10-01' });
     const lead = newLead();
     await push.pushAfterUpsert(lead, insert(lead));
     const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/contacts/'));
-    assert.equal(post.body.customFields.find((f) => f.id === FIELDS.MARKETING_CONSENT).fieldValue, 'Unknown');
+    assert.equal(post.body.customFields.find((f) => f.id === FIELDS.MARKETING_CONSENT), undefined);
   });
 });
 
@@ -837,9 +837,9 @@ describe('dry-run lines show which of the 19 standard fields are set / blank', (
     assert.equal(r.set.length + r.blank.length + r.byDesign.length, 19);
     assert.deepEqual(r.byDesign, ['Lead Score']);
     assert.ok(!r.blank.includes('Lead Score') && !r.set.includes('Lead Score'));
-    ['Contact', 'Email', 'Mobile', 'City', 'Event Type', 'Lead Source', 'Status', 'Last Activity', 'Marketing Consent', 'Interested In', 'Secondary Interest']
+    ['Contact', 'Email', 'Mobile', 'City', 'Event Type', 'Lead Source', 'Status', 'Last Activity', 'Interested In', 'Secondary Interest']
       .forEach((k) => assert.ok(r.set.includes(k), `${k} set`));
-    ['Company', 'Event Date', 'Budget Range', 'Sales Owner', 'Lead Type', 'Campaign'].forEach((k) => assert.ok(r.blank.includes(k), `${k} blank`));
+    ['Company', 'Event Date', 'Budget Range', 'Sales Owner', 'Lead Type', 'Campaign', 'Marketing Consent'].forEach((k) => assert.ok(r.blank.includes(k), `${k} blank`));
   });
 
   test('Interested In and Secondary Interest are tracked separately', async () => {

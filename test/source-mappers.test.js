@@ -65,7 +65,7 @@ describe('Wix mapper', () => {
 
   test('flows through the plan: picklists, consent, interest options', () => {
     const plan = planFor(map(answers), 'wix');
-    assert.equal(val(plan, FIELDS.MARKETING_CONSENT), 'No');
+    assert.equal(val(plan, FIELDS.MARKETING_CONSENT), undefined); // "No thanks": the field stays empty
     assert.equal(val(plan, FIELDS.BUDGET_RANGE), '$5,000-$10,000');
     assert.equal(val(plan, FIELDS.EVENT_TYPE), 'Corporate');
     assert.equal(val(plan, FIELDS.EVENT_DATE), '2027-05-30');
@@ -74,9 +74,9 @@ describe('Wix mapper', () => {
     assert.match(plan.note, /How did you hear about us\?: Google/);
   });
 
-  test('a lead with no consent answer gets Unknown on a new contact', () => {
+  test('a lead with no consent answer leaves consent empty on a new contact', () => {
     const { optin: _omit, ...rest } = answers;
-    assert.equal(val(planFor(map(rest), 'wix'), FIELDS.MARKETING_CONSENT), 'Unknown');
+    assert.equal(val(planFor(map(rest), 'wix'), FIELDS.MARKETING_CONSENT), undefined);
   });
 });
 

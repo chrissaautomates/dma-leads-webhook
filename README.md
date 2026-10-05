@@ -103,9 +103,9 @@ never keywords):
 
 | Bucket | Who | What the push does |
 |---|---|---|
-| **Skip** (active/booked) | carries any of the 16 `ADVANCED_TAGS`, **or** Lead Status beyond Nurture other than Lost / Not Ready | minimal update (last-activity + note). **No tags.** |
-| **Re-engage** (dead deal) | carries one of the 5 `DEAD_DEAL_TAGS`, **or** Lead Status is Lost / Not Ready | minimal update + tag **`newsletter-reengagement`** only. Never `new-lead`. |
-| **New-lead** (cold) | brand-new contact, or an existing one in neither bucket above | source tag + **`new-lead`** (unless already present) — but **only if CheckCherry has no event (proposal/booking) for that email, whichever source the lead came through.** |
+| **Skip** (active/booked) | carries any of the 16 `ADVANCED_TAGS`, **or** Lead Status beyond Nurture other than Lost / Not Ready | minimal update (last-activity + note). No source / new-lead / nurture tags — only the event tags below. |
+| **Re-engage** (dead deal) | carries one of the 5 `DEAD_DEAL_TAGS`, **or** Lead Status is Lost / Not Ready | minimal update + tag **`newsletter-reengagement`** (+ the event tags below). Never `new-lead`. |
+| **New-lead** (cold) | a **brand-new** contact (created by the push) | source tag + **`new-lead`** — but **only if CheckCherry has no event (proposal/booking) for that email, whichever source the lead came through.** An *existing* contact never gets `new-lead` from the push; it gets `repeat-inquiry` instead (below). |
 
 **One email, several sources.** Leads dedupe by email *and* target, so the same
 person arriving via Wix and CheckCherry is two rows but one GHL contact. Each
@@ -125,11 +125,25 @@ expired` + `deposit`, or tag `expired-proposal` + Lead Status Won) is Skip.
 `leads` columns). Answers no field can take go to `leads.extra` and the GHL note.
 `toPlanBody` passes all of them to `buildLeadPlan`, which matches picklists
 (event type, budget, interest, lead type), writes Guest Count as a number, and
-keeps anything unmatched in the note. Marketing Consent is `Unknown` on a brand-new
-contact when nothing explicit was supplied, never on an existing one. Lead Score is
+keeps anything unmatched in the note. **Marketing Consent is written as exactly `Yes` when
+consent was given, and not written otherwise** (never `No`, never `Unknown`). Lead Score is
 not written. Last Activity reads like `Wix Form Submission — <form> — <what they asked for>`.
-For existing, non-advanced contacts the plan's `fillBlank` list is written only into
-fields that are blank in GHL.
+
+**Existing GHL contacts** (matched by email, else phone):
+- `repeat-inquiry` is added to **every** existing contact (removed first if already present, so a GHL
+  *Tag Added* trigger fires each time). `new-lead` is applied only when the contact is created.
+- Lead Score, Lead Status and Lead Source are never written to an existing contact; Sales Owner only
+  fills an empty one. Every other field is written **only if empty** (name, phone, company, city,
+  campaign, event type, budget, lead type, consent `Yes`), except **event date** (replaced when the new
+  date is later than the one on file) and **guest count** (replaced when the event isn't older; with no
+  new date it only fills an empty field). Interest is merged into what the contact already has.
+  Last Activity is always updated.
+- Source-form tags apply to new and existing contacts alike: `proposal-requested` (form name matches
+  quote/proposal) and `quiz-completed` (form name matches quiz) — rules in `FORM_TAG_RULES`, `config.js`.
+- **CheckCherry proposal sent:** when the events feed shows a proposal out (status
+  `proposal_date_open` / `proposal_date_reserved` / `awaiting_signature`) for someone who already exists
+  in GHL, that contact gets `cc-proposal-sent` (primary email only; never creates a contact; dry-run
+  logs `WOULD TAG`; live only for events created on/after `GHL_PUSH_CUTOFF_DATE`; each event once).
 
 **19 standard fields** (what dry-run lines report as `fields n/19 set=[…] blank=[…]
 not-written-by-design=[Lead Score]`): Lead Source, Campaign, Lead Type, Company, Contact,

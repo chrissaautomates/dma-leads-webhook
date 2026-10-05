@@ -28,8 +28,8 @@ const ghl = require('./ghl-client');
 const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
 const { formNameFromSource } = require('./lead-shape');
 const { testLeadReason, barrExclusionReason } = require('./config');
-const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
+const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES, CC_PROPOSAL_SENT_STATUSES } = require('./ghl-canonical');
+const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -331,6 +331,7 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     reengageReason: cls.bucket === 'reengage' ? cls.reason : null,
     hasNewLeadTag: hasTag(TAGS.LEAD_NEW),
     hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
+    hasRepeatInquiryTag: hasTag(TAGS.REPEAT_INQUIRY),
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
   // Existing contact: interest is merged into what they already have, never replaced.
@@ -354,6 +355,8 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     const result = await ghl.createContact({ ...plan.contactFields, customFields: plan.customFields });
     contactId = result.contact.id;
   }
+  // Remove -> add, so a GHL "Tag Added" trigger fires again even when the tag is already there.
+  if (plan.removeTags && plan.removeTags.length) await ghl.removeTags(contactId, plan.removeTags);
   if (plan.tags.length) await ghl.addTags(contactId, plan.tags);
   if (plan.note) await ghl.createNote(contactId, plan.note);
   return { ...outcome, contactId, dryRun: false };
@@ -372,6 +375,7 @@ function describeOutcome(lead, profile, outcome) {
     `source="${lead.source}"`,
     `leadSource=${profile.leadSourceOption}`,
     `tags=[${plan.tags.join(', ')}]`,
+    plan.removeTags && plan.removeTags.length ? `remove-then-add=[${plan.removeTags.join(', ')}]` : null,
     `new-lead: ${plan.newLead.applied ? 'YES' : 'NO'} (${plan.newLead.reason})`,
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
@@ -449,6 +453,74 @@ async function pushAfterUpsert(lead, result, context = {}) {
   }
 }
 
+// --- CheckCherry "proposal sent" -> tag the EXISTING GHL contact ----------------
+//
+// When CheckCherry's events feed shows a proposal out (status proposal_date_open /
+// proposal_date_reserved / awaiting_signature, not canceled / archived / postponed) for
+// a person who ALREADY exists in GHL, add the tag "cc-proposal-sent" to that contact.
+// It never creates a contact (the lead push does that) and only tags the event's primary
+// customer email. Same safety model as the push: dry-run logs WOULD TAG and sends
+// nothing; live needs GHL_PUSH_LIVE + GHL_PUSH_CUTOFF_DATE and only handles events
+// CREATED on/after the cutoff (the back catalog is never tagged). Each event is recorded
+// once (db.js cc_proposal_tags) so the 15-minute sync doesn't re-tag; a contact that
+// doesn't exist yet is retried for 3 days, then given up on.
+// Never throws. Returns { mode, tagged, considered }.
+const PROPOSAL_TAG_RETRY_DAYS = 3;
+const PROPOSAL_DRY_RUN_WINDOW_DAYS = 14; // dry run has no cutoff: only look at recent events
+
+async function tagProposalSentContacts(events, { now = new Date() } = {}) {
+  const result = { mode: 'off', tagged: 0, considered: 0 };
+  try {
+    const cfg = getPushConfig();
+    result.mode = resolveMode(cfg);
+    if (result.mode === 'off') return result;
+    const dry = result.mode === 'dry-run';
+    const day = (d) => d.toISOString().slice(0, 10);
+    const since = cfg.cutoff || day(new Date(now.getTime() - PROPOSAL_DRY_RUN_WINDOW_DAYS * 86400000));
+    const giveUpBefore = day(new Date(now.getTime() - PROPOSAL_TAG_RETRY_DAYS * 86400000));
+    const first = (list) => String(list || '').split(',')[0].trim();
+
+    for (const record of events || []) {
+      const attrs = (record && record.attributes) || record || {};
+      if (!CC_PROPOSAL_SENT_STATUSES.includes(attrs.status) || attrs.canceled || attrs.archived || attrs.postponed) continue;
+      const created = String(attrs.created_at || '').slice(0, 10);
+      if (!created || created < since) continue;
+      const eventId = String((record && record.id) || attrs.id || '');
+      const email = first(attrs.customer_emails).toLowerCase();
+      if (!eventId || !email) continue;
+      if (testLeadReason({ name: first(attrs.customer_names), email })) continue;
+      if (getProposalTagOutcome(eventId)) continue;
+      const key = `proposal-tag:${eventId}`;
+      if (dry && dryRunLogged.has(key)) continue;
+      result.considered++;
+
+      const found = await ghl.findDuplicateContact({ email, phone: '' });
+      if (!found) { // not in GHL: never create one here
+        if (dry) dryRunLogged.add(key);
+        else if (created < giveUpBefore) recordProposalTag(eventId, email, 'no-contact');
+        continue;
+      }
+      const contact = (await ghl.getContact(found.id)) || found;
+      if ((contact.tags || []).some((t) => tagKey(t) === TAGS.CC_PROPOSAL_SENT)) {
+        if (dry) dryRunLogged.add(key); else recordProposalTag(eventId, email, 'already-tagged');
+        continue;
+      }
+      if (dry) {
+        dryRunLogged.add(key);
+        console.log(`[ghl-push][DRY-RUN] WOULD TAG existing contact ${found.id} email=${email} with ${TAGS.CC_PROPOSAL_SENT} (CheckCherry event ${eventId}, status ${attrs.status})`);
+        continue;
+      }
+      await ghl.addTags(found.id, [TAGS.CC_PROPOSAL_SENT]);
+      recordProposalTag(eventId, email, 'tagged');
+      result.tagged++;
+      console.log(`[ghl-push] TAGGED existing contact ${found.id} email=${email} with ${TAGS.CC_PROPOSAL_SENT} (CheckCherry event ${eventId}, status ${attrs.status})`);
+    }
+  } catch (err) {
+    console.error('[ghl-push] proposal-sent tagging failed — will retry next cycle:', err.message);
+  }
+  return result;
+}
+
 // Read-only assessment of already-stored rows (used by the admin dry-run
 // preview): what WOULD be done to each, ignoring their ghl_pushed state.
 // Performs only read calls to GHL. Never sends or marks anything.
@@ -477,5 +549,6 @@ module.exports = {
   toPlanBody,
   pushLeadToGhl,
   pushAfterUpsert,
+  tagProposalSentContacts,
   previewLead,
 };

@@ -127,6 +127,13 @@ if (!db.prepare(`PRAGMA table_info(leads)`).all().some((c) => c.name === 'ghl_pu
 db.exec(`CREATE TABLE IF NOT EXISTS proposal_emails (email TEXT PRIMARY KEY)`);
 db.exec(`CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT)`);
 
+// One row per CheckCherry proposal event already handled by the "cc-proposal-sent" tagging
+// (ghl-push.js tagProposalSentContacts), so each event is tagged at most once and the
+// 15-minute sync never re-tags. Additive (CREATE IF NOT EXISTS); only written in live mode.
+db.exec(`CREATE TABLE IF NOT EXISTS cc_proposal_tags (
+  event_id TEXT PRIMARY KEY, email TEXT, outcome TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
 // One-time fixup: rows synced before CheckCherry got its own tab were
 // routed to DMA/BARR by content keywords alone (the only rule that existed
 // at the time), even though their source is 'CheckCherry'. computeTarget()
@@ -491,6 +498,15 @@ function hasProposalEmail(email) {
   return !!db.prepare(`SELECT 1 FROM proposal_emails WHERE email = ?`).get(e);
 }
 
+function getProposalTagOutcome(eventId) {
+  const row = db.prepare(`SELECT outcome FROM cc_proposal_tags WHERE event_id = ?`).get(String(eventId));
+  return row ? row.outcome : null;
+}
+
+function recordProposalTag(eventId, email, outcome) {
+  db.prepare(`INSERT OR IGNORE INTO cc_proposal_tags (event_id, email, outcome) VALUES (?, ?, ?)`).run(String(eventId), email || '', outcome);
+}
+
 // GHL push state for one row: { ghl_pushed, date_received, target, ... }.
 function getGhlState(id) {
   return db.prepare(`SELECT id, ghl_pushed, date_received, target, created_at, status FROM leads WHERE id = ?`).get(id);
@@ -509,6 +525,8 @@ module.exports = {
   setProposalEmails,
   getProposalState,
   hasProposalEmail,
+  getProposalTagOutcome,
+  recordProposalTag,
   markGhlPushed,
   listLeadsSince,
   upsertLead,

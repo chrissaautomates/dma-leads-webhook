@@ -55,7 +55,7 @@ describe('buildLeadPlan — blank optional fields', () => {
     assert.equal(fieldValue(plan.customFields, FIELDS.EVENT_TYPE), undefined);
     assert.equal(fieldValue(plan.customFields, FIELDS.BUDGET_RANGE), undefined);
     assert.equal(fieldValue(plan.customFields, FIELDS.INTEREST), undefined);
-    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), 'Unknown'); // new contact default
+    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), undefined); // empty unless consent was given
     assert.equal(plan.contactFields.companyName, undefined);
     assert.equal(plan.note, null);
     // Only the two always-on tags — nothing inferred.
@@ -192,14 +192,15 @@ describe('buildLeadPlan — marketing consent', () => {
     assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), 'Yes');
   });
 
-  test('explicit "no" sets the field to "No"', () => {
+  test('explicit "no" writes NOTHING (the field stays empty; never "No")', () => {
     const plan = buildLeadPlan({ firstName: 'Jane', email: 'a@example.com', marketingConsent: 'no' }, { isNewContact: true, profile: WIX });
-    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), 'No');
+    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), undefined);
+    assert.equal(plan.note, null, 'a clear No is not an unmapped value');
   });
 
-  test('not supplied on a NEW contact — written as "Unknown"', () => {
+  test('not supplied on a NEW contact — left empty (no "Unknown")', () => {
     const plan = buildLeadPlan({ firstName: 'Jane', email: 'a@example.com' }, { isNewContact: true, profile: WIX });
-    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), 'Unknown');
+    assert.equal(fieldValue(plan.customFields, FIELDS.MARKETING_CONSENT), undefined);
   });
 
   test('not supplied on an EXISTING contact — never written (no downgrade of explicit consent)', () => {
@@ -208,10 +209,10 @@ describe('buildLeadPlan — marketing consent', () => {
     assert.ok(!plan.fillBlank.some((e) => e.key === 'marketingConsent'));
   });
 
-  test('"No thanks" is an explicit No; "Not sure" is not an answer', () => {
-    const c = (marketingConsent) => fieldValue(buildLeadPlan({ email: 'a@example.com', marketingConsent }, { isNewContact: false, profile: WIX }).customFields, FIELDS.MARKETING_CONSENT);
-    assert.equal(c('No thanks'), 'No');
-    assert.equal(c('Not sure'), undefined);
+  test('only a consenting answer is written, and it is exactly "Yes"', () => {
+    const c = (marketingConsent) => fieldValue(buildLeadPlan({ email: 'a@example.com', marketingConsent }, { isNewContact: true, profile: WIX }).customFields, FIELDS.MARKETING_CONSENT);
+    for (const yes of ['yes', 'Yes', 'YES', 'true', 'Yes, please', 'sure', 'i agree', '1']) assert.strictEqual(c(yes), 'Yes', yes);
+    for (const no of ['No thanks', 'no', 'false', 'Not sure', '', undefined, 'maybe later']) assert.strictEqual(c(no), undefined, String(no));
   });
 });
 
@@ -266,9 +267,12 @@ describe('buildLeadPlan — new-lead gate', () => {
     assert.equal(plan.newLead.applied, true);
   });
 
-  test('existing, not advanced, no new-lead tag yet: applied', () => {
+  test('existing, not advanced, no new-lead tag: still NOT new-lead (only on creation) — repeat-inquiry instead', () => {
     const plan = buildLeadPlan(lead, { isNewContact: false, profile: SOURCE_PROFILES.meta, context: { advancedReason: null, hasNewLeadTag: false } });
-    assert.ok(plan.tags.includes('new-lead'));
+    assert.ok(!plan.tags.includes('new-lead'));
+    assert.ok(plan.tags.includes('repeat-inquiry'));
+    assert.equal(plan.route, 'repeat-inquiry');
+    assert.match(plan.newLead.reason, /repeat inquiry/);
   });
 
   test('BUG FIX: existing contact that already has new-lead is NOT re-tagged on update', () => {
@@ -277,12 +281,12 @@ describe('buildLeadPlan — new-lead gate', () => {
     assert.match(plan.newLead.reason, /already has the new-lead tag/);
   });
 
-  test('advanced existing contact: no new-lead, no tags at all, MINIMAL update (last-activity + note only)', () => {
+  test('advanced existing contact: no new-lead, only the repeat-inquiry event tag, MINIMAL update (last-activity + note only)', () => {
     const plan = buildLeadPlan(
       { ...lead, phone: '555-1212', company: 'Acme', utmCampaign: 'spring', noteLines: ['Interest / form answers: booth'] },
       { isNewContact: false, profile: SOURCE_PROFILES.meta, context: { advancedReason: 'Lead Status = Proposal Sent', hasNewLeadTag: false } }
     );
-    assert.deepEqual(plan.tags, []);
+    assert.deepEqual(plan.tags, ['repeat-inquiry']);
     assert.deepEqual(plan.contactFields, {}); // no name/phone/company overwrite
     assert.equal(plan.customFields.length, 1);
     assert.equal(plan.customFields[0].id, FIELDS.LAST_ACTIVITY);
@@ -296,7 +300,7 @@ describe('buildLeadPlan — new-lead gate', () => {
       { isNewContact: false, profile: SOURCE_PROFILES.meta, context: { advancedReason: null, reengageReason: 'tag "proposal expired"', hasNewLeadTag: false, hasReengageTag: false } }
     );
     assert.equal(plan.route, 'reengage');
-    assert.deepEqual(plan.tags, ['newsletter-reengagement']);
+    assert.deepEqual(plan.tags, ['newsletter-reengagement', 'repeat-inquiry']);
     assert.deepEqual(plan.contactFields, {});
     assert.equal(plan.customFields.length, 1);
     assert.equal(plan.newLead.applied, false);

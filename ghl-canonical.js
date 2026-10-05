@@ -130,6 +130,15 @@ const TAGS = {
   SOURCE_GOOGLE_ADS: 'source-google-ads',
   SOURCE_CHECKCHERRY: 'source-checkcherry',
   LEAD_NEW: 'new-lead',
+  // Applied to EVERY existing contact that inquires again (removed first when already
+  // present, so a GHL "Tag Added" trigger fires on every repeat inquiry).
+  REPEAT_INQUIRY: 'repeat-inquiry',
+  // From the source form (see FORM_TAG_RULES in config.js).
+  PROPOSAL_REQUESTED: 'proposal-requested',
+  QUIZ_COMPLETED: 'quiz-completed',
+  // Added to an EXISTING contact when CheckCherry reports a proposal for them
+  // (ghl-push.js tagProposalSentContacts). Also one of ADVANCED_TAGS below.
+  CC_PROPOSAL_SENT: 'cc-proposal-sent',
   // Bucket 2 (dead deals): applied by ghl-push.js instead of new-lead. A separate
   // GHL workflow / monthly broadcast enrolls this tag — and must respect DMA
   // Marketing Consent (CASL).
@@ -145,6 +154,10 @@ const TAGS = {
     social: 'type-social', // NEW, exact name
   },
 };
+
+// CheckCherry event statuses that mean "a proposal has been sent / is out": the three
+// pre-booking stages (a confirmed event is a booking, not a proposal).
+const CC_PROPOSAL_SENT_STATUSES = ['proposal_date_open', 'proposal_date_reserved', 'awaiting_signature'];
 
 // Tags that mark a contact as ALREADY in active sales / booked — such a contact
 // must never be dropped into cold nurture (see ghl-push.js classifyContact).
@@ -226,4 +239,5 @@ module.exports = {
   REENGAGE_STATUSES,
   INTEREST_MAP,
   EVENT_TYPE_ALIASES,
+  CC_PROPOSAL_SENT_STATUSES,
 };

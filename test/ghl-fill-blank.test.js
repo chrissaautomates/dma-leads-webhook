@@ -82,7 +82,7 @@ describe('plan.fillBlank', () => {
 
   test('lists mapped values for an existing, non-advanced contact — never defaults or Last Activity', () => {
     const keys = plan.fillBlank.map((e) => e.key).sort();
-    assert.deepEqual(keys, ['city', 'company', 'eventDate', 'guestCount']);
+    assert.deepEqual(keys, ['city', 'company', 'eventDate', 'firstName', 'guestCount', 'lastName']);
   });
 
   test('is empty for a new contact and for advanced / dead-deal contacts', () => {
@@ -91,21 +91,22 @@ describe('plan.fillBlank', () => {
     assert.deepEqual(buildLeadPlan(lead, { isNewContact: false, profile: WIX, context: { reengageReason: 'Lead Status = Lost' } }).fillBlank, []);
   });
 
-  test('resolveFillBlank fills only blanks and never overwrites', () => {
+  test('resolveFillBlank fills only blanks and never overwrites (existing event date is LATER, so it stays)', () => {
     // Plan only fills; suppress the always-written customFields so the blank check is isolated.
     const isolated = { ...plan, customFields: [], contactFields: {} };
-    const contact = { city: 'Ottawa', companyName: '', customFields: [{ id: FIELDS.EVENT_DATE, value: '2026-01-01' }] };
+    const contact = { city: 'Ottawa', companyName: '', customFields: [{ id: FIELDS.EVENT_DATE, value: '2028-01-01' }, { id: FIELDS.GUEST_COUNT, value: 300 }] };
     const fill = resolveFillBlank(isolated, contact);
-    assert.deepEqual(fill.keys.sort(), ['company', 'guestCount']); // city + eventDate already set
+    assert.deepEqual(fill.keys.sort(), ['company', 'firstName', 'lastName']); // city set; date + guests kept: the event on file is later
     assert.equal(fill.contactFields.city, undefined);
-    assert.deepEqual(fill.customFields, [{ id: FIELDS.GUEST_COUNT, fieldValue: 80 }]);
+    assert.deepEqual(fill.customFields, []);
   });
 
   test('treats an empty multi-select array as blank', () => {
     const p = buildLeadPlan({ ...base, interest: 'Glambot' }, { isNewContact: false, profile: WIX });
     const isolated = { ...p, customFields: [] };
-    assert.deepEqual(resolveFillBlank(isolated, { customFields: [{ id: FIELDS.INTEREST, value: [] }] }).keys, ['interest']);
-    assert.deepEqual(resolveFillBlank(isolated, { customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar'] }] }).keys, []);
+    const only = (c) => resolveFillBlank(isolated, c).keys.filter((k) => k === 'interest');
+    assert.deepEqual(only({ customFields: [{ id: FIELDS.INTEREST, value: [] }] }), ['interest']);
+    assert.deepEqual(only({ customFields: [{ id: FIELDS.INTEREST, value: ['Hat Bar'] }] }), []);
   });
 });
 

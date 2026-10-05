@@ -127,7 +127,10 @@ function mapGoogleAdsLead(userColumnData, body) {
   const location = [city, flat.region || flat.state, flat.postalcode || flat.zipcode]
     .filter(Boolean).join(', ') || pickGoogleField(flat, ['location']);
 
+  const leadId = body && body.lead_id;
+
   return {
+    submissionId: leadId ? `google:${leadId}` : '', // Google's lead id: each new lead form submission is its own
     source: 'Google Ads',
     name: name || '',
     email: pickGoogleField(flat, ['email', 'useremail', 'workemail', 'emailaddress']),

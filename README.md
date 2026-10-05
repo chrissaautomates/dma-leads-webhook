@@ -129,16 +129,28 @@ keeps anything unmatched in the note. **Marketing Consent is written as exactly 
 consent was given, and not written otherwise** (never `No`, never `Unknown`). Lead Score is
 not written. Last Activity reads like `Wix Form Submission — <form> — <what they asked for>`.
 
+**Every submission counts.** Leads dedupe by email in the database, so a second submission only
+updates the stored row; each source's own submission id (Wix submission id, Meta leadgen id,
+Google lead id, CheckCherry lead id — stored in `submissions`) is what lets every NEW submission
+reach GHL, exactly once, as a repeat inquiry (live: dated on/after `GHL_PUSH_CUTOFF_DATE`; a
+`legacy` row's own back-catalog submission is never re-pushed). Email stays the contact match key.
+
+**Marketing consent for Canadian numbers:** when there is no consent answer and the phone is Canadian
+(libphonenumber region CA, so US `+1` numbers don't count), Marketing Consent is set to `Yes` if empty
+or `Unknown`, and the contact gets `consent-implied-inquiry`. An existing `No` (or `Yes`) and an
+explicit `No` answer on the form are never overridden; non-Canadian or missing numbers are left alone;
+advanced / dead-deal contacts are not touched; the backfill never implies consent.
+
 **Existing GHL contacts** (matched by email, else phone):
 - `repeat-inquiry` is added to **every** existing contact (removed first if already present, so a GHL
   *Tag Added* trigger fires each time). `new-lead` is applied only when the contact is created.
 - Lead Score, Lead Status and Lead Source are never written to an existing contact; Sales Owner only
   fills an empty one. Every other field is written **only if empty** (name, phone, company, city,
-  campaign, event type, budget, lead type, consent `Yes`), except **event date** (replaced when the new
+  campaign, event type, budget, lead type, consent `Yes`; a picklist value that isn't one of the field's options, e.g. an Event Type of `estimated_guest_count:` left by a broken upstream parser, counts as empty), except **event date** (replaced when the new
   date is later than the one on file) and **guest count** (replaced when the event isn't older; with no
   new date it only fills an empty field). Interest is merged into what the contact already has.
   Last Activity is always updated.
-- Source-form tags apply to new and existing contacts alike: `proposal-requested` (form name matches
+- Source-form tags apply to new and existing contacts alike, and like `repeat-inquiry` are removed then re-added when already present so they fire every time: `proposal-requested` (form name matches
   quote/proposal) and `quiz-completed` (form name matches quiz) — rules in `FORM_TAG_RULES`, `config.js`.
 - **CheckCherry proposal sent:** when the events feed shows a proposal out (status
   `proposal_date_open` / `proposal_date_reserved` / `awaiting_signature`) for someone who already exists

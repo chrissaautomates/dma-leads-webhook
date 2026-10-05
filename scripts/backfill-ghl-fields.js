@@ -90,6 +90,7 @@ async function backfillSource(profile, deps, { apply = false, limit = Infinity, 
         context: {
           advancedReason: cls.bucket === 'advanced' ? cls.reason : null,
           reengageReason: cls.bucket === 'reengage' ? cls.reason : null,
+          noImpliedConsent: true, // the backfill writes no tags, so it must not imply consent (no audit tag)
         },
       });
 

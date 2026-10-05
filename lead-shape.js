@@ -51,6 +51,13 @@ function classifyLabel(label) {
   return 'other';
 }
 
+// A value that is really a "key: value" line fragment from a broken upstream parser,
+// e.g. "estimated_guest_count:" or "package_name: Pro Photographer" (snake_case key with an
+// underscore, then a colon). Never a legitimate answer for a picklist-style field.
+function isParseArtifact(value) {
+  return /^[a-z][a-z0-9]*(_[a-z0-9]+)+:(\s.*)?$/.test(str(value));
+}
+
 // --- Value parsers -----------------------------------------------------------
 
 // Explicit yes/no consent answer -> 'Yes' | 'No' | ''. Unrecognized -> ''
@@ -175,6 +182,7 @@ function rowToLead(row) {
 }
 
 module.exports = {
+  isParseArtifact,
   formNameFromSource,
   rowToLead,
   SHAPE_FIELDS,

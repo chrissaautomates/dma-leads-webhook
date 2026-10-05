@@ -99,16 +99,6 @@ describe('A. repeat-inquiry: existing contact -> remove then add, never new-lead
     }
   });
 
-  test('KNOWN LIMIT (documented, not changed here): a row is pushed at most once, so a 2nd submission from the SAME email updates the stored row but does not push again', async () => {
-    setEnv(LIVE);
-    const lead = newLead();
-    addContact(lead.email, { tags: [] });
-    assert.equal(await run(lead), 'pushed');
-    calls.length = 0;
-    assert.equal(await push.pushAfterUpsert(lead, upsertLead({ ...lead, interest: 'Robotics' })), 'not-pending');
-    assert.equal(calls.length, 0);
-  });
-
   test('new-lead is NOT added to an existing contact (with or without the tag), only on creation', async () => {
     setEnv(LIVE);
     const a = newLead(); addContact(a.email, { tags: [] });
@@ -467,5 +457,291 @@ describe('E. marketing consent: exactly "Yes" when given, empty otherwise', () =
 
   test('the live DMA Marketing Consent picklist really has the exact option "Yes"', () => {
     assert.ok(FIELD_OPTIONS.MARKETING_CONSENT.includes('Yes'));
+  });
+});
+
+// ================= 1. per-submission dedupe (submission id, not email) =========
+describe('1. every NEW submission reaches GHL; email stays the contact key', () => {
+  const { hasSubmission } = require('../db');
+  const sub = (lead, n, over = {}) => ({ ...lead, submissionId: `${lead.source === 'Meta Ads' ? 'meta' : 'wix'}:sub-${n}`, ...over });
+  const pushIt = (lead) => push.pushAfterUpsert(lead, upsertLead(lead));
+
+  test('2nd and 3rd submissions from the same person each push once, as repeat inquiries; re-reading them never re-pushes', async () => {
+    setEnv(LIVE);
+    const base = newLead();
+    const id = addContact(base.email, { tags: [] });
+    assert.equal(await pushIt(sub(base, 1)), 'pushed');
+    contacts[id].tags = ['repeat-inquiry'];
+    calls.length = 0;
+    assert.equal(await pushIt(sub(base, 2, { interest: 'Robotics' })), 'pushed-repeat');
+    assert.equal(calls.filter((c) => c.method === 'DELETE').length, 1, 'repeat-inquiry removed then re-added');
+    assert.ok(tagPosts().includes('repeat-inquiry'));
+    assert.ok(!tagPosts().includes('new-lead'));
+    assert.equal(await pushIt(sub(base, 3)), 'pushed-repeat');
+    calls.length = 0;
+    for (const n of [1, 2, 3]) assert.equal(await pushIt(sub(base, n)), 'not-pending', `sync cycle re-reads submission ${n}`);
+    assert.equal(calls.length, 0);
+    assert.ok(hasSubmission('meta:sub-1') && hasSubmission('meta:sub-2') && hasSubmission('meta:sub-3'));
+  });
+
+  test('a submission without an id behaves as before (a pushed row stays done)', async () => {
+    setEnv(LIVE);
+    const lead = newLead();
+    addContact(lead.email, {});
+    assert.equal(await pushIt(lead), 'pushed');
+    assert.equal(await pushIt({ ...lead, interest: 'Robotics' }), 'not-pending');
+  });
+
+  test('a failed push is not recorded, so the same submission is retried', async () => {
+    setEnv(LIVE);
+    const base = newLead();
+    addContact(base.email, {});
+    assert.equal(await pushIt(sub(base, 10)), 'pushed');
+    const realF = global.fetch; global.fetch = async () => ({ ok: false, status: 500, text: async () => '{}', json: async () => ({}) });
+    try { assert.equal(await pushIt(sub(base, 11)), 'error'); } finally { global.fetch = realF; }
+    assert.equal(hasSubmission('meta:sub-11'), false);
+    assert.equal(await pushIt(sub(base, 11)), 'pushed-repeat');
+  });
+
+  test('a LEGACY row: its own back-catalog submission is never pushed, a strictly newer one is', async () => {
+    setEnv(LIVE);
+    const base = newLead({ dateReceived: '2026-09-01' });
+    addContact(base.email, {});
+    const { id } = upsertLead(sub(base, 20));
+    db.exec(`UPDATE leads SET ghl_pushed = 'legacy' WHERE id = ${id}`);
+    assert.equal(await pushIt(sub(base, 20)), 'not-pending', 'old submission');
+    assert.equal(await pushIt(sub(base, 21, { dateReceived: '2026-09-01' })), 'not-pending', 'same day as the legacy row');
+    calls.length = 0;
+    assert.equal(await pushIt(sub(base, 22, { dateReceived: '2026-10-05' })), 'pushed-repeat');
+    assert.ok(tagPosts().includes('repeat-inquiry'));
+  });
+
+  test('live: a submission dated before the cutoff never pushes; excluded rows never repeat-push', async () => {
+    setEnv(LIVE);
+    const base = newLead({ dateReceived: '2026-10-02' });
+    addContact(base.email, {});
+    assert.equal(await pushIt(sub(base, 30)), 'pushed');
+    calls.length = 0;
+    assert.equal(await pushIt(sub(base, 31, { dateReceived: '2026-09-20' })), 'not-pending');
+    const spam = newLead({ status: 'Spam' });
+    assert.equal(await pushIt(sub(spam, 32)), 'excluded_spam');
+    assert.equal(await pushIt(sub(spam, 33, { dateReceived: '2026-10-06' })), 'not-pending');
+    assert.equal(calls.length, 0);
+  });
+
+  test('test/internal and BARR submissions never repeat-push', async () => {
+    setEnv(LIVE);
+    const base = newLead();
+    addContact(base.email, {});
+    await pushIt(sub(base, 40));
+    calls.length = 0;
+    const r = await pushIt(sub({ ...base, name: 'TEST DMA' }, 41, { dateReceived: '2026-10-06' }));
+    assert.equal(r, 'excluded_test');
+    assert.deepEqual(writes(), []);
+  });
+
+  test('dry run: WOULD ... [repeat submission] once per submission, nothing written or recorded', async () => {
+    const base = newLead();
+    const { id } = upsertLead(sub(base, 50));
+    db.exec(`UPDATE leads SET ghl_pushed = 'pushed' WHERE id = ${id}`); // as if pushed earlier
+    addContact(base.email, { tags: ['repeat-inquiry'] });
+    assert.equal(await pushIt(sub(base, 51)), 'dry-run');
+    assert.deepEqual(writes(), []);
+    assert.ok(logs.some((l) => /WOULD UPDATE.*\[repeat submission\]/.test(l)));
+    assert.equal(hasSubmission('meta:sub-51'), false);
+    const n = calls.length;
+    assert.equal(await pushIt(sub(base, 51)), 'dry-run-seen');
+    assert.equal(calls.length, n);
+  });
+
+  test('every source mapper sets its own submission id', () => {
+    const sync = require('../sync');
+    const { mapGoogleAdsLead } = require('../server');
+    const form = { id: 'f1', fields: [{ target: 'em', view: { label: 'Email', fieldType: 'CONTACTS_EMAIL' } }] };
+    const wix = sync.mapWixFormSubmission({ id: 'aaaa-bbbb', submissions: { em: 'a@b.c' }, createdDate: '2026-10-01T00:00:00Z' }, sync.buildFieldMetaMap(form), sync.taggedCategoriesInForm(form), 'Wix Form - X');
+    assert.equal(wix.submissionId, 'wix:aaaa-bbbb');
+    assert.equal(sync.mapMetaAdsRow({ id: 'l:123', email: 'a@b.c' }).submissionId, 'meta:l:123');
+    assert.equal(mapGoogleAdsLead([{ column_id: 'EMAIL', string_value: 'a@b.c' }], { lead_id: 'gl-9' }).submissionId, 'google:gl-9');
+    assert.equal(sync.mapCheckCherryLead({ id: 77, attributes: { email: 'a@b.c' } }).submissionId, 'checkcherry:77');
+    assert.equal(sync.mapMetaAdsRow({ id: '', email: 'a@b.c' }).submissionId, '');
+  });
+});
+
+// ============ 2. form tags: remove then add (like repeat-inquiry) ============
+describe('2. proposal-requested / quiz-completed are removed then re-added so they fire every time', () => {
+  const QUOTE = 'Wix Form - Check Availability.  Get a Quote.  Secure Your Date.';
+  test('an existing contact that already has proposal-requested: DELETE (both event tags it has) precedes the add', async () => {
+    setEnv(LIVE);
+    const lead = newLead({ source: QUOTE });
+    addContact(lead.email, { tags: ['proposal-requested', 'repeat-inquiry', 'unrelated'] });
+    await run(lead);
+    const del = calls.findIndex((c) => c.method === 'DELETE');
+    const add = calls.findIndex((c) => c.method === 'POST' && c.url.endsWith('/tags'));
+    assert.ok(del >= 0 && add > del);
+    assert.deepEqual([...calls[del].body.tags].sort(), ['proposal-requested', 'repeat-inquiry']);
+    assert.ok(calls[add].body.tags.includes('proposal-requested') && calls[add].body.tags.includes('repeat-inquiry'));
+  });
+  test('only tags the contact actually has are removed; a contact without them just gets them added', async () => {
+    setEnv(LIVE);
+    const lead = newLead({ source: QUOTE });
+    addContact(lead.email, { tags: ['repeat-inquiry'] });
+    await run(lead);
+    assert.deepEqual(calls.find((c) => c.method === 'DELETE').body.tags, ['repeat-inquiry']);
+    assert.ok(tagPosts().includes('proposal-requested'));
+  });
+  test('quiz-completed gets the same treatment (config pattern), advanced contacts included', async () => {
+    setEnv(LIVE);
+    const lead = newLead({ source: 'Wix Form - Activation Quiz' });
+    addContact(lead.email, { tags: ['quiz-completed', 'deposit'] });
+    await run(lead);
+    assert.ok(calls.find((c) => c.method === 'DELETE').body.tags.includes('quiz-completed'));
+    assert.ok(tagPosts().includes('quiz-completed'));
+  });
+  test('a NEW contact: nothing to remove', async () => {
+    setEnv(LIVE);
+    await run(newLead({ source: QUOTE }));
+    assert.equal(calls.filter((c) => c.method === 'DELETE').length, 0);
+    assert.ok(tagPosts().includes('proposal-requested'));
+  });
+  test('dry run shows remove-then-add for both', async () => {
+    const lead = newLead({ source: QUOTE });
+    addContact(lead.email, { tags: ['proposal-requested', 'repeat-inquiry'] });
+    await run(lead);
+    assert.match(logs.find((l) => l.includes('WOULD UPDATE')), /remove-then-add=\[repeat-inquiry, proposal-requested\]/);
+    assert.deepEqual(writes(), []);
+  });
+});
+
+// ============ 7. implied consent for Canadian phone numbers ===================
+describe('7. Canadian phone -> Marketing Consent "Yes" (implied), tagged consent-implied-inquiry', () => {
+  const CA = '+1 416 204 1234'; const CA_LOCAL = '416-204-1234'; const US = '+1 212 555 1234';
+  const consentOf = (body) => field(body, FIELDS.MARKETING_CONSENT);
+  const created = async (over) => { reset(); setEnv(LIVE); await run(newLead(over)); return post().body; };
+  const existingRun = async (cf, over, contactExtra = {}) => { reset(); setEnv(LIVE); const lead = newLead(over); addContact(lead.email, { customFields: cf, ...contactExtra }); await run(lead); return put() ? put().body : { customFields: [] }; };
+
+  test('Canadian number, consent empty (new contact) -> "Yes" + consent-implied-inquiry', async () => {
+    assert.strictEqual(consentOf(await created({ phone: CA })), 'Yes');
+    assert.ok(tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('Canadian local format (no +1) is read as Canadian too', async () => {
+    assert.strictEqual(consentOf(await created({ phone: CA_LOCAL })), 'Yes');
+  });
+  test('existing contact: empty -> Yes and "Unknown" -> Yes, both tagged', async () => {
+    for (const cf of [[], [{ id: FIELDS.MARKETING_CONSENT, value: 'Unknown' }]]) {
+      assert.strictEqual(consentOf(await existingRun(cf, { phone: CA })), 'Yes', JSON.stringify(cf));
+      assert.ok(tagPosts().includes('consent-implied-inquiry'));
+    }
+  });
+  test('Canadian number with an existing "No": stays No, no write, no tag', async () => {
+    const body = await existingRun([{ id: FIELDS.MARKETING_CONSENT, value: 'No' }], { phone: CA });
+    assert.strictEqual(consentOf(body), undefined);
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('Canadian number with an existing "Yes": untouched, no implied tag', async () => {
+    const body = await existingRun([{ id: FIELDS.MARKETING_CONSENT, value: 'Yes' }], { phone: CA });
+    assert.strictEqual(consentOf(body), undefined);
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('US number, consent empty: stays empty, no tag', async () => {
+    assert.strictEqual(consentOf(await created({ phone: US })), undefined);
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+    assert.strictEqual(consentOf(await existingRun([], { phone: US })), undefined);
+  });
+  test('US number with an EXPLICIT Yes -> "Yes", and no implied tag (it is explicit)', async () => {
+    assert.strictEqual(consentOf(await created({ phone: US, marketingConsent: 'Yes' })), 'Yes');
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('Canadian number with an explicit Yes: Yes, but not tagged as implied', async () => {
+    assert.strictEqual(consentOf(await created({ phone: CA, marketingConsent: 'yes' })), 'Yes');
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('Canadian number but the form says an explicit No: no implied consent', async () => {
+    assert.strictEqual(consentOf(await created({ phone: CA, marketingConsent: 'No thanks' })), undefined);
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('no phone: left as is (new and existing)', async () => {
+    assert.strictEqual(consentOf(await created({})), undefined);
+    assert.strictEqual(consentOf(await existingRun([], {})), undefined);
+  });
+  test('the lead has no phone but the existing contact has a Canadian one on file: implied', async () => {
+    assert.strictEqual(consentOf(await existingRun([], {}, { phone: CA })), 'Yes');
+    assert.ok(tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('invalid and non-Canadian foreign numbers do nothing', async () => {
+    for (const phone of ['555-1212', '+44 7911 123456', 'not a phone', '+1 416 555']) {
+      assert.strictEqual(consentOf(await created({ phone })), undefined, phone);
+    }
+  });
+  test('advanced / dead-deal contacts: no implied consent (minimal update)', async () => {
+    const body = await existingRun([], { phone: CA }, { tags: ['deposit'] });
+    assert.strictEqual(consentOf(body), undefined);
+    assert.ok(!tagPosts().includes('consent-implied-inquiry'));
+  });
+  test('dry run reports it (tag + Marketing Consent set) and writes nothing', async () => {
+    reset(); setEnv({});
+    await run(newLead({ phone: CA }));
+    assert.deepEqual(writes(), []);
+    const line = logs.find((l) => l.includes('WOULD CREATE'));
+    assert.match(line, /consent-implied-inquiry/);
+    assert.match(line, /set=\[[^\]]*Marketing Consent/);
+  });
+  test('libphonenumber, not "+1": Canadian vs US area codes', () => {
+    const { isCanadianPhone } = require('../phone');
+    assert.equal(isCanadianPhone('+14165551234'), true);
+    assert.equal(isCanadianPhone('(647) 226-6568'), true);
+    assert.equal(isCanadianPhone('+12125551234'), false);
+    assert.equal(isCanadianPhone('212-555-1234'), false);
+    assert.equal(isCanadianPhone(''), false);
+  });
+});
+
+// ============ 4. corrupted upstream values (the "Annie Lamb" payload shape) ======
+describe('4. "key: value" parse artifacts never become data, and never block the real value', () => {
+  const ARTIFACTS = { eventType: 'estimated_guest_count:', city: 'package_name: Pro Photographer' };
+
+  test('an artifact in a lead field is ignored (not written, not matched, not in the note) with a warning', () => {
+    const plan = buildLeadPlan({ email: 'a@b.c', ...ARTIFACTS, interest: 'package_name: Pro Photographer' }, { isNewContact: true, profile: push.SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set() } });
+    assert.equal(field({ customFields: plan.customFields }, FIELDS.EVENT_TYPE), undefined);
+    assert.equal(plan.contactFields.city, undefined);
+    assert.equal(plan.note, null);
+    assert.equal(plan.warnings.filter((w) => /parse artifact/.test(w)).length, 3);
+  });
+
+  test('existing contact whose Event Type holds an artifact: the real Event Type replaces it; Event Address / Sync Key are never ours to touch', async () => {
+    setEnv(LIVE);
+    const lead = newLead({ eventType: 'Corporate' });
+    addContact(lead.email, { customFields: [
+      { id: FIELDS.EVENT_TYPE, value: 'estimated_guest_count:' },
+      { id: 'pfWvB4ENk5TaBa4ranRO', value: 'package_name: Pro Photographer' }, // Event Address
+      { id: 'AoHOrIiBu4NnC8XLDmaL', value: 'lead:x|event_type:' }, // Sync Key
+    ] });
+    await run(lead);
+    assert.equal(field(put().body, FIELDS.EVENT_TYPE), 'Corporate');
+    const ids = put().body.customFields.map((f) => f.id);
+    assert.ok(!ids.includes('pfWvB4ENk5TaBa4ranRO') && !ids.includes('AoHOrIiBu4NnC8XLDmaL'));
+  });
+
+  test('a VALID existing Event Type is still never overwritten', async () => {
+    setEnv(LIVE);
+    const lead = newLead({ eventType: 'Corporate' });
+    addContact(lead.email, { customFields: [{ id: FIELDS.EVENT_TYPE, value: 'Gala' }] });
+    await run(lead);
+    assert.equal(field(put().body, FIELDS.EVENT_TYPE), undefined);
+  });
+
+  test('the CheckCherry payload shape (empty event type shifting the next line into it) maps to blanks, not garbage', () => {
+    const sync = require('../sync');
+    const lead = sync.mapCheckCherryLead({ id: 1, attributes: { email: 'pdc@example.ca', first_name: 'A', last_name: 'L', package_name: 'Pro Photographer', lead_event_type: 'estimated_guest_count:', venue_city: 'package_name: Pro Photographer' } });
+    const plan = buildLeadPlan(push.toPlanBody(lead), { isNewContact: true, profile: push.SOURCE_PROFILES.checkcherry, context: { proposalEmails: new Set() } });
+    assert.equal(field({ customFields: plan.customFields }, FIELDS.EVENT_TYPE), undefined);
+    assert.equal(plan.contactFields.city, undefined);
+    assert.deepEqual(field({ customFields: plan.customFields }, FIELDS.INTEREST) || [], []); // "Pro Photographer" is not a known interest
+    assert.ok(!/estimated_guest_count|package_name/.test(plan.note || ''));
+  });
+
+  test('real values containing a colon are not mistaken for artifacts', () => {
+    const { isParseArtifact } = require('../lead-shape');
+    for (const v of ['Gala: black tie', 'Note: call me', 'Corporate', '']) assert.equal(isParseArtifact(v), false, v);
+    for (const v of ['estimated_guest_count:', 'package_name: Pro Photographer', 'event_type:']) assert.equal(isParseArtifact(v), true, v);
   });
 });

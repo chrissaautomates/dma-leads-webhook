@@ -26,10 +26,10 @@
 
 const ghl = require('./ghl-client');
 const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
-const { formNameFromSource } = require('./lead-shape');
+const { formNameFromSource, isParseArtifact } = require('./lead-shape');
 const { testLeadReason, barrExclusionReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES, CC_PROPOSAL_SENT_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag } = require('./db');
+const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -304,7 +304,7 @@ function toPlanBody(lead) {
     owner: lead.owner,
     formName: formNameFromSource(lead.source),
     noteLines: [
-      lead.location && `Location: ${lead.location}`,
+      lead.location && !isParseArtifact(lead.location) && `Location: ${lead.location}`, // an upstream "key: value" fragment is not a location
       lead.notes && `Notes: ${lead.notes}`,
       lead.extra && `Other form answers: ${lead.extra}`,
       lead.source && `Original source: ${lead.source}`,
@@ -332,6 +332,10 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     hasNewLeadTag: hasTag(TAGS.LEAD_NEW),
     hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
     hasRepeatInquiryTag: hasTag(TAGS.REPEAT_INQUIRY),
+    // for event-tag remove->add and the Canadian-phone implied consent (ghl-lead-plan.js)
+    existingTags: existing ? (existing.tags || []) : [],
+    existingPhone: existing ? existing.phone : '',
+    existingConsent: existing ? customFieldValue(existing, FIELDS.MARKETING_CONSENT) : '',
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
   // Existing contact: interest is merged into what they already have, never replaced.
@@ -408,45 +412,70 @@ async function pushAfterUpsert(lead, result, context = {}) {
     if (!result || result.action === 'skipped_deleted') return 'deleted';
 
     const row = getGhlState(result.id);
-    // Legacy / pushed / excluded rows are terminal. Only a pending (NULL) row
-    // — freshly inserted, or inserted earlier but deferred/failed — proceeds.
-    if (!row || row.ghl_pushed) return 'not-pending';
-
-    const decision = assess(lead, row, cfg, context);
+    if (!row) return 'not-pending';
     const dry = mode === 'dry-run';
+    const sid = lead.submissionId ? String(lead.submissionId) : '';
+
+    // A PENDING (NULL) row — freshly inserted, or inserted earlier but deferred/failed — is
+    // the person's first push. A terminal row is normally done, BUT leads dedupe by email, so
+    // a later submission from the same person only updates the stored row. Each source
+    // submission has its own id (lead.submissionId), so a NEW submission on a 'pushed' or
+    // 'legacy' row is a repeat inquiry and reaches GHL exactly once (db.js `submissions`).
+    // Excluded rows (BARR / spam / test / source) never push. Email stays the contact match key.
+    let repeat = false;
+    let assessRow = row;
+    if (row.ghl_pushed) {
+      if (!sid || !(row.ghl_pushed === 'pushed' || row.ghl_pushed === 'legacy')) return 'not-pending';
+      if (hasSubmission(sid)) return 'not-pending';
+      const today = new Date().toISOString().slice(0, 10);
+      const submittedOn = lead.dateReceived || today;
+      // The back-catalog submission behind a 'legacy' row is never re-pushed: only strictly newer ones.
+      if (row.ghl_pushed === 'legacy' && !(submittedOn > row.date_received)) return 'not-pending';
+      // Live: GHL_PUSH_CUTOFF_DATE (assess). Dry run has no cutoff: look at the last 14 days only.
+      const since = cfg.cutoff || new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+      if (submittedOn < since) return 'not-pending';
+      repeat = true;
+      assessRow = { ...row, date_received: submittedOn };
+    }
+    const key = repeat ? `sub:${sid}` : row.id;
+    const tag = repeat ? ' [repeat submission]' : '';
+
+    const decision = assess(lead, assessRow, cfg, context);
 
     if (decision.kind === 'skip') return 'skip';
     if (decision.kind === 'defer') {
-      if (!dryRunLogged.has(`defer:${row.id}:${dry}`)) {
-        dryRunLogged.add(`defer:${row.id}:${dry}`);
-        console.log(`[ghl-push]${dry ? '[DRY-RUN]' : ''} DEFERRED ${lead.email || lead.name} — ${decision.reason}`);
+      if (!dryRunLogged.has(`defer:${key}:${dry}`)) {
+        dryRunLogged.add(`defer:${key}:${dry}`);
+        console.log(`[ghl-push]${dry ? '[DRY-RUN]' : ''} DEFERRED ${lead.email || lead.name}${tag} — ${decision.reason}`);
       }
       return 'defer';
     }
     if (decision.kind === 'exclude') {
       if (dry) {
-        if (!dryRunLogged.has(row.id)) {
-          dryRunLogged.add(row.id);
-          console.log(`[ghl-push][DRY-RUN] WOULD EXCLUDE ${lead.email || lead.name} (source="${lead.source}") — ${decision.reason}`);
+        if (!dryRunLogged.has(key)) {
+          dryRunLogged.add(key);
+          console.log(`[ghl-push][DRY-RUN] WOULD EXCLUDE ${lead.email || lead.name} (source="${lead.source}")${tag} — ${decision.reason}`);
         }
       } else {
-        markGhlPushed(row.id, decision.terminal);
-        console.log(`[ghl-push] EXCLUDED ${lead.email || lead.name} (source="${lead.source}") — ${decision.reason}`);
+        if (repeat) recordSubmission(sid, row.id); // the row is already terminal; just stop re-evaluating this submission
+        else markGhlPushed(row.id, decision.terminal);
+        console.log(`[ghl-push] EXCLUDED ${lead.email || lead.name} (source="${lead.source}")${tag} — ${decision.reason}`);
       }
       return decision.terminal;
     }
 
     // kind === 'push'
-    if (dry && dryRunLogged.has(row.id)) return 'dry-run-seen';
+    if (dry && dryRunLogged.has(key)) return 'dry-run-seen';
     const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context: { ...context, proposal: decision.proposal }, dryRun: dry });
     if (dry) {
-      dryRunLogged.add(row.id);
-      console.log(`[ghl-push][DRY-RUN] WOULD ${describeOutcome(lead, decision.profile, outcome)}`);
+      dryRunLogged.add(key);
+      console.log(`[ghl-push][DRY-RUN] WOULD ${describeOutcome(lead, decision.profile, outcome)}${tag}`);
       return 'dry-run';
     }
-    markGhlPushed(row.id, 'pushed');
-    console.log(`[ghl-push] DONE ${describeOutcome(lead, decision.profile, outcome)}`);
-    return 'pushed';
+    if (!repeat) markGhlPushed(row.id, 'pushed');
+    if (sid) recordSubmission(sid, row.id);
+    console.log(`[ghl-push] DONE ${describeOutcome(lead, decision.profile, outcome)}${tag}`);
+    return repeat ? 'pushed-repeat' : 'pushed';
   } catch (err) {
     console.error(`[ghl-push] push failed for ${lead && (lead.email || lead.name)} — row stays pending, will retry next cycle:`, err.message);
     return 'error';

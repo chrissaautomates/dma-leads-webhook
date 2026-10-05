@@ -68,7 +68,8 @@
 //    Advanced / dead-deal contacts get an empty fillBlank.
 
 const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = require('./ghl-canonical');
-const { parseConsent, toIsoDate, parseGuestCount } = require('./lead-shape');
+const { parseConsent, toIsoDate, parseGuestCount, isParseArtifact } = require('./lead-shape');
+const { isCanadianPhone } = require('./phone');
 const { formTags } = require('./config');
 
 function normalize(value) {
@@ -230,10 +231,19 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
 // for addTags(), note is a string or null ready for createNote(), and
 // warnings is a list of human-readable strings about anything that
 // couldn't be mapped (for logging — never exposed to the Wix caller).
-function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
+function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   if (!profile) throw new Error('buildLeadPlan requires a source profile');
   const warnings = [];
   const unmapped = [];
+  // A "key: value" line fragment from a broken upstream parser ("estimated_guest_count:")
+  // is never a real answer: drop it (and say so) rather than write it or match it.
+  const body = { ...rawBody };
+  ['eventType', 'budgetRange', 'city', 'interest', 'secondaryInterest', 'leadType', 'campaign', 'eventDate'].forEach((k) => {
+    if (body[k] && isParseArtifact(body[k])) {
+      warnings.push(`${k} "${normalize(body[k])}" looks like a parse artifact ("key: value") — ignored`);
+      body[k] = '';
+    }
+  });
   const { firstName, lastName } = splitName(body);
 
   const contactFields = {};
@@ -275,7 +285,24 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   const consentRaw = normalize(body.marketingConsent);
   const consentAnswer = parseConsent(consentRaw);
   if (consentRaw && !consentAnswer) unmapped.push({ label: 'Marketing Consent', value: consentRaw });
-  const consent = consentAnswer === 'Yes' ? 'Yes' : '';
+  let consent = consentAnswer === 'Yes' ? 'Yes' : '';
+
+  // --- Implied consent for a Canadian phone number (libphonenumber region CA, see phone.js):
+  // when there is no consent answer yet, set "Yes" if the field is empty or "Unknown". Never
+  // overrides an existing "No" (or Yes), never overrides an explicit "No" answer on this form,
+  // and does nothing for non-Canadian (incl. US) or missing numbers. Not applied to
+  // advanced / dead-deal contacts (their update is minimal). The caller (the backfill) can
+  // switch it off with context.noImpliedConsent. Tagged so it can be told from explicit consent.
+  let consentImplied = false;
+  const minimalBucket = !isNewContact && (context.advancedReason || context.reengageReason);
+  if (!consent && consentAnswer !== 'No' && !minimalBucket && !context.noImpliedConsent) {
+    const existingConsent = String(context.existingConsent || '').trim().toLowerCase();
+    if ((isNewContact || existingConsent === '' || existingConsent === 'unknown')
+      && isCanadianPhone(normalize(body.phone) || context.existingPhone)) {
+      consent = 'Yes';
+      consentImplied = true;
+    }
+  }
 
   // --- New-lead-only defaults (see design decision #1). Lead Score is
   // intentionally NOT written: blank until real scoring exists. ---
@@ -369,13 +396,12 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   tags.push(...interestTags);
   // Source-form tags (proposal request / quiz) apply to every lead, new or existing.
   tags.push(...formTags(body.formName));
-  // Repeat inquiry: EVERY existing contact. Removed first when already present so the
-  // GHL "Tag Added" trigger fires again on each inquiry (the caller does remove -> add).
-  const removeTags = [];
-  if (!isNewContact) {
-    tags.push(TAGS.REPEAT_INQUIRY);
-    if (context.hasRepeatInquiryTag) removeTags.push(TAGS.REPEAT_INQUIRY);
-  }
+  if (consentImplied) tags.push(TAGS.CONSENT_IMPLIED_INQUIRY);
+  // EVENT TAGS on an EXISTING contact: repeat-inquiry (always) plus the source-form tags.
+  // Each one the contact already has is removed first and then re-added, so a GHL
+  // "Tag Added" trigger fires on every inquiry (the caller does remove -> add).
+  const removeTags = eventTagsToRemove(body, isNewContact, context);
+  if (!isNewContact) tags.push(TAGS.REPEAT_INQUIRY);
 
   const note = buildNote(body, unmapped, profile.noteLabel, notedGuestCount);
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
@@ -398,7 +424,7 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
         ...(reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : []),
         TAGS.REPEAT_INQUIRY, ...formTags(body.formName),
       ])],
-      removeTags,
+      removeTags: eventTagsToRemove(body, false, context),
       note,
       warnings,
       newLead,
@@ -416,11 +442,21 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
     secondaryInterestSet,
     tags: [...new Set(tags)],
     removeTags,
+    consentImplied,
     note,
     warnings,
     newLead,
     route: !isNewContact ? 'repeat-inquiry' : (newLead.applied ? 'new-lead' : 'no-new-lead'),
   };
+}
+
+// The event tags this inquiry will (re)apply that the existing contact ALREADY carries:
+// repeat-inquiry and the source-form tags. They are removed before being added again.
+function eventTagsToRemove(body, isNewContact, context) {
+  if (isNewContact) return [];
+  const have = new Set((context.existingTags || []).map((t) => String(t).trim().toLowerCase()));
+  if (context.hasRepeatInquiryTag) have.add(TAGS.REPEAT_INQUIRY);
+  return [TAGS.REPEAT_INQUIRY, ...formTags(body.formName)].filter((t) => have.has(t));
 }
 
 // DMA Last Activity text: the source label, the form it came from, and what
@@ -484,6 +520,13 @@ function existingEventDate(contact) {
   return toIsoDate(String(v)) || null;
 }
 
+// shape key -> the field's valid options, for spotting corrupt picklist values (see resolveFillBlank)
+const PICKLIST_OPTIONS = {
+  eventType: FIELD_OPTIONS.EVENT_TYPE,
+  budgetRange: FIELD_OPTIONS.BUDGET_RANGE,
+  marketingConsent: FIELD_OPTIONS.MARKETING_CONSENT,
+};
+
 // Which plan.fillBlank entries to actually send for this existing contact:
 //  - a value goes into a field only if the field is EMPTY on the contact (never an
 //    overwrite), and the plan isn't already writing it in customFields/contactFields;
@@ -514,7 +557,12 @@ function resolveFillBlank(plan, contact, { standalone = false, blankOnly = false
       return;
     }
     if (alreadyCustom.has(entry.id)) return;
-    const current = customFieldValue(contact, entry.id);
+    let current = customFieldValue(contact, entry.id);
+    // A picklist field holding something that is not one of its options (e.g. an Event Type
+    // of "estimated_guest_count:" left by a broken upstream parser) is corrupt, not data:
+    // treat it as empty so the real value can replace it.
+    const options = PICKLIST_OPTIONS[entry.key];
+    if (current && options && !matchOption(current, options)) current = '';
     let write = !current;
     if (!write) {
       if (entry.key === 'marketingConsent') write = current.toLowerCase() === 'unknown'; // "Unknown" counts as empty

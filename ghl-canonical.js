@@ -139,6 +139,9 @@ const TAGS = {
   // Added to an EXISTING contact when CheckCherry reports a proposal for them
   // (ghl-push.js tagProposalSentContacts). Also one of ADVANCED_TAGS below.
   CC_PROPOSAL_SENT: 'cc-proposal-sent',
+  // Added whenever Marketing Consent is set to Yes because the phone number is Canadian
+  // (implied consent from the inquiry), so it can be told apart from explicit consent.
+  CONSENT_IMPLIED_INQUIRY: 'consent-implied-inquiry',
   // Bucket 2 (dead deals): applied by ghl-push.js instead of new-lead. A separate
   // GHL workflow / monthly broadcast enrolls this tag — and must respect DMA
   // Marketing Consent (CASL).

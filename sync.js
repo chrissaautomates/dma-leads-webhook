@@ -104,6 +104,7 @@ function mapCheckCherryLead(record) {
   else if (attrs.archived) status = 'Archived';
 
   const lead = {
+    submissionId: (record && record.id) || attrs.id ? `checkcherry:${(record && record.id) || attrs.id}` : '', // CheckCherry lead id
     source: 'CheckCherry',
     name,
     company: attrs.company || attrs.company_name || '',
@@ -797,7 +798,10 @@ function mapMetaAdsRow(rowObj) {
   const planning = pick(rowObj, [META_COLUMNS.planning]);
   const goal = pick(rowObj, [META_COLUMNS.goal]);
 
+  const leadgenId = pick(rowObj, [META_COLUMNS.id]);
+
   return {
+    submissionId: leadgenId ? `meta:${leadgenId}` : '', // Meta leadgen id (the sheet's id column)
     source: 'Meta Ads',
     name,
     company: '',
@@ -1089,6 +1093,9 @@ function mapWixFormSubmission(record, fieldMetaByTarget, tagged, sourceLabel) {
   if (!email) return null;
 
   return {
+    // The source's own submission id (Wix submission UUID): lets each NEW submission reach GHL
+    // even though leads dedupe by email. Transient: not stored on the lead row.
+    submissionId: record.id ? `wix:${record.id}` : '',
     source: sourceLabel,
     name: [firstName, lastName].filter(Boolean).join(' '),
     company: '',

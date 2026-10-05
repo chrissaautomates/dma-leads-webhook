@@ -130,6 +130,15 @@ db.exec(`CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT
 // One row per CheckCherry proposal event already handled by the "cc-proposal-sent" tagging
 // (ghl-push.js tagProposalSentContacts), so each event is tagged at most once and the
 // 15-minute sync never re-tags. Additive (CREATE IF NOT EXISTS); only written in live mode.
+// One row per source SUBMISSION (Wix submission id, Meta leadgen id, Google lead id, CheckCherry
+// lead id; namespaced "wix:…" etc.) already delivered to GHL. Leads dedupe by email in `leads`,
+// so a second submission from the same person only updates the stored row; this table is what
+// lets every NEW submission reach GHL (as a repeat inquiry) exactly once. Additive; written
+// only in live mode.
+db.exec(`CREATE TABLE IF NOT EXISTS submissions (
+  sid TEXT PRIMARY KEY, row_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
 db.exec(`CREATE TABLE IF NOT EXISTS cc_proposal_tags (
   event_id TEXT PRIMARY KEY, email TEXT, outcome TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
 )`);
@@ -498,6 +507,14 @@ function hasProposalEmail(email) {
   return !!db.prepare(`SELECT 1 FROM proposal_emails WHERE email = ?`).get(e);
 }
 
+function hasSubmission(sid) {
+  return !!db.prepare(`SELECT 1 FROM submissions WHERE sid = ?`).get(String(sid));
+}
+
+function recordSubmission(sid, rowId) {
+  db.prepare(`INSERT OR IGNORE INTO submissions (sid, row_id) VALUES (?, ?)`).run(String(sid), rowId || null);
+}
+
 function getProposalTagOutcome(eventId) {
   const row = db.prepare(`SELECT outcome FROM cc_proposal_tags WHERE event_id = ?`).get(String(eventId));
   return row ? row.outcome : null;
@@ -525,6 +542,8 @@ module.exports = {
   setProposalEmails,
   getProposalState,
   hasProposalEmail,
+  hasSubmission,
+  recordSubmission,
   getProposalTagOutcome,
   recordProposalTag,
   markGhlPushed,

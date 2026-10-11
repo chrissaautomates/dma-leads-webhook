@@ -13,7 +13,8 @@
 // Rules: matches by email, then phone (ghl-client findDuplicateContact); NEVER creates a contact;
 // FIRST TOUCH WINS — a value is written only into a field that is currently blank (the same
 // resolveFillBlank the live push uses); per person the OLDEST record carrying any attribution
-// signal (a click id or a utm_*) is used; spam records are ignored; a person with no signal is
+// signal (a click id or a utm_*) is used; spam records and test data (gclid starting with TEST, or
+// utm_campaign "test") are ignored and never tagged; a person with no signal is
 // "no attribution" and nothing is written for them (no "Direct / Unknown" guesses).
 // Channel rule: attribution.js deriveChannel (only a click id proves "Google Ads").
 
@@ -23,6 +24,8 @@ const { FIELDS, TAGS } = require('../ghl-canonical');
 
 const firstOf = (v) => (Array.isArray(v) ? (v[0] || '') : (v || ''));
 const maskEmail = (e) => { const [l = '', d = ''] = String(e).split('@'); return `${l.slice(0, 1)}***@${d.slice(0, 1)}***`; };
+// Test data (the owner's own tracking tests): a gclid starting with TEST, or utm_campaign "test".
+const isTestRecord = (a) => /^test/i.test(a.gclid || '') || String(a.utmCampaign || '').trim().toLowerCase() === 'test';
 const hasSignal = (a) => !!(a.gclid || a.gbraid || a.wbraid || a.utmSource || a.utmMedium || a.utmCampaign || a.utmContent || a.utmTerm);
 
 // CheckCherry /leads or /events record -> { email, phone, createdAt, status, kind, ...attribution }
@@ -31,17 +34,19 @@ function toCandidate(record, kind) {
   const lead = kind === 'lead'
     ? { email: attrs.email, phone: attrs.phone_normalized || attrs.phone }
     : { email: firstOf(attrs.customer_emails), phone: firstOf(attrs.customer_phones) };
+  const attribution = extractAttribution(attrs);
   return {
     kind, id: String((record && record.id) || attrs.id || ''), email: String(lead.email || '').trim().toLowerCase(),
     phone: String(lead.phone || '').trim(), createdAt: String(attrs.created_at || ''),
     source: 'CheckCherry', status: attrs.spam ? 'Spam' : 'New', spam: !!attrs.spam,
-    ...extractAttribution(attrs),
+    ...attribution,
+    test: isTestRecord(attribution),
   };
 }
 
 // Oldest-first, one candidate per person (email, else phone): the first record with a signal.
 function pickPerPerson(candidates) {
-  const sorted = [...candidates].filter((c) => !c.spam && (c.email || c.phone)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const sorted = [...candidates].filter((c) => !c.spam && !c.test && (c.email || c.phone)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const people = new Map();
   for (const c of sorted) {
     const key = c.email || `tel:${c.phone}`;
@@ -57,7 +62,7 @@ function pickPerPerson(candidates) {
 async function run(candidates, deps, { apply = false, limit = Infinity, pauseMs = 0, log = () => {}, fieldIds = FIELDS } = {}) {
   const people = pickPerPerson(candidates);
   const s = {
-    mode: apply ? 'APPLY' : 'DRY-RUN', records: candidates.length, spamIgnored: candidates.filter((c) => c.spam).length,
+    mode: apply ? 'APPLY' : 'DRY-RUN', records: candidates.length, spamIgnored: candidates.filter((c) => c.spam).length, testIgnored: candidates.filter((c) => c.test && !c.spam).length,
     people: people.length, noAttribution: 0, notInGhl: 0, matched: 0, updated: 0, skipped: 0, valuesFilled: 0, tagged: 0, errors: 0,
     fieldsNotConfigured: [], byChannel: {},
   };
@@ -104,7 +109,7 @@ async function run(candidates, deps, { apply = false, limit = Infinity, pauseMs 
 
 function printSummary(s, log = console.log) {
   log(`\n=== Attribution backfill (${s.mode}) ===`);
-  log(`CheckCherry records scanned: ${s.records} (spam ignored: ${s.spamIgnored}); distinct people: ${s.people}`);
+  log(`CheckCherry records scanned: ${s.records} (spam ignored: ${s.spamIgnored}; test data ignored: ${s.testIgnored}); distinct people: ${s.people}`);
   log(`no attribution (no click id / UTM on any record): ${s.noAttribution}`);
   log(`not found in GHL (by email, then phone): ${s.notInGhl}`);
   log(`matched in GHL: ${s.matched}`);

@@ -166,6 +166,15 @@ describe('backfill', () => {
     assert.ok(!('f-gclid' in body));
   });
 
+  test('test data (TEST* gclid or utm_campaign "test") is skipped and never tagged', async () => {
+    const d = deps({ 'a@b.com': { id: 'c-a', tags: [], customFields: [] }, 'c@d.com': { id: 'c-c', tags: [], customFields: [] } });
+    const recs = [backfill.toCandidate({ id: 1, attributes: { email: 'a@b.com', gclid: 'TEST123', utm_source: 'google', created_at: '2026-10-01T00:00:00Z' } }, 'lead'),
+      backfill.toCandidate({ id: 2, attributes: { email: 'c@d.com', gclid: 'real', utm_campaign: ' Test ', created_at: '2026-10-01T00:00:00Z' } }, 'lead')];
+    const s = await backfill.run(recs, d, { apply: true, fieldIds: ids });
+    assert.equal(s.testIgnored, 2); assert.equal(s.matched, 0);
+    assert.equal(d.calls.updates.length + d.calls.tags.length, 0);
+  });
+
   test('--apply refuses to write while GHL fields are not configured', async () => {
     const d = deps({ 'a@b.com': { id: 'c-a', tags: [], customFields: [] } });
     const s = await backfill.run([cand({ gclid: 'G' })], d, { apply: true, fieldIds: {} });

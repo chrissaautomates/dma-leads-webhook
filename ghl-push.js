@@ -29,7 +29,7 @@ const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldV
 const { formNameFromSource, isParseArtifact } = require('./lead-shape');
 const { testLeadReason, barrExclusionReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES, CC_PROPOSAL_SENT_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission } = require('./db');
+const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission, getSubmissionsBaselineDate } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -452,8 +452,10 @@ async function pushAfterUpsert(lead, result, context = {}) {
     if (row.ghl_pushed) {
       if (!sid || !(row.ghl_pushed === 'pushed' || row.ghl_pushed === 'legacy')) return 'not-pending';
       if (hasSubmission(sid)) return 'not-pending';
+      const baseline = getSubmissionsBaselineDate();
       const today = new Date().toISOString().slice(0, 10);
       const submittedOn = lead.dateReceived || today;
+      if (baseline && submittedOn <= baseline) return 'not-pending'; // handled before submission ids were recorded (db.js baseline)
       // The back-catalog submission behind a 'legacy' row is never re-pushed: only strictly newer ones.
       if (row.ghl_pushed === 'legacy' && !(submittedOn > row.date_received)) return 'not-pending';
       // Live: GHL_PUSH_CUTOFF_DATE (assess). Dry run has no cutoff: look at the last 14 days only.

@@ -296,7 +296,8 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   // switch it off with context.noImpliedConsent. Tagged so it can be told from explicit consent.
   let consentImplied = false;
   const minimalBucket = !isNewContact && (context.advancedReason || context.reengageReason);
-  if (!consent && consentAnswer !== 'No' && !minimalBucket && !context.noImpliedConsent) {
+  // CheckCherry leads ONLY: Wix and Google lead-form leads never saw the CheckCherry consent checkbox.
+  if (profile.key === 'checkcherry' && !consent && consentAnswer !== 'No' && !minimalBucket && !context.noImpliedConsent) {
     const existingConsent = String(context.existingConsent || '').trim().toLowerCase();
     if ((isNewContact || existingConsent === '' || existingConsent === 'unknown')
       && isCanadianPhone(normalize(body.phone) || context.existingPhone)) {

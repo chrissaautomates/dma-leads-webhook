@@ -11,14 +11,16 @@
 // comments:
 //
 // 1. NEW-LEAD DEFAULTS ONLY APPLY TO A BRAND-NEW CONTACT.
-//    DMA Lead Source = "Website Form", DMA Lead Status = "New", and
-//    Lead Score = 0 are only ever included in the payload when creating a
-//    new contact. Sending them on every update would silently regress a
+//    DMA Lead Source = "Website Form", DMA Lead Status = "New",
+//    Marketing Consent = "Unknown" (only when nothing explicit was supplied)
+//    are only ever included in the payload when creating a new contact. Lead
+//    Score is never written: it stays blank until real scoring exists. Sending them on every update would silently regress a
 //    lead sales has already progressed (status "Hot", score 25) back down
 //    to "New"/0 on every repeat Wix submission — a real, dangerous
 //    regression, not just an "erase a blank value" case, so it's called out
 //    separately from the general no-overwrite-with-blank rule below.
-//    DMA Last Activity = "Wix Form Submission" is the one exception: it
+//    DMA Last Activity (e.g. "Wix Form Submission — <form> — <what they asked
+//    for>") is the one exception: it
 //    updates on every submission (new or repeat) because it describes the
 //    most recent event, not a cumulative/regressable state — a repeat
 //    submission genuinely is the most recent activity.
@@ -52,12 +54,24 @@
 //    Reengage and skip contacts get a MINIMAL update: last-activity + note,
 //    no other field changes.
 //
-// 5. Marketing consent is written ONLY when Wix explicitly supplied a
-//    yes/no answer. No value is ever written for "not supplied" (not even
-//    "Unknown") — see the module-level MARKETING_CONSENT handling below for
-//    why "Unknown" is deliberately never written by this webhook.
+// 5. Marketing consent: an explicit yes/no answer is written as Yes/No. When
+//    nothing explicit was supplied, "Unknown" is written ONLY on a brand-new
+//    contact (so the field is never blank on a fresh lead). It is never
+//    written on an existing contact: the field is merged by id on update, so
+//    writing "Unknown" there would silently downgrade a contact who had given
+//    explicit consent.
+//
+// 7. FILL-BLANK (plan.fillBlank). For an existing, non-advanced contact the
+//    plan also lists every mapped value as a candidate to fill IF the contact's
+//    field is currently blank (see resolveFillBlank). Never overwrites, never
+//    includes defaults (Lead Source/Status/Consent=Unknown) or Last Activity.
+//    Advanced / dead-deal contacts get an empty fillBlank.
 
-const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP } = require('./ghl-canonical');
+const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = require('./ghl-canonical');
+const { parseConsent, toIsoDate, parseGuestCount, isParseArtifact } = require('./lead-shape');
+const { isCanadianPhone } = require('./phone');
+const { formTags } = require('./config');
+const { attributionValues, deriveChannel, GOOGLE_ADS_CHANNEL } = require('./attribution');
 
 function normalize(value) {
   return String(value == null ? '' : value).trim();
@@ -74,9 +88,22 @@ function normalizeKey(value) {
 // case-insensitive exact match rather than fuzzy matching that could
 // silently pick the wrong option).
 function matchOption(value, options) {
-  const key = normalizeKey(value);
+  const key = squash(value);
   if (!key) return null;
-  return options.find((opt) => opt.toLowerCase() === key) || null;
+  return options.find((opt) => squash(opt) === key) || null;
+}
+
+// Comparison key tolerant of case, spacing, underscores (Meta exports
+// "product_launch") and dash variants ("$2,500 – $5,000" vs "$2,500-$5,000").
+function squash(value) {
+  return normalizeKey(value).replace(/[\u2012-\u2015\u2212]/g, '-').replace(/[_\s]+/g, '');
+}
+
+function matchEventType(value) {
+  const direct = matchOption(value, FIELD_OPTIONS.EVENT_TYPE);
+  if (direct) return direct;
+  const key = normalizeKey(value).replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+  return EVENT_TYPE_ALIASES[key] || null;
 }
 
 function splitName(body) {
@@ -101,9 +128,26 @@ function leadTypeTag(leadType) {
 // interest / secondaryInterest -> { tag, fieldOption } via INTEREST_MAP.
 // Returns null for an unrecognized value (never guessed/inferred).
 function lookupInterest(value) {
-  const key = normalizeKey(value);
+  const key = normalizeKey(value).replace(/[_\s]+/g, ' ');
   if (!key) return null;
   return INTEREST_MAP[key] || null;
+}
+
+// An interest answer may hold several choices ("Glambot, Robotics" — a multi-
+// select). Whole-string match first; otherwise split on , ; | / newline and
+// look each piece up. Returns { hits: [{token, entry}], unmatched: [token] }.
+function interestTokens(value) {
+  const whole = lookupInterest(value);
+  if (whole) return { hits: [{ token: normalize(value), entry: whole }], unmatched: [] };
+  const tokens = normalize(value).split(/[,;|\n]+|\s+and\s+/i).map((t) => t.trim()).filter(Boolean);
+  const hits = [];
+  const unmatched = [];
+  tokens.forEach((t) => {
+    const entry = lookupInterest(t);
+    if (entry) hits.push({ token: t, entry });
+    else unmatched.push(t);
+  });
+  return { hits, unmatched };
 }
 
 // Builds the DMA_Interest MULTIPLE_OPTIONS value and the interest-* tags to
@@ -112,7 +156,7 @@ function lookupInterest(value) {
 // where "secondary interest" lives, per Phase 1's design (DMA_Interest is
 // multi-select specifically so a second value doesn't need its own field).
 function resolveInterests(body) {
-  const hits = [lookupInterest(body.interest), lookupInterest(body.secondaryInterest)].filter(Boolean);
+  const hits = [...interestTokens(body.interest).hits, ...interestTokens(body.secondaryInterest).hits].map((h) => h.entry);
   const fieldOptions = [...new Set(hits.map((h) => h.fieldOption))];
   const tags = [...new Set(hits.map((h) => h.tag).filter(Boolean))];
   return { fieldOptions, tags };
@@ -121,10 +165,12 @@ function resolveInterests(body) {
 // Free-text note: the original message, plus (only when present) any
 // submitted value that didn't cleanly map to a canonical field option —
 // preserved here rather than dropped, per design decision #4 above.
-function buildNote(body, unmapped, noteLabel) {
+function buildNote(body, unmapped, noteLabel, notedGuestCount) {
   const lines = [];
   if (normalize(body.message)) lines.push(`Message: ${normalize(body.message)}`);
-  if (normalize(body.guestCount)) lines.push(`Guest Count (no canonical field for this yet): ${normalize(body.guestCount)}`);
+  // Guest Count only lands in the note when it can't be written as a number
+  // (no field configured yet, or a range/text answer). See buildLeadPlan.
+  if (notedGuestCount) lines.push(`Guest Count (submitted): ${notedGuestCount}`);
   (body.noteLines || []).forEach((l) => { if (normalize(l)) lines.push(normalize(l)); });
   unmapped.forEach(({ label, value }) => {
     lines.push(`${label} (submitted value did not match a canonical option): ${value}`);
@@ -157,7 +203,10 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
   if (!isNewContact && context.hasNewLeadTag) {
     return { applied: false, reason: 'existing contact already has the new-lead tag (not re-applied)' };
   }
-  return { applied: true, reason: isNewContact ? 'new contact' : 'existing contact, not advanced' };
+  // new-lead is applied ONLY when the contact is created. An existing contact that
+  // inquires again gets repeat-inquiry instead (buildLeadPlan), never new-lead.
+  if (!isNewContact) return { applied: false, reason: 'existing contact — repeat inquiry (new-lead is applied only on creation)' };
+  return { applied: true, reason: 'new contact' };
 }
 
 // Core mapping function. `isNewContact` must be determined by the caller
@@ -183,10 +232,19 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
 // for addTags(), note is a string or null ready for createNote(), and
 // warnings is a list of human-readable strings about anything that
 // couldn't be mapped (for logging — never exposed to the Wix caller).
-function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
+function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   if (!profile) throw new Error('buildLeadPlan requires a source profile');
   const warnings = [];
   const unmapped = [];
+  // A "key: value" line fragment from a broken upstream parser ("estimated_guest_count:")
+  // is never a real answer: drop it (and say so) rather than write it or match it.
+  const body = { ...rawBody };
+  ['eventType', 'budgetRange', 'city', 'interest', 'secondaryInterest', 'leadType', 'campaign', 'eventDate'].forEach((k) => {
+    if (body[k] && isParseArtifact(body[k])) {
+      warnings.push(`${k} "${normalize(body[k])}" looks like a parse artifact ("key: value") — ignored`);
+      body[k] = '';
+    }
+  });
   const { firstName, lastName } = splitName(body);
 
   const contactFields = {};
@@ -204,72 +262,136 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   if (isNewContact && profile.nativeSource) contactFields.source = profile.nativeSource;
 
   const customFields = [];
-  function setField(id, value) {
+  // Every mapped (non-default) value, tagged with its shape key, so the
+  // fill-blank pass and the backfill report can reason per field.
+  const mapped = [];
+  // EXISTING contact: only Last Activity and Interest (merged additively, see
+  // mergeInterestWithExisting) are written directly. Every other mapped value goes
+  // to `mapped` -> plan.fillBlank, written only into an empty field (event date and
+  // guest count: also when newer, see resolveFillBlank). Lead Score / Status are
+  // never written to an existing contact, and Owner only fills an empty one.
+  const DIRECT_ON_EXISTING = new Set([FIELDS.LAST_ACTIVITY, FIELDS.INTEREST]);
+  function setField(id, value, key) {
+    if (!id) return; // field not created in GHL yet (see FIELDS.GUEST_COUNT / LEAD_TYPE)
     if (value === undefined || value === null || value === '') return;
-    customFields.push({ id, fieldValue: value });
+    if (isNewContact || DIRECT_ON_EXISTING.has(id)) customFields.push({ id, fieldValue: value });
+    if (key) mapped.push({ key, kind: 'custom', id, value });
+  }
+  Object.entries({ firstName: 'firstName', lastName: 'lastName', city: 'city', company: 'companyName', phone: 'phone' }).forEach(([key, field]) => {
+    if (contactFields[field]) mapped.push({ key, kind: 'contact', field, value: contactFields[field] });
+  });
+
+  // --- Consent: written as exactly "Yes" when consent was given, otherwise NOT
+  // written at all (the field stays empty: no "No", no "Unknown") ---
+  const consentRaw = normalize(body.marketingConsent);
+  const consentAnswer = parseConsent(consentRaw);
+  if (consentRaw && !consentAnswer) unmapped.push({ label: 'Marketing Consent', value: consentRaw });
+  let consent = consentAnswer === 'Yes' ? 'Yes' : '';
+
+  // --- Implied consent for a Canadian phone number (libphonenumber region CA, see phone.js):
+  // when there is no consent answer yet, set "Yes" if the field is empty or "Unknown". Never
+  // overrides an existing "No" (or Yes), never overrides an explicit "No" answer on this form,
+  // and does nothing for non-Canadian (incl. US) or missing numbers. Not applied to
+  // advanced / dead-deal contacts (their update is minimal). The caller (the backfill) can
+  // switch it off with context.noImpliedConsent. Tagged so it can be told from explicit consent.
+  let consentImplied = false;
+  const minimalBucket = !isNewContact && (context.advancedReason || context.reengageReason);
+  if (!consent && consentAnswer !== 'No' && !minimalBucket && !context.noImpliedConsent) {
+    const existingConsent = String(context.existingConsent || '').trim().toLowerCase();
+    if ((isNewContact || existingConsent === '' || existingConsent === 'unknown')
+      && isCanadianPhone(normalize(body.phone) || context.existingPhone)) {
+      consent = 'Yes';
+      consentImplied = true;
+    }
   }
 
-  // --- New-lead-only defaults (see design decision #1) ---
+  // --- New-lead-only defaults (see design decision #1). Lead Score is
+  // intentionally NOT written: blank until real scoring exists. ---
   if (isNewContact) {
     setField(FIELDS.LEAD_SOURCE, profile.leadSourceOption);
     setField(FIELDS.LEAD_STATUS, 'New');
-    setField(FIELDS.LEAD_SCORE, 0);
+  }
+
+  // EXISTING contact: no standard field is overwritten. They are all candidates for
+  // the fill-blank pass (plan.fillBlank), which writes only into empty fields.
+  if (!isNewContact) {
+    ['firstName', 'lastName', 'email', 'phone', 'companyName', 'city'].forEach((k) => { delete contactFields[k]; });
   }
 
   // --- Always safe to update: describes the most recent event, not a
   // cumulative/regressable state ---
-  setField(FIELDS.LAST_ACTIVITY, `${profile.lastActivityLabel} — ${new Date().toISOString()}`);
+  setField(FIELDS.LAST_ACTIVITY, `${describeActivity(body, profile)} — ${new Date().toISOString()}`);
 
   // --- Campaign: submitted campaign, falling back to utmCampaign ---
-  const campaign = normalize(body.campaign) || normalize(body.utmCampaign);
-  setField(FIELDS.CAMPAIGN, campaign);
+  setField(FIELDS.CAMPAIGN, normalize(body.campaign) || normalize(body.utmCampaign), 'campaign');
 
-  // --- Event Date: DATE field, pass through whatever format Wix sends;
-  // GHL accepts several common date formats (see create-contact's own
-  // dateOfBirth field for the documented accepted list) — not
-  // reformatted/validated further here, since doing so risks silently
-  // misinterpreting an ambiguous DD/MM vs MM/DD date rather than just
-  // passing through what a structured Wix date picker already normalized.
-  setField(FIELDS.EVENT_DATE, normalize(body.eventDate));
+  // --- Marketing attribution (CheckCherry leads only; see attribution.js). Written to a new
+  // contact, and to an existing one ONLY into a blank field (first touch wins: these go through
+  // `mapped` -> fillBlank like every other fill-only value). The google-ads tag follows the
+  // channel of THIS inquiry and is additive.
+  attributionValues(body).forEach((v) => setField(FIELDS[v.fieldKey], v.value, v.key));
+  const googleAdsLead = attributionValues(body).some((v) => v.key === 'channel' && v.value === GOOGLE_ADS_CHANNEL);
 
-  // --- Event Type: only when it matches a real option ---
+  // --- Event Date: DATE field. Mappers normalize to ISO; anything still not
+  // an unambiguous date stays in the note rather than risk a day/month swap.
+  if (normalize(body.eventDate)) {
+    const iso = toIsoDate(body.eventDate);
+    if (iso) setField(FIELDS.EVENT_DATE, iso, 'eventDate');
+    else unmapped.push({ label: 'Event Date', value: normalize(body.eventDate) });
+  }
+
+  // --- Event Type: only when it matches a real option (or a known alias) ---
   if (normalize(body.eventType)) {
-    const matched = matchOption(body.eventType, FIELD_OPTIONS.EVENT_TYPE);
-    if (matched) setField(FIELDS.EVENT_TYPE, matched);
+    const matched = matchEventType(body.eventType);
+    if (matched) setField(FIELDS.EVENT_TYPE, matched, 'eventType');
     else unmapped.push({ label: 'Event Type', value: normalize(body.eventType) });
   }
 
   // --- Budget Range: only when it matches a real option ---
   if (normalize(body.budgetRange)) {
     const matched = matchOption(body.budgetRange, FIELD_OPTIONS.BUDGET_RANGE);
-    if (matched) setField(FIELDS.BUDGET_RANGE, matched);
+    if (matched) setField(FIELDS.BUDGET_RANGE, matched, 'budgetRange');
     else unmapped.push({ label: 'Budget Range', value: normalize(body.budgetRange) });
   }
 
-  // --- Interest / Secondary Interest ---
-  const { fieldOptions: interestOptions, tags: interestTags } = resolveInterests(body);
-  if (normalize(body.interest) && !lookupInterest(body.interest)) {
-    unmapped.push({ label: 'Interest', value: normalize(body.interest) });
+  // --- Guest Count (NUMERICAL): a plain number is written; a range writes its
+  // lower bound and keeps the original answer in the note; no field configured
+  // or no number at all -> note only. ---
+  let notedGuestCount = '';
+  if (normalize(body.guestCount)) {
+    const g = parseGuestCount(body.guestCount);
+    if (g.value !== null && FIELDS.GUEST_COUNT) {
+      setField(FIELDS.GUEST_COUNT, g.value, 'guestCount');
+      if (!g.exact) notedGuestCount = normalize(body.guestCount);
+    } else {
+      notedGuestCount = normalize(body.guestCount);
+    }
   }
-  if (normalize(body.secondaryInterest) && !lookupInterest(body.secondaryInterest)) {
-    unmapped.push({ label: 'Secondary Interest', value: normalize(body.secondaryInterest) });
-  }
-  if (interestOptions.length) setField(FIELDS.INTEREST, interestOptions);
 
-  // --- Marketing Consent: ONLY when explicitly yes/no. Never written for
-  // "not supplied" — not even "Unknown" — because this field is merged
-  // by id on update (see ghl-client.js), so omitting it entirely leaves
-  // whatever the contact already had untouched; writing "Unknown"
-  // unconditionally would instead silently downgrade a contact who
-  // previously gave explicit consent back to "Unknown" on every repeat
-  // submission that doesn't re-ask the question. ---
-  const consentKey = normalizeKey(body.marketingConsent);
-  if (['yes', 'true', '1'].includes(consentKey)) setField(FIELDS.MARKETING_CONSENT, 'Yes');
-  else if (['no', 'false', '0'].includes(consentKey)) setField(FIELDS.MARKETING_CONSENT, 'No');
-  else if (normalize(body.marketingConsent)) {
-    // Something was submitted but didn't parse as yes/no — don't guess.
-    unmapped.push({ label: 'Marketing Consent', value: normalize(body.marketingConsent) });
+  // --- Interest / Secondary Interest (multi-select; every recognized choice) ---
+  const { fieldOptions: interestOptions, tags: interestTags } = resolveInterests(body);
+  [['Interest', body.interest], ['Secondary Interest', body.secondaryInterest]].forEach(([label, value]) => {
+    const { unmatched } = interestTokens(value);
+    if (unmatched.length) unmapped.push({ label, value: unmatched.join(', ') });
+  });
+  if (interestOptions.length) setField(FIELDS.INTEREST, interestOptions, 'interest');
+  const interestSet = interestTokens(body.interest).hits.length > 0;
+  const secondaryInterestSet = interestTokens(body.secondaryInterest).hits.length > 0;
+
+  // --- Lead Type (single select) ---
+  const leadTypeKey = normalizeKey(body.leadType);
+  const leadTypeOption = FIELD_OPTIONS.LEAD_TYPE.find((o) => o.toLowerCase() === leadTypeKey) || null;
+  if (leadTypeOption) setField(FIELDS.LEAD_TYPE, leadTypeOption, 'leadType');
+
+  // --- Owner (single select; only a value matching a configured option) ---
+  if (normalize(body.owner)) {
+    const matched = matchOption(body.owner, FIELD_OPTIONS.OWNER);
+    if (matched) setField(FIELDS.OWNER, matched, 'owner');
+    else unmapped.push({ label: 'Owner', value: normalize(body.owner) });
   }
+
+  // --- Marketing Consent: only ever "Yes" ---
+  if (consent) setField(FIELDS.MARKETING_CONSENT, consent, 'marketingConsent');
 
   // --- Tags: the source tag always; new-lead only through the gate in
   // design decision #6; lead-type/interest tags only when recognized. ---
@@ -280,20 +402,38 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   if (typeTag) tags.push(typeTag);
   else if (normalize(body.leadType)) unmapped.push({ label: 'Lead Type', value: normalize(body.leadType) });
   tags.push(...interestTags);
+  if (googleAdsLead) tags.push(TAGS.GOOGLE_ADS);
+  // Source-form tags (proposal request / quiz) apply to every lead, new or existing.
+  tags.push(...formTags(body.formName));
+  if (consentImplied) tags.push(TAGS.CONSENT_IMPLIED_INQUIRY);
+  // EVENT TAGS on an EXISTING contact: repeat-inquiry (always) plus the source-form tags.
+  // Each one the contact already has is removed first and then re-added, so a GHL
+  // "Tag Added" trigger fires on every inquiry (the caller does remove -> add).
+  const removeTags = eventTagsToRemove(body, isNewContact, context);
+  if (!isNewContact) tags.push(TAGS.REPEAT_INQUIRY);
 
-  const note = buildNote(body, unmapped, profile.noteLabel);
+  const note = buildNote(body, unmapped, profile.noteLabel, notedGuestCount);
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
 
   // ADVANCED (skip) or DEAD-DEAL (reengage) existing contact: minimal update —
   // last-activity + note only. No standard field changes, no other custom
-  // fields. Advanced gets no tags at all; a dead deal gets only the
-  // re-engagement tag (not re-added if it already has it).
+  // fields, nothing to fill. Advanced gets no tags at all; a dead deal gets
+  // only the re-engagement tag (not re-added if it already has it).
   if ((context.advancedReason || context.reengageReason) && !isNewContact) {
     const reengage = !context.advancedReason;
     return {
       contactFields: {},
       customFields: customFields.filter((f) => f.id === FIELDS.LAST_ACTIVITY),
-      tags: reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : [],
+      fillBlank: [],
+      interestSet: false,
+      secondaryInterestSet: false,
+      // No nurture/new-lead tags for these buckets; only the re-engagement tag (dead
+      // deals), plus the event tags: repeat inquiry and source-form tags.
+      tags: [...new Set([
+        ...(reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : []),
+        TAGS.REPEAT_INQUIRY, ...formTags(body.formName),
+      ])],
+      removeTags: eventTagsToRemove(body, false, context),
       note,
       warnings,
       newLead,
@@ -304,20 +444,234 @@ function buildLeadPlan(body, { isNewContact, profile, context = {} }) {
   return {
     contactFields,
     customFields,
+    // Existing, non-advanced contacts only: candidates to write where the
+    // contact's field is blank. See resolveFillBlank().
+    fillBlank: isNewContact ? [] : mapped,
+    interestSet,
+    secondaryInterestSet,
     tags: [...new Set(tags)],
+    removeTags,
+    consentImplied,
     note,
     warnings,
     newLead,
-    route: newLead.applied ? 'new-lead' : 'no-new-lead',
+    route: !isNewContact ? 'repeat-inquiry' : (newLead.applied ? 'new-lead' : 'no-new-lead'),
   };
 }
 
+// The event tags this inquiry will (re)apply that the existing contact ALREADY carries:
+// repeat-inquiry and the source-form tags. They are removed before being added again.
+function eventTagsToRemove(body, isNewContact, context) {
+  if (isNewContact) return [];
+  const have = new Set((context.existingTags || []).map((t) => String(t).trim().toLowerCase()));
+  if (context.hasRepeatInquiryTag) have.add(TAGS.REPEAT_INQUIRY);
+  return [TAGS.REPEAT_INQUIRY, ...formTags(body.formName)].filter((t) => have.has(t));
+}
+
+// DMA Last Activity text: the source label, the form it came from, and what
+// they asked for — e.g. "Wix Form Submission — Digital Mirror Homepage —
+// Glambot, Robotics". The timestamp is appended by the caller.
+function describeActivity(body, profile) {
+  const parts = [profile.lastActivityLabel];
+  if (normalize(body.formName)) parts.push(normalize(body.formName));
+  const asked = [body.interest, body.secondaryInterest].map(normalize).filter(Boolean).join(', ')
+    || normalize(body.eventType);
+  if (asked) parts.push(asked.length > 120 ? `${asked.slice(0, 117)}...` : asked);
+  return parts.join(' — ');
+}
+
+// --- Fill-blank -------------------------------------------------------------
+
+// Current value of one custom field on a GHL contact ('' when absent/blank).
+function customFieldValue(contact, fieldId) {
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
+  if (!entry) return '';
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
+}
+
+// Current values of a multi-select custom field on a GHL contact ([] when blank).
+function customFieldValues(contact, fieldId) {
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
+  if (!entry) return [];
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  return (Array.isArray(v) ? v : [v]).map((x) => String(x == null ? '' : x).trim()).filter(Boolean);
+}
+
+// Existing contact: the plan's Interest write must ADD to what the contact already
+// has, not replace it. Returns plan.customFields with the interest entry replaced by
+// existing values first (their own spelling), then new ones not already present.
+function mergeInterestWithExisting(plan, contact) {
+  const have = customFieldValues(contact, FIELDS.INTEREST);
+  if (!have.length) return plan.customFields;
+  return plan.customFields.map((f) => {
+    if (f.id !== FIELDS.INTEREST) return f;
+    const merged = [...have];
+    (Array.isArray(f.fieldValue) ? f.fieldValue : [f.fieldValue]).forEach((o) => {
+      if (!merged.some((m) => m.toLowerCase() === String(o).toLowerCase())) merged.push(o);
+    });
+    return { ...f, fieldValue: merged };
+  });
+}
+
+// Event date currently on the contact, as 'YYYY-MM-DD': '' when empty, null when
+// something is there that can't be read (then it is left alone). GHL returns DATE values
+// either as an ISO string or as epoch milliseconds — both handled.
+function existingEventDate(contact) {
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === FIELDS.EVENT_DATE);
+  if (!entry) return '';
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  if (v === undefined || v === null || String(v).trim() === '') return '';
+  if (typeof v === 'number' || /^\d{10,13}$/.test(String(v))) {
+    const ms = Number(v) < 1e11 ? Number(v) * 1000 : Number(v);
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+  return toIsoDate(String(v)) || null;
+}
+
+// shape key -> the field's valid options, for spotting corrupt picklist values (see resolveFillBlank)
+const PICKLIST_OPTIONS = {
+  eventType: FIELD_OPTIONS.EVENT_TYPE,
+  budgetRange: FIELD_OPTIONS.BUDGET_RANGE,
+  marketingConsent: FIELD_OPTIONS.MARKETING_CONSENT,
+};
+
+// Which plan.fillBlank entries to actually send for this existing contact:
+//  - a value goes into a field only if the field is EMPTY on the contact (never an
+//    overwrite), and the plan isn't already writing it in customFields/contactFields;
+//  - EXCEPT event date and guest count, which a NEWER inquiry replaces: the event date
+//    when the new date is later than the one on file; the guest count when the event
+//    isn't older (same or later date) — the guest count belongs to that event. With no
+//    new event date, a guest count only fills an empty field;
+//  - Marketing Consent ("Yes" only) also fills a field holding "Unknown", but never
+//    replaces an existing Yes/No.
+// Lead Score, Lead Status and Lead Source are never in plan.fillBlank. Pass
+// { standalone: true } when the plan's own writes are NOT being sent (the backfill),
+// and { blankOnly: true } to disable the newer-wins rule (the backfill never overwrites).
+// Returns { contactFields, customFields, keys } ready to merge into the update body.
+function resolveFillBlank(plan, contact, { standalone = false, blankOnly = false } = {}) {
+  const out = { contactFields: {}, customFields: [], keys: [] };
+  const alreadyCustom = new Set(standalone ? [] : (plan.customFields || []).map((f) => f.id));
+  const planContact = standalone ? {} : (plan.contactFields || {});
+  const entries = plan.fillBlank || [];
+  const newDateEntry = entries.find((e) => e.key === 'eventDate');
+  const newDate = newDateEntry ? newDateEntry.value : '';
+  const haveDate = existingEventDate(contact);
+
+  entries.forEach((entry) => {
+    if (entry.kind === 'contact') {
+      if (normalize(contact[entry.field]) || planContact[entry.field] !== undefined) return;
+      out.contactFields[entry.field] = entry.value;
+      out.keys.push(entry.key);
+      return;
+    }
+    if (alreadyCustom.has(entry.id)) return;
+    let current = customFieldValue(contact, entry.id);
+    // A picklist field holding something that is not one of its options (e.g. an Event Type
+    // of "estimated_guest_count:" left by a broken upstream parser) is corrupt, not data:
+    // treat it as empty so the real value can replace it.
+    const options = PICKLIST_OPTIONS[entry.key];
+    if (current && options && !matchOption(current, options)) current = '';
+    let write = !current;
+    if (!write) {
+      if (entry.key === 'marketingConsent') write = current.toLowerCase() === 'unknown'; // "Unknown" counts as empty
+      else if (!blankOnly && entry.key === 'eventDate') write = haveDate !== null && !!entry.value && entry.value > haveDate;
+      else if (!blankOnly && entry.key === 'guestCount') write = !!newDate && haveDate !== null && newDate >= haveDate;
+    }
+    if (!write) return;
+    out.customFields.push({ id: entry.id, fieldValue: entry.value });
+    out.keys.push(entry.key);
+  });
+  return out;
+}
+
+// Fields the backfill report tracks: shape key -> where it lives on a contact.
+// (Interest / secondaryInterest share one multi-select field.)
+const TRACKED_FIELDS = [
+  { key: 'eventDate', kind: 'custom', id: FIELDS.EVENT_DATE },
+  { key: 'eventType', kind: 'custom', id: FIELDS.EVENT_TYPE },
+  { key: 'guestCount', kind: 'custom', id: FIELDS.GUEST_COUNT },
+  { key: 'budgetRange', kind: 'custom', id: FIELDS.BUDGET_RANGE },
+  { key: 'city', kind: 'contact', field: 'city' },
+  { key: 'interest', kind: 'custom', id: FIELDS.INTEREST },
+  { key: 'leadType', kind: 'custom', id: FIELDS.LEAD_TYPE },
+  { key: 'marketingConsent', kind: 'custom', id: FIELDS.MARKETING_CONSENT },
+  { key: 'campaign', kind: 'custom', id: FIELDS.CAMPAIGN },
+  { key: 'owner', kind: 'custom', id: FIELDS.OWNER },
+];
+
+function isBlankOnContact(contact, tracked) {
+  if (tracked.kind === 'contact') return !normalize(contact[tracked.field]);
+  if (!tracked.id) return true; // field not created yet -> blank by definition
+  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === tracked.id);
+  if (!entry) return true;
+  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
+  return Array.isArray(v) ? v.length === 0 : !normalize(v);
+}
+
+// The 19 standard fields a lead is judged on, under their GHL names. `Contact` is
+// the person's name (set when first or last name is written), `Mobile` is the
+// phone. Lead Score is in the schema but never written (no real scoring yet), so
+// it is reported as "not written by design", never as blank. Interested In and
+// Secondary Interest share one multi-select field in GHL; each counts as set when
+// its own answer matched an option (plan.interestSet / plan.secondaryInterestSet).
+const STANDARD_FIELDS = [
+  { name: 'Lead Source', id: FIELDS.LEAD_SOURCE },
+  { name: 'Campaign', id: FIELDS.CAMPAIGN },
+  { name: 'Lead Type', id: FIELDS.LEAD_TYPE },
+  { name: 'Company', contact: ['companyName'] },
+  { name: 'Contact', contact: ['firstName', 'lastName'] },
+  { name: 'Email', contact: ['email'] },
+  { name: 'Mobile', contact: ['phone'] },
+  { name: 'Event Date', id: FIELDS.EVENT_DATE },
+  { name: 'City', contact: ['city'] },
+  { name: 'Guest Count', id: FIELDS.GUEST_COUNT },
+  { name: 'Interested In', plan: 'interestSet' },
+  { name: 'Secondary Interest', plan: 'secondaryInterestSet' },
+  { name: 'Budget Range', id: FIELDS.BUDGET_RANGE },
+  { name: 'Event Type', id: FIELDS.EVENT_TYPE },
+  { name: 'Lead Score', byDesign: true },
+  { name: 'Sales Owner', id: FIELDS.OWNER },
+  { name: 'Status', id: FIELDS.LEAD_STATUS },
+  { name: 'Last Activity', id: FIELDS.LAST_ACTIVITY },
+  { name: 'Marketing Consent', id: FIELDS.MARKETING_CONSENT },
+];
+const STANDARD_FIELD_COUNT = STANDARD_FIELDS.length; // 19
+
+// Which of the 19 this push writes ("set"), which it does not ("blank"), and the
+// by-design exception, counting what the plan sends plus any fill-blank
+// additions. For the dry-run logs.
+function standardFieldReport(plan, fill) {
+  const contact = { ...plan.contactFields, ...((fill && fill.contactFields) || {}) };
+  const ids = new Set([...plan.customFields, ...((fill && fill.customFields) || [])].map((f) => f.id));
+  const set = [];
+  const blank = [];
+  const notWritten = [];
+  STANDARD_FIELDS.forEach((f) => {
+    if (f.byDesign) { notWritten.push(f.name); return; }
+    let isSet;
+    if (f.contact) isSet = f.contact.some((k) => contact[k]);
+    else if (f.plan) isSet = !!plan[f.plan];
+    else isSet = !!(f.id && ids.has(f.id));
+    (isSet ? set : blank).push(f.name);
+  });
+  return { set, blank, notWritten };
+}
+
 module.exports = {
+  standardFieldReport,
+  STANDARD_FIELD_COUNT,
   buildLeadPlan,
   decideNewLead,
+  resolveFillBlank,
+  mergeInterestWithExisting,
+  customFieldValue,
+  isBlankOnContact,
+  TRACKED_FIELDS,
   // exported for tests
   splitName,
   matchOption,
+  matchEventType,
   leadTypeTag,
   lookupInterest,
 };

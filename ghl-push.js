@@ -25,9 +25,11 @@
 //   GHL_API_KEY / GHL_LOCATION_ID  (see ghl-client.js)
 
 const ghl = require('./ghl-client');
-const { buildLeadPlan } = require('./ghl-lead-plan');
-const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail } = require('./db');
+const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldValue, standardFieldReport, STANDARD_FIELD_COUNT } = require('./ghl-lead-plan');
+const { formNameFromSource, isParseArtifact } = require('./lead-shape');
+const { testLeadReason, barrExclusionReason } = require('./config');
+const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES, CC_PROPOSAL_SENT_STATUSES } = require('./ghl-canonical');
+const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -136,8 +138,26 @@ function normEmail(v) {
 // be trusted to reveal a BARR lead. Over-excluding is the safe direction here.
 function isBarrLead(lead, row) {
   if (row && row.target === 'BARR') return true;
+  if (barrExclusionReason(lead)) return true; // config.js BARR_EXCLUSION (source / campaign), exclusion only
+
+  // CheckCherry leads: scan ONLY source, campaign/attribution and the lead's own
+  // inquiry (the packages/services they asked for, event type, and their own
+  // message). NEVER staff notes, company or venue: staff write things like "Humanoid
+  // Bot: attendant" into a DMA booking, which is not a BuyAndRentRobots lead.
+  // (`inquiryText` is the lead's own message, set transiently by the mapper.)
+  if (lead.source === 'CheckCherry') {
+    const inquiry = [
+      lead.source, lead.campaign, lead.utmSource, lead.utmMedium, lead.utmCampaign, lead.utmContent, lead.utmTerm,
+      lead.interest, lead.secondaryInterest, lead.eventType, lead.leadType, lead.inquiryText,
+    ].filter(Boolean).join(' ');
+    return BARR_PATTERN.test(inquiry);
+  }
+
+  // Every text field a keyword could now sit in: answers that used to be folded
+  // into `interest` live in the shape fields and `extra`.
   const haystack = [
-    lead.source, lead.interest, lead.notes, lead.company,
+    lead.source, lead.interest, lead.secondaryInterest, lead.eventType, lead.budgetRange, lead.guestCount,
+    lead.leadType, lead.extra, lead.campaign, lead.location, lead.notes, lead.company,
     lead.utmSource, lead.utmMedium, lead.utmCampaign, lead.utmContent, lead.utmTerm,
   ].filter(Boolean).join(' ');
   return BARR_PATTERN.test(haystack);
@@ -188,6 +208,8 @@ function settleWindowMinutes(env = process.env) {
 function assess(lead, row, cfg, context) {
   const profile = profileForSource(lead.source);
   if (!profile) return { kind: 'exclude', terminal: 'excluded_source', reason: `source "${lead.source || ''}" is not pushed to GHL` };
+  const testReason = testLeadReason(lead);
+  if (testReason) return { kind: 'exclude', terminal: 'excluded_test', reason: `${testReason} — never enters the funnel` };
   if (isBarrLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_barr', reason: 'BuyAndRentRobots lead — not for the DMA Events funnel' };
   if (isSpamLead(lead, row)) return { kind: 'exclude', terminal: 'excluded_spam', reason: 'lead is marked Spam — never enters the funnel' };
   if (cfg.cutoff && row && row.date_received < cfg.cutoff) {
@@ -229,13 +251,6 @@ const REENGAGE_STATUS_SET = new Set(REENGAGE_STATUSES.map((x) => x.toLowerCase()
 const ADVANCED_TAG_SET = new Set(ADVANCED_TAGS.map((t) => t.trim().toLowerCase()));
 const DEAD_DEAL_TAG_SET = new Set(DEAD_DEAL_TAGS.map((t) => t.trim().toLowerCase()));
 
-function customFieldValue(contact, fieldId) {
-  const entry = (contact.customFields || contact.customField || []).find((f) => f && f.id === fieldId);
-  if (!entry) return '';
-  const v = entry.value !== undefined ? entry.value : entry.fieldValue;
-  return String(Array.isArray(v) ? v[0] || '' : v == null ? '' : v).trim();
-}
-
 const tagKey = (t) => String(t).trim().toLowerCase();
 
 // Which of the three buckets an EXISTING contact is in:
@@ -264,21 +279,39 @@ function classifyContact(contact) {
 
 // --- The shared push --------------------------------------------------------
 
-// Adapts a stored/synced lead ({name, email, phone, company, location,
-// interest, notes, utm*, source}) into the input buildLeadPlan expects.
-// Free-text interest and location go to the note, not into structured fields:
-// they aren't picklist values, and a venue city isn't the contact's city.
+// Adapts a stored/synced lead (the normalized shape from lead-shape.js plus
+// name/email/phone/company/location/notes/utm*/source) into the input
+// buildLeadPlan expects: every shape field is passed straight through so the
+// picklist matching in buildLeadPlan actually runs. Free-text location and
+// notes (which now hold only what no field could take) go to the note.
 function toPlanBody(lead) {
   return {
     name: lead.name,
     email: lead.email,
     phone: lead.phone,
     company: lead.company,
-    campaign: lead.utmCampaign,
+    // the 11 standard shape fields
+    eventDate: lead.eventDate,
+    eventType: lead.eventType,
+    guestCount: lead.guestCount,
+    budgetRange: lead.budgetRange,
+    city: lead.city,
+    interest: lead.interest,
+    secondaryInterest: lead.secondaryInterest,
+    leadType: lead.leadType,
+    marketingConsent: lead.marketingConsent,
+    campaign: lead.campaign || lead.utmCampaign,
+    owner: lead.owner,
+    // attribution (attribution.js); only CheckCherry leads carry it
+    attributionSource: lead.source, status: lead.status,
+    gclid: lead.gclid, gbraid: lead.gbraid, wbraid: lead.wbraid,
+    utmSource: lead.utmSource, utmMedium: lead.utmMedium, utmCampaign: lead.utmCampaign,
+    utmContent: lead.utmContent, utmTerm: lead.utmTerm, origin: lead.origin,
+    formName: formNameFromSource(lead.source),
     noteLines: [
-      lead.interest && `Interest / form answers: ${lead.interest}`,
-      lead.location && `Location: ${lead.location}`,
+      lead.location && !isParseArtifact(lead.location) && `Location: ${lead.location}`, // an upstream "key: value" fragment is not a location
       lead.notes && `Notes: ${lead.notes}`,
+      lead.extra && `Other form answers: ${lead.extra}`,
       lead.source && `Original source: ${lead.source}`,
     ].filter(Boolean),
   };
@@ -303,20 +336,36 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
     reengageReason: cls.bucket === 'reengage' ? cls.reason : null,
     hasNewLeadTag: hasTag(TAGS.LEAD_NEW),
     hasReengageTag: hasTag(TAGS.NEWSLETTER_REENGAGEMENT),
+    hasRepeatInquiryTag: hasTag(TAGS.REPEAT_INQUIRY),
+    // for event-tag remove->add and the Canadian-phone implied consent (ghl-lead-plan.js)
+    existingTags: existing ? (existing.tags || []) : [],
+    existingPhone: existing ? existing.phone : '',
+    existingConsent: existing ? customFieldValue(existing, FIELDS.MARKETING_CONSENT) : '',
   };
   const plan = buildLeadPlan(toPlanBody(lead), { isNewContact, profile, context: ctx });
+  // Existing contact: interest is merged into what they already have, never replaced.
+  if (existing && plan.route !== 'skip' && plan.route !== 'reengage') plan.customFields = mergeInterestWithExisting(plan, existing);
   const action = isNewContact ? 'create' : ((ctx.advancedReason || ctx.reengageReason) ? 'update-minimal' : 'update');
-  const outcome = { action, contactId: existing ? existing.id : null, plan, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
+  // Existing non-advanced contact: also fill any blank mapped field (never
+  // overwrites — see resolveFillBlank).
+  const fill = existing ? resolveFillBlank(plan, existing) : { contactFields: {}, customFields: [], keys: [] };
+  const outcome = { action, contactId: existing ? existing.id : null, plan, fill, advancedReason: ctx.advancedReason, reengageReason: ctx.reengageReason };
   if (dryRun) return { ...outcome, dryRun: true };
 
   let contactId;
   if (existing) {
-    await ghl.updateContact(existing.id, { ...plan.contactFields, customFields: plan.customFields });
+    await ghl.updateContact(existing.id, {
+      ...plan.contactFields,
+      ...fill.contactFields,
+      customFields: [...plan.customFields, ...fill.customFields],
+    });
     contactId = existing.id;
   } else {
     const result = await ghl.createContact({ ...plan.contactFields, customFields: plan.customFields });
     contactId = result.contact.id;
   }
+  // Remove -> add, so a GHL "Tag Added" trigger fires again even when the tag is already there.
+  if (plan.removeTags && plan.removeTags.length) await ghl.removeTags(contactId, plan.removeTags);
   if (plan.tags.length) await ghl.addTags(contactId, plan.tags);
   if (plan.note) await ghl.createNote(contactId, plan.note);
   return { ...outcome, contactId, dryRun: false };
@@ -327,6 +376,7 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
 function describeOutcome(lead, profile, outcome) {
   const { plan } = outcome;
   const verb = { create: 'CREATE contact', update: 'UPDATE contact', 'update-minimal': 'UPDATE contact (MINIMAL: last-activity + note only)' }[outcome.action];
+  const std = standardFieldReport(plan, outcome.fill);
   return [
     `${verb}${outcome.contactId ? ` ${outcome.contactId}` : ''}`,
     `email=${lead.email || '-'}`,
@@ -334,10 +384,13 @@ function describeOutcome(lead, profile, outcome) {
     `source="${lead.source}"`,
     `leadSource=${profile.leadSourceOption}`,
     `tags=[${plan.tags.join(', ')}]`,
+    plan.removeTags && plan.removeTags.length ? `remove-then-add=[${plan.removeTags.join(', ')}]` : null,
     `new-lead: ${plan.newLead.applied ? 'YES' : 'NO'} (${plan.newLead.reason})`,
     `route=${plan.route}`,
     outcome.advancedReason ? `advanced: ${outcome.advancedReason}` : null,
     outcome.reengageReason ? `dead deal: ${outcome.reengageReason}` : null,
+    `fields ${std.set.length}/${STANDARD_FIELD_COUNT} set=[${std.set.join(', ')}] blank=[${std.blank.join(', ')}] not-written-by-design=[${std.notWritten.join(', ')}]`,
+    outcome.fill && outcome.fill.keys.length ? `fill-blank=[${outcome.fill.keys.join(', ')}]` : null,
     plan.note ? 'note=yes' : 'note=no',
   ].filter(Boolean).join(' | ');
 }
@@ -364,49 +417,142 @@ async function pushAfterUpsert(lead, result, context = {}) {
     if (!result || result.action === 'skipped_deleted') return 'deleted';
 
     const row = getGhlState(result.id);
-    // Legacy / pushed / excluded rows are terminal. Only a pending (NULL) row
-    // — freshly inserted, or inserted earlier but deferred/failed — proceeds.
-    if (!row || row.ghl_pushed) return 'not-pending';
-
-    const decision = assess(lead, row, cfg, context);
+    if (!row) return 'not-pending';
     const dry = mode === 'dry-run';
+    const sid = lead.submissionId ? String(lead.submissionId) : '';
+
+    // A PENDING (NULL) row — freshly inserted, or inserted earlier but deferred/failed — is
+    // the person's first push. A terminal row is normally done, BUT leads dedupe by email, so
+    // a later submission from the same person only updates the stored row. Each source
+    // submission has its own id (lead.submissionId), so a NEW submission on a 'pushed' or
+    // 'legacy' row is a repeat inquiry and reaches GHL exactly once (db.js `submissions`).
+    // Excluded rows (BARR / spam / test / source) never push. Email stays the contact match key.
+    let repeat = false;
+    let assessRow = row;
+    if (row.ghl_pushed) {
+      if (!sid || !(row.ghl_pushed === 'pushed' || row.ghl_pushed === 'legacy')) return 'not-pending';
+      if (hasSubmission(sid)) return 'not-pending';
+      const today = new Date().toISOString().slice(0, 10);
+      const submittedOn = lead.dateReceived || today;
+      // The back-catalog submission behind a 'legacy' row is never re-pushed: only strictly newer ones.
+      if (row.ghl_pushed === 'legacy' && !(submittedOn > row.date_received)) return 'not-pending';
+      // Live: GHL_PUSH_CUTOFF_DATE (assess). Dry run has no cutoff: look at the last 14 days only.
+      const since = cfg.cutoff || new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+      if (submittedOn < since) return 'not-pending';
+      repeat = true;
+      assessRow = { ...row, date_received: submittedOn };
+    }
+    const key = repeat ? `sub:${sid}` : row.id;
+    const tag = repeat ? ' [repeat submission]' : '';
+
+    const decision = assess(lead, assessRow, cfg, context);
 
     if (decision.kind === 'skip') return 'skip';
     if (decision.kind === 'defer') {
-      if (!dryRunLogged.has(`defer:${row.id}:${dry}`)) {
-        dryRunLogged.add(`defer:${row.id}:${dry}`);
-        console.log(`[ghl-push]${dry ? '[DRY-RUN]' : ''} DEFERRED ${lead.email || lead.name} — ${decision.reason}`);
+      if (!dryRunLogged.has(`defer:${key}:${dry}`)) {
+        dryRunLogged.add(`defer:${key}:${dry}`);
+        console.log(`[ghl-push]${dry ? '[DRY-RUN]' : ''} DEFERRED ${lead.email || lead.name}${tag} — ${decision.reason}`);
       }
       return 'defer';
     }
     if (decision.kind === 'exclude') {
       if (dry) {
-        if (!dryRunLogged.has(row.id)) {
-          dryRunLogged.add(row.id);
-          console.log(`[ghl-push][DRY-RUN] WOULD EXCLUDE ${lead.email || lead.name} (source="${lead.source}") — ${decision.reason}`);
+        if (!dryRunLogged.has(key)) {
+          dryRunLogged.add(key);
+          console.log(`[ghl-push][DRY-RUN] WOULD EXCLUDE ${lead.email || lead.name} (source="${lead.source}")${tag} — ${decision.reason}`);
         }
       } else {
-        markGhlPushed(row.id, decision.terminal);
-        console.log(`[ghl-push] EXCLUDED ${lead.email || lead.name} (source="${lead.source}") — ${decision.reason}`);
+        if (repeat) recordSubmission(sid, row.id); // the row is already terminal; just stop re-evaluating this submission
+        else markGhlPushed(row.id, decision.terminal);
+        console.log(`[ghl-push] EXCLUDED ${lead.email || lead.name} (source="${lead.source}")${tag} — ${decision.reason}`);
       }
       return decision.terminal;
     }
 
     // kind === 'push'
-    if (dry && dryRunLogged.has(row.id)) return 'dry-run-seen';
+    if (dry && dryRunLogged.has(key)) return 'dry-run-seen';
     const outcome = await pushLeadToGhl(lead, { profile: decision.profile, context: { ...context, proposal: decision.proposal }, dryRun: dry });
     if (dry) {
-      dryRunLogged.add(row.id);
-      console.log(`[ghl-push][DRY-RUN] WOULD ${describeOutcome(lead, decision.profile, outcome)}`);
+      dryRunLogged.add(key);
+      console.log(`[ghl-push][DRY-RUN] WOULD ${describeOutcome(lead, decision.profile, outcome)}${tag}`);
       return 'dry-run';
     }
-    markGhlPushed(row.id, 'pushed');
-    console.log(`[ghl-push] DONE ${describeOutcome(lead, decision.profile, outcome)}`);
-    return 'pushed';
+    if (!repeat) markGhlPushed(row.id, 'pushed');
+    if (sid) recordSubmission(sid, row.id);
+    console.log(`[ghl-push] DONE ${describeOutcome(lead, decision.profile, outcome)}${tag}`);
+    return repeat ? 'pushed-repeat' : 'pushed';
   } catch (err) {
     console.error(`[ghl-push] push failed for ${lead && (lead.email || lead.name)} — row stays pending, will retry next cycle:`, err.message);
     return 'error';
   }
+}
+
+// --- CheckCherry "proposal sent" -> tag the EXISTING GHL contact ----------------
+//
+// When CheckCherry's events feed shows a proposal out (status proposal_date_open /
+// proposal_date_reserved / awaiting_signature, not canceled / archived / postponed) for
+// a person who ALREADY exists in GHL, add the tag "cc-proposal-sent" to that contact.
+// It never creates a contact (the lead push does that) and only tags the event's primary
+// customer email. Same safety model as the push: dry-run logs WOULD TAG and sends
+// nothing; live needs GHL_PUSH_LIVE + GHL_PUSH_CUTOFF_DATE and only handles events
+// CREATED on/after the cutoff (the back catalog is never tagged). Each event is recorded
+// once (db.js cc_proposal_tags) so the 15-minute sync doesn't re-tag; a contact that
+// doesn't exist yet is retried for 3 days, then given up on.
+// Never throws. Returns { mode, tagged, considered }.
+const PROPOSAL_TAG_RETRY_DAYS = 3;
+const PROPOSAL_DRY_RUN_WINDOW_DAYS = 14; // dry run has no cutoff: only look at recent events
+
+async function tagProposalSentContacts(events, { now = new Date() } = {}) {
+  const result = { mode: 'off', tagged: 0, considered: 0 };
+  try {
+    const cfg = getPushConfig();
+    result.mode = resolveMode(cfg);
+    if (result.mode === 'off') return result;
+    const dry = result.mode === 'dry-run';
+    const day = (d) => d.toISOString().slice(0, 10);
+    const since = cfg.cutoff || day(new Date(now.getTime() - PROPOSAL_DRY_RUN_WINDOW_DAYS * 86400000));
+    const giveUpBefore = day(new Date(now.getTime() - PROPOSAL_TAG_RETRY_DAYS * 86400000));
+    const first = (list) => String(list || '').split(',')[0].trim();
+
+    for (const record of events || []) {
+      const attrs = (record && record.attributes) || record || {};
+      if (!CC_PROPOSAL_SENT_STATUSES.includes(attrs.status) || attrs.canceled || attrs.archived || attrs.postponed) continue;
+      const created = String(attrs.created_at || '').slice(0, 10);
+      if (!created || created < since) continue;
+      const eventId = String((record && record.id) || attrs.id || '');
+      const email = first(attrs.customer_emails).toLowerCase();
+      if (!eventId || !email) continue;
+      if (testLeadReason({ name: first(attrs.customer_names), email })) continue;
+      if (getProposalTagOutcome(eventId)) continue;
+      const key = `proposal-tag:${eventId}`;
+      if (dry && dryRunLogged.has(key)) continue;
+      result.considered++;
+
+      const found = await ghl.findDuplicateContact({ email, phone: '' });
+      if (!found) { // not in GHL: never create one here
+        if (dry) dryRunLogged.add(key);
+        else if (created < giveUpBefore) recordProposalTag(eventId, email, 'no-contact');
+        continue;
+      }
+      const contact = (await ghl.getContact(found.id)) || found;
+      if ((contact.tags || []).some((t) => tagKey(t) === TAGS.CC_PROPOSAL_SENT)) {
+        if (dry) dryRunLogged.add(key); else recordProposalTag(eventId, email, 'already-tagged');
+        continue;
+      }
+      if (dry) {
+        dryRunLogged.add(key);
+        console.log(`[ghl-push][DRY-RUN] WOULD TAG existing contact ${found.id} email=${email} with ${TAGS.CC_PROPOSAL_SENT} (CheckCherry event ${eventId}, status ${attrs.status})`);
+        continue;
+      }
+      await ghl.addTags(found.id, [TAGS.CC_PROPOSAL_SENT]);
+      recordProposalTag(eventId, email, 'tagged');
+      result.tagged++;
+      console.log(`[ghl-push] TAGGED existing contact ${found.id} email=${email} with ${TAGS.CC_PROPOSAL_SENT} (CheckCherry event ${eventId}, status ${attrs.status})`);
+    }
+  } catch (err) {
+    console.error('[ghl-push] proposal-sent tagging failed — will retry next cycle:', err.message);
+  }
+  return result;
 }
 
 // Read-only assessment of already-stored rows (used by the admin dry-run
@@ -434,7 +580,9 @@ module.exports = {
   proposalLookup,
   assess,
   classifyContact,
+  toPlanBody,
   pushLeadToGhl,
   pushAfterUpsert,
+  tagProposalSentContacts,
   previewLead,
 };

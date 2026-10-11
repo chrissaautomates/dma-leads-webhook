@@ -20,8 +20,10 @@ test('maps the real Google Ads payload including email and phone', () => {
   assert.equal(lead.email, 'idandriman@gmail.com');
   assert.equal(lead.phone, '+16472266568');
   assert.equal(lead.company, 'Bar Mitzva');
-  assert.equal(lead.interest, 'Private Event');
-  assert.equal(lead.notes, 'Event date: 05/30/2027');
+  assert.equal(lead.eventType, 'Private Event');
+  assert.equal(lead.eventDate, '2027-05-30');
+  assert.equal(lead.interest, '');
+  assert.equal(lead.campaign, '');
 });
 
 test('redactGoogleKey drops google_key but keeps every other top-level field', () => {

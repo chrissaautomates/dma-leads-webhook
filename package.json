@@ -5,13 +5,15 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "backfill:attribution": "node scripts/backfill-attribution.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "libphonenumber-js": "^1.13.14"
   }
 }

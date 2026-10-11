@@ -14,6 +14,10 @@ const Database = require('better-sqlite3');
 const DB_PATH = process.env.DB_PATH || '/data/leads.db';
 const db = new Database(DB_PATH);
 
+// Before ANY schema change: a one-time safety copy of the existing database
+// (/data/backups/leads-pre-ghl-<timestamp>.db). See db-backup.js.
+require('./db-backup').backupBeforeMigration(db, DB_PATH);
+
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -77,6 +81,38 @@ UTM_COLUMNS.forEach((col) => {
   }
 });
 
+// Migration: the normalized lead shape (see lead-shape.js). Same ADD COLUMN
+// approach as UTM above: no-op once present, never rewrites existing rows.
+// Old rows keep these blank; backfill-ghl-fields.js re-derives what it can
+// from their legacy interest/notes text.
+const SHAPE_COLUMNS = [
+  'event_date', 'event_type', 'guest_count', 'budget_range', 'city',
+  'secondary_interest', 'lead_type', 'marketing_consent', 'campaign',
+  'extra', // form answers no field could take (kept off `notes`, which staff edit and syncs would overwrite)
+];
+const columnsNow = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
+SHAPE_COLUMNS.forEach((col) => {
+  if (!columnsNow.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
+});
+
+// Migration: Google Ads click ids captured from the landing page (CheckCherry hidden
+// field / UTM param). Same additive ADD COLUMN approach; fill-only on update.
+const CLICK_ID_COLUMNS = ['gclid', 'gbraid', 'wbraid', 'origin', 'cc_source']; // + CheckCherry's `origin` and free-text `source`
+const columnsForClickIds = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
+CLICK_ID_COLUMNS.forEach((col) => {
+  if (!columnsForClickIds.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
+});
+
+// One row per Google Ads offline click conversion attempt, keyed by source submission id
+// ("checkcherry:<id>"). status: 'uploaded' and 'rejected' are terminal (never re-sent);
+// 'error' is transient and retried on a later sync (attempts is capped by the caller).
+// click_id is unique among terminal rows' lookups (see hasAdsConversionForClick) so one
+// click can't be counted twice via two leads.
+db.exec(`CREATE TABLE IF NOT EXISTS ads_conversions (
+  sid TEXT PRIMARY KEY, click_id TEXT, click_type TEXT, status TEXT NOT NULL, detail TEXT,
+  attempts INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
 // Migration: ghl_pushed records whether a lead has been pushed to GHL (see
 // ghl-push.js). NULL = pending (eligible to push); anything else is terminal:
 // 'pushed', 'legacy', 'excluded_barr', 'excluded_source', 'excluded_proposal'.
@@ -108,6 +144,22 @@ if (!db.prepare(`PRAGMA table_info(leads)`).all().some((c) => c.name === 'ghl_pu
 // CheckCherry data and is written in every mode, dry-run included.
 db.exec(`CREATE TABLE IF NOT EXISTS proposal_emails (email TEXT PRIMARY KEY)`);
 db.exec(`CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT)`);
+
+// One row per CheckCherry proposal event already handled by the "cc-proposal-sent" tagging
+// (ghl-push.js tagProposalSentContacts), so each event is tagged at most once and the
+// 15-minute sync never re-tags. Additive (CREATE IF NOT EXISTS); only written in live mode.
+// One row per source SUBMISSION (Wix submission id, Meta leadgen id, Google lead id, CheckCherry
+// lead id; namespaced "wix:…" etc.) already delivered to GHL. Leads dedupe by email in `leads`,
+// so a second submission from the same person only updates the stored row; this table is what
+// lets every NEW submission reach GHL (as a repeat inquiry) exactly once. Additive; written
+// only in live mode.
+db.exec(`CREATE TABLE IF NOT EXISTS submissions (
+  sid TEXT PRIMARY KEY, row_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS cc_proposal_tags (
+  event_id TEXT PRIMARY KEY, email TEXT, outcome TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
 
 // One-time fixup: rows synced before CheckCherry got its own tab were
 // routed to DMA/BARR by content keywords alone (the only rule that existed
@@ -195,11 +247,13 @@ function recordDeletion(email, target, source) {
 const insertLead = db.prepare(`
   INSERT INTO leads (
     target, date_received, source, name, company, email, phone, location, interest,
-    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed, gclid, gbraid, wbraid, origin, cc_source,
+    event_date, event_type, guest_count, budget_range, city, secondary_interest, lead_type, marketing_consent, campaign, extra
   )
   VALUES (
     @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
-    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed, @gclid, @gbraid, @wbraid, @origin, @cc_source,
+    @event_date, @event_type, @guest_count, @budget_range, @city, @secondary_interest, @lead_type, @marketing_consent, @campaign, @extra
   )
 `);
 
@@ -214,6 +268,21 @@ const updateLeadFields = db.prepare(`
     utm_campaign = COALESCE(NULLIF(@utm_campaign, ''), utm_campaign),
     utm_content = COALESCE(NULLIF(@utm_content, ''), utm_content),
     utm_term = COALESCE(NULLIF(@utm_term, ''), utm_term),
+    gclid = COALESCE(NULLIF(@gclid, ''), gclid),
+    gbraid = COALESCE(NULLIF(@gbraid, ''), gbraid),
+    wbraid = COALESCE(NULLIF(@wbraid, ''), wbraid),
+    origin = COALESCE(NULLIF(@origin, ''), origin),
+    cc_source = COALESCE(NULLIF(@cc_source, ''), cc_source),
+    event_date = COALESCE(NULLIF(@event_date, ''), event_date),
+    event_type = COALESCE(NULLIF(@event_type, ''), event_type),
+    guest_count = COALESCE(NULLIF(@guest_count, ''), guest_count),
+    budget_range = COALESCE(NULLIF(@budget_range, ''), budget_range),
+    city = COALESCE(NULLIF(@city, ''), city),
+    secondary_interest = COALESCE(NULLIF(@secondary_interest, ''), secondary_interest),
+    lead_type = COALESCE(NULLIF(@lead_type, ''), lead_type),
+    marketing_consent = COALESCE(NULLIF(@marketing_consent, ''), marketing_consent),
+    campaign = COALESCE(NULLIF(@campaign, ''), campaign),
+    extra = COALESCE(NULLIF(@extra, ''), extra),
     updated_at = datetime('now')
   WHERE id = @id
 `);
@@ -249,7 +318,11 @@ function computeTarget(data) {
     const dateReceived = data.dateReceived || new Date().toISOString().slice(0, 10);
     if (dateReceived >= '2026-01-01') return 'CHATLEAD';
   }
-  return BARR_PATTERN.test(source + ' ' + (data.interest || '')) ? 'BARR' : 'DMA';
+  // Same text the old folded `interest` carried (every submitted answer), so a
+  // row's target doesn't change now that answers live in separate fields.
+  const text = [data.interest, data.secondaryInterest, data.eventType, data.budgetRange, data.guestCount, data.leadType, data.extra]
+    .filter(Boolean).join(' ');
+  return BARR_PATTERN.test(source + ' ' + text) ? 'BARR' : 'DMA';
 }
 
 // Returns the existing lead row for a given email + target, or undefined if
@@ -260,6 +333,33 @@ function findLead(email, target) {
   const normalizedEmail = (email || '').toString().trim().toLowerCase();
   if (!normalizedEmail) return undefined;
   return findByEmailAndTarget.get(normalizedEmail, target);
+}
+
+// camelCase shape fields on a lead -> snake_case columns (blank when absent).
+function shapeParams(data) {
+  const v = (x) => (x == null ? '' : String(x).trim());
+  return {
+    event_date: v(data.eventDate), event_type: v(data.eventType), guest_count: v(data.guestCount),
+    budget_range: v(data.budgetRange), city: v(data.city), secondary_interest: v(data.secondaryInterest),
+    lead_type: v(data.leadType), marketing_consent: v(data.marketingConsent), campaign: v(data.campaign),
+    extra: v(data.extra),
+    gclid: v(data.gclid), gbraid: v(data.gbraid), wbraid: v(data.wbraid),
+    origin: v(data.origin), cc_source: v(data.ccSource),
+  };
+}
+
+function getAdsConversion(sid) {
+  return db.prepare(`SELECT * FROM ads_conversions WHERE sid = ?`).get(sid);
+}
+// True when a DIFFERENT submission already has a non-error upload for this click id.
+function hasAdsConversionForClick(clickId, exceptSid) {
+  return !!db.prepare(`SELECT 1 FROM ads_conversions WHERE click_id = ? AND sid != ? AND status IN ('uploaded','rejected')`).get(clickId, exceptSid || '');
+}
+function recordAdsConversion({ sid, clickId, clickType, status, detail }) {
+  db.prepare(`INSERT INTO ads_conversions (sid, click_id, click_type, status, detail) VALUES (?,?,?,?,?)
+    ON CONFLICT(sid) DO UPDATE SET status = excluded.status, detail = excluded.detail, click_id = excluded.click_id,
+      click_type = excluded.click_type, attempts = attempts + 1, updated_at = datetime('now')`)
+    .run(sid, clickId, clickType, status, String(detail || '').slice(0, 1000));
 }
 
 function upsertLead(data) {
@@ -294,6 +394,7 @@ function upsertLead(data) {
       utm_campaign: data.utmCampaign || '',
       utm_content: data.utmContent || '',
       utm_term: data.utmTerm || '',
+      ...shapeParams(data),
     });
     return { action: 'updated', id: existing.id, target };
   }
@@ -328,6 +429,7 @@ function upsertLead(data) {
     // NULL = pending push. Callers that know a row must never be pushed
     // (e.g. CheckCherry proposal-event rows) pass an explicit terminal value.
     ghl_pushed: data.ghlPushed || null,
+    ...shapeParams(data),
   });
   return { action: 'inserted', id: info.lastInsertRowid, target };
 }
@@ -403,6 +505,7 @@ function addLeadFromAdmin(fields) {
     utm_content: fields.utm_content || '',
     utm_term: fields.utm_term || '',
     ghl_pushed: 'excluded_source', // manual entries are never pushed to GHL
+    ...shapeParams({}),
   });
   return info.lastInsertRowid;
 }
@@ -443,6 +546,23 @@ function hasProposalEmail(email) {
   return !!db.prepare(`SELECT 1 FROM proposal_emails WHERE email = ?`).get(e);
 }
 
+function hasSubmission(sid) {
+  return !!db.prepare(`SELECT 1 FROM submissions WHERE sid = ?`).get(String(sid));
+}
+
+function recordSubmission(sid, rowId) {
+  db.prepare(`INSERT OR IGNORE INTO submissions (sid, row_id) VALUES (?, ?)`).run(String(sid), rowId || null);
+}
+
+function getProposalTagOutcome(eventId) {
+  const row = db.prepare(`SELECT outcome FROM cc_proposal_tags WHERE event_id = ?`).get(String(eventId));
+  return row ? row.outcome : null;
+}
+
+function recordProposalTag(eventId, email, outcome) {
+  db.prepare(`INSERT OR IGNORE INTO cc_proposal_tags (event_id, email, outcome) VALUES (?, ?, ?)`).run(String(eventId), email || '', outcome);
+}
+
 // GHL push state for one row: { ghl_pushed, date_received, target, ... }.
 function getGhlState(id) {
   return db.prepare(`SELECT id, ghl_pushed, date_received, target, created_at, status FROM leads WHERE id = ?`).get(id);
@@ -456,11 +576,18 @@ function markGhlPushed(id, value) {
 
 module.exports = {
   db,
+  getAdsConversion,
+  hasAdsConversionForClick,
+  recordAdsConversion,
   BARR_PATTERN,
   getGhlState,
   setProposalEmails,
   getProposalState,
   hasProposalEmail,
+  hasSubmission,
+  recordSubmission,
+  getProposalTagOutcome,
+  recordProposalTag,
   markGhlPushed,
   listLeadsSince,
   upsertLead,

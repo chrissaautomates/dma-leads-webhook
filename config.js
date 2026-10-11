@@ -31,13 +31,6 @@ const CHECKCHERRY_ATTRIBUTES = {
 // these. As a fallback the mapper also looks for `gclid=...` inside the utm_* values.
 const CLICK_ID_ATTRIBUTES = { gclid: 'gclid', gbraid: 'gbraid', wbraid: 'wbraid' };
 
-// Google Ads offline conversion target. The customer id is fixed; the conversion action
-// id comes from GOOGLE_ADS_CONVERSION_ACTION_ID (must be an "Import from clicks" action).
-const GOOGLE_ADS_CONVERSION = {
-  customerId: '8531627827',
-  get conversionActionId() { return String(process.env.GOOGLE_ADS_CONVERSION_ACTION_ID || '').trim(); },
-};
-
 // Leads that must never enter the GHL funnel: obvious test/internal submissions.
 // Checked against name, email and company of every source.
 //  - TEST_LEAD_PATTERNS: case-insensitive regexes ("TEST DMA" tolerates any
@@ -110,4 +103,4 @@ function barrExclusionReason(lead) {
   return null;
 }
 
-module.exports = { FORM_TAG_RULES, formTags, BARR_EXCLUSION, barrExclusionReason, CHECKCHERRY_ATTRIBUTES, CLICK_ID_ATTRIBUTES, GOOGLE_ADS_CONVERSION, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };
+module.exports = { FORM_TAG_RULES, formTags, BARR_EXCLUSION, barrExclusionReason, CHECKCHERRY_ATTRIBUTES, CLICK_ID_ATTRIBUTES, TEST_LEAD_PATTERNS, INTERNAL_EXCLUDE, testLeadReason };

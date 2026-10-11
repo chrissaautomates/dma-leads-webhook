@@ -247,27 +247,27 @@ the next 15-minute cycle.
 
 `npm test` — GHL is fully mocked; nothing touches a real contact.
 
-## Google Ads offline conversions (CheckCherry leads)
+## Google Ads offline conversions (CheckCherry leads -> Google Sheet)
 
-When `syncCheckCherry` inserts a **new** lead that carries a `gclid` / `gbraid` / `wbraid`, `google-ads.js`
-uploads a click conversion to customer `8531627827` (set in `config.js`) using the conversion action in
-`GOOGLE_ADS_CONVERSION_ACTION_ID`, which must be an "Import from clicks" action. The click id is read from the CheckCherry attribute named in `CLICK_ID_ATTRIBUTES`
-(config.js), falling back to a `gclid=…` token inside any `utm_*` value, and is stored on the lead row
-(`gclid`, `gbraid`, `wbraid`; fill-only).
+When `syncCheckCherry` inserts a **new** lead, `google-ads.js` appends one row to the **first tab** of the
+sheet in `GOOGLE_ADS_CONVERSION_SHEET_ID`, which Google Ads imports on a schedule (Conversions > Uploads >
+Google Sheets). Columns, in order: **A** Google Click ID (gclid, blank if none) · **B** Conversion Time
+(`America/Toronto`, DST aware, `yyyy-MM-dd HH:mm:ss±HH:MM`) · **C** Conversion Value (blank) · **D** Currency
+(`CAD`) · **E** Order ID (the CheckCherry lead id) · **F** SHA-256 of the email (trimmed, lowercased) ·
+**G** SHA-256 of the phone as E.164.
 
-The landing page must pass the click id into CheckCherry: a hidden form field named `gclid` (and
-`gbraid`/`wbraid`) populated from the URL query string.
+A row is appended only if it has a gclid, an email or a phone, and its Order ID is not already in column E.
+Existing leads are never back-filled; spam and test leads are skipped; a lead with a gclid older than 90 days
+is skipped. Every attempt is logged (`[google-ads] …`) and recorded in `ads_conversions` (`error` is retried
+up to 5 times on later syncs). The gclid is stored on the lead row (`gclid`, `gbraid`, `wbraid`; fill-only).
+The landing page must pass the click id into CheckCherry (a hidden `gclid` field populated from the URL).
 
-Every attempt is logged (`[google-ads] …`) and recorded in `ads_conversions` (one row per submission id;
-`uploaded`/`rejected` are final, `error` is retried up to 5 times on later syncs). A click id is never
-uploaded twice, existing leads are never back-filled, test leads and clicks older than 90 days are skipped.
+At startup the app logs which Google account the Sheets token belongs to: **share the sheet with that
+account as Editor**.
 
 | Env var | Purpose |
 |---|---|
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | OAuth; the refresh token must have the `adwords` scope |
-| `GOOGLE_ADS_DEVELOPER_TOKEN` | **Required** by the Google Ads API |
-| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Manager account id, if the customer is reached through one |
-| `GOOGLE_ADS_API_VERSION` | Default `v23`; bump when Google sunsets it |
-| `GOOGLE_ADS_CONVERSION_ACTION_ID` | **Required.** Id of the "Import from clicks" conversion action |
-| `GOOGLE_ADS_UPLOAD_DRY_RUN=true` | Log what would be uploaded; send and record nothing |
+| `GOOGLE_ADS_CONVERSION_SHEET_ID` | **Required.** The Google Sheet to append to |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | OAuth; the refresh token needs the `spreadsheets` scope |
+| `GOOGLE_ADS_UPLOAD_DRY_RUN=true` | Log the row (hashes only) instead of appending; no network calls, nothing recorded |
 | `GOOGLE_ADS_UPLOAD_DISABLED=true` | Kill switch |

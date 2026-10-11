@@ -71,6 +71,7 @@ const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = requir
 const { parseConsent, toIsoDate, parseGuestCount, isParseArtifact } = require('./lead-shape');
 const { isCanadianPhone } = require('./phone');
 const { formTags } = require('./config');
+const { attributionValues, deriveChannel, GOOGLE_ADS_CHANNEL } = require('./attribution');
 
 function normalize(value) {
   return String(value == null ? '' : value).trim();
@@ -324,6 +325,13 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   // --- Campaign: submitted campaign, falling back to utmCampaign ---
   setField(FIELDS.CAMPAIGN, normalize(body.campaign) || normalize(body.utmCampaign), 'campaign');
 
+  // --- Marketing attribution (CheckCherry leads only; see attribution.js). Written to a new
+  // contact, and to an existing one ONLY into a blank field (first touch wins: these go through
+  // `mapped` -> fillBlank like every other fill-only value). The google-ads tag follows the
+  // channel of THIS inquiry and is additive.
+  attributionValues(body).forEach((v) => setField(FIELDS[v.fieldKey], v.value, v.key));
+  const googleAdsLead = attributionValues(body).some((v) => v.key === 'channel' && v.value === GOOGLE_ADS_CHANNEL);
+
   // --- Event Date: DATE field. Mappers normalize to ISO; anything still not
   // an unambiguous date stays in the note rather than risk a day/month swap.
   if (normalize(body.eventDate)) {
@@ -394,6 +402,7 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   if (typeTag) tags.push(typeTag);
   else if (normalize(body.leadType)) unmapped.push({ label: 'Lead Type', value: normalize(body.leadType) });
   tags.push(...interestTags);
+  if (googleAdsLead) tags.push(TAGS.GOOGLE_ADS);
   // Source-form tags (proposal request / quiz) apply to every lead, new or existing.
   tags.push(...formTags(body.formName));
   if (consentImplied) tags.push(TAGS.CONSENT_IMPLIED_INQUIRY);

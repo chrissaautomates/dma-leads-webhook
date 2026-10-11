@@ -149,6 +149,8 @@ function rowToLead(row) {
     budgetRange: str(row.budget_range), city: str(row.city), secondaryInterest: str(row.secondary_interest),
     leadType: str(row.lead_type), marketingConsent: str(row.marketing_consent), campaign: str(row.campaign),
     utmCampaign: str(row.utm_campaign), extra: str(row.extra),
+    utmSource: str(row.utm_source), utmMedium: str(row.utm_medium), utmContent: str(row.utm_content), utmTerm: str(row.utm_term),
+    gclid: str(row.gclid), gbraid: str(row.gbraid), wbraid: str(row.wbraid), origin: str(row.origin), ccSource: str(row.cc_source),
   };
   const hasShape = ['eventDate', 'eventType', 'guestCount', 'budgetRange', 'city', 'secondaryInterest', 'leadType', 'marketingConsent', 'campaign']
     .some((k) => lead[k]);

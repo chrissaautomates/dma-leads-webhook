@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "backfill:attribution": "node scripts/backfill-attribution.js"
   },
   "engines": {
     "node": ">=18"

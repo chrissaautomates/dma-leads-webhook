@@ -5,7 +5,8 @@
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert, tagProposalSentContacts } = require('./ghl-push');
 const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
-const { CHECKCHERRY_ATTRIBUTES, CLICK_ID_ATTRIBUTES } = require('./config');
+const { CHECKCHERRY_ATTRIBUTES } = require('./config');
+const { extractAttribution } = require('./attribution');
 const { uploadLeadConversion } = require('./google-ads');
 
 const status = {};
@@ -85,25 +86,6 @@ function strictAttr(attrs, shapeKey, missing) {
 
 const warnedCheckCherry = new Set();
 
-// gclid / gbraid / wbraid for a CheckCherry lead: the configured attribute first, then a
-// `name=value` token inside any utm_* value (landing pages that smuggle it through a UTM).
-function extractClickIds(attrs) {
-  const out = { gclid: '', gbraid: '', wbraid: '' };
-  const utms = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].map((k) => String(attrs[k] || ''));
-  for (const key of Object.keys(out)) {
-    const attr = CLICK_ID_ATTRIBUTES[key];
-    let v = attr && attrs[attr] != null ? String(attrs[attr]).trim() : '';
-    if (!v) {
-      for (const u of utms) {
-        const m = u.match(new RegExp(`(?:^|[?&|;,\\s])${key}[=:]([A-Za-z0-9_-]+)`, 'i'));
-        if (m) { v = m[1]; break; }
-      }
-    }
-    out[key] = v;
-  }
-  return out;
-}
-
 function mapCheckCherryLead(record) {
   const attrs = (record && record.attributes) || record || {};
 
@@ -162,12 +144,8 @@ function mapCheckCherryLead(record) {
     // null on every real lead seen so far, but the key is genuinely part
     // of the schema, so it's captured the same as the others rather than
     // left out on the assumption it doesn't exist.
-    utmSource: attrs.utm_source || '',
-    utmMedium: attrs.utm_medium || '',
-    utmCampaign: attrs.utm_campaign || '',
-    utmContent: attrs.utm_content || '',
-    utmTerm: attrs.utm_term || '',
-    ...extractClickIds(attrs),
+    // utm* (all five), gclid / gbraid / wbraid, CheckCherry's `source` (ccSource) and `origin` — see attribution.js.
+    ...extractAttribution(attrs),
     // Exact created_at timestamp (transient, not stored) for the Ads conversion time.
     createdAtIso: attrs.created_at || '',
   };
@@ -302,11 +280,7 @@ function mapCheckCherryProposalEvent(record) {
     // Real value, always the created date (used as dateReceived below), so
     // this is only meaningful as a fallback if that ever comes back blank.
     dateReceived: attrs.created_at ? attrs.created_at.slice(0, 10) : undefined,
-    utmSource: attrs.utm_source || '',
-    utmMedium: attrs.utm_medium || '',
-    utmCampaign: attrs.utm_campaign || '',
-    utmContent: attrs.utm_content || '',
-    utmTerm: attrs.utm_term || '',
+    ...extractAttribution(attrs),
   };
 }
 

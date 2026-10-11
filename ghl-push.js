@@ -302,6 +302,11 @@ function toPlanBody(lead) {
     marketingConsent: lead.marketingConsent,
     campaign: lead.campaign || lead.utmCampaign,
     owner: lead.owner,
+    // attribution (attribution.js); only CheckCherry leads carry it
+    attributionSource: lead.source, status: lead.status,
+    gclid: lead.gclid, gbraid: lead.gbraid, wbraid: lead.wbraid,
+    utmSource: lead.utmSource, utmMedium: lead.utmMedium, utmCampaign: lead.utmCampaign,
+    utmContent: lead.utmContent, utmTerm: lead.utmTerm, origin: lead.origin,
     formName: formNameFromSource(lead.source),
     noteLines: [
       lead.location && !isParseArtifact(lead.location) && `Location: ${lead.location}`, // an upstream "key: value" fragment is not a location

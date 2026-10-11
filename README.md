@@ -250,7 +250,7 @@ the next 15-minute cycle.
 ## Google Ads offline conversions (CheckCherry leads)
 
 When `syncCheckCherry` inserts a **new** lead that carries a `gclid` / `gbraid` / `wbraid`, `google-ads.js`
-uploads a click conversion to customer `8531627827` (set in `config.js`) using the conversion action in
+uploads a click conversion to customer `1545947716` (set in `config.js`) using the conversion action in
 `GOOGLE_ADS_CONVERSION_ACTION_ID`, which must be an "Import from clicks" action. The click id is read from the CheckCherry attribute named in `CLICK_ID_ATTRIBUTES`
 (config.js), falling back to a `gclid=…` token inside any `utm_*` value, and is stored on the lead row
 (`gclid`, `gbraid`, `wbraid`; fill-only).
@@ -271,3 +271,22 @@ uploaded twice, existing leads are never back-filled, test leads and clicks olde
 | `GOOGLE_ADS_CONVERSION_ACTION_ID` | **Required.** Id of the "Import from clicks" conversion action |
 | `GOOGLE_ADS_UPLOAD_DRY_RUN=true` | Log what would be uploaded; send and record nothing |
 | `GOOGLE_ADS_UPLOAD_DISABLED=true` | Kill switch |
+
+## Marketing attribution (CheckCherry -> GHL)
+
+CheckCherry leads and events expose `gclid` and the five `utm_*` values as attributes, plus `source` and
+`origin` ("Online Booking" / "Lead Form"). `attribution.js` extracts them (stored on the lead row), derives
+`lead_channel`, and the GHL push writes them to contact fields **first touch wins** (new contact: written;
+existing contact: only into a blank field, via the same fill-blank logic as every other field).
+
+`lead_channel`: a gclid/gbraid/wbraid => **Google Ads** (the only value that gets the `google-ads` tag);
+`utm_content=hero_cta` without a click id => **Website**; `utm_source=google` + `utm_medium=cpc` without a click id =>
+**Google (unverified)**; facebook/instagram/meta => **Meta Ads**; otherwise `utm_source`, or **Direct / Unknown**.
+Spam leads get no attribution.
+
+Setup: `railway run node scripts/create-ghl-fields.js` (dry run) then `--apply` creates the TEXT fields `gclid`,
+`utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, `lead_channel`, `lead_origin` and prints
+`GHL_FIELD_GCLID_ID`, `GHL_FIELD_UTM_SOURCE_ID`, ... to set on Railway. Until set, those fields are skipped (the tag still applies).
+
+Backfill (last 60 days, matches by email then phone, never creates contacts):
+`railway run npm run backfill:attribution` (dry run) / `railway run node scripts/backfill-attribution.js --apply`.

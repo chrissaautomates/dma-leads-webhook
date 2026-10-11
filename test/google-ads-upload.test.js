@@ -35,10 +35,10 @@ test('uploads a click conversion for a new lead, once', async () => {
   await uploadLeadConversion(lead(), ins);
   assert.equal(adsCalls().length, 1);
   const c = adsCalls()[0];
-  assert.match(c.url, /customers\/8531627827:uploadClickConversions/);
+  assert.match(c.url, /customers\/1545947716:uploadClickConversions/);
   assert.equal(c.opts.headers['developer-token'], 'dev');
   const conv = JSON.parse(c.opts.body).conversions[0];
-  assert.equal(conv.conversionAction, 'customers/8531627827/conversionActions/555');
+  assert.equal(conv.conversionAction, 'customers/1545947716/conversionActions/555');
   assert.equal(conv.gclid, 'Cj0KCQabc');
   assert.equal(conv.orderId, 'checkcherry:1');
   assert.equal(getAdsConversion('checkcherry:1').status, 'uploaded');

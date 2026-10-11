@@ -5,6 +5,8 @@
 //   node scripts/create-ghl-fields.js --apply    # do it
 //   (--allow-similar: create a field even if one with a similar name exists)
 //
+// (Also creates the 8 attribution TEXT fields: gclid, utm_source, utm_medium, utm_campaign, utm_term,
+// utm_content, lead_channel, lead_origin -> GHL_FIELD_GCLID_ID, GHL_FIELD_UTM_SOURCE_ID, ... .)
 // Needs GHL_API_KEY + GHL_LOCATION_ID. This is the one script that works with
 // `railway run` (`railway run node scripts/create-ghl-fields.js`): it only talks to
 // GHL and never opens the leads database, so it doesn't need to run in the container.
@@ -35,6 +37,8 @@
 const fs = require('fs');
 const path = require('path');
 const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
+
+const ATTRIBUTION_FIELD_DEFS = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin'];
 
 const optionLabel = (o) => (typeof o === 'string' ? o : (o && (o.label || o.value || o.name)) || '');
 const optionsOf = (f) => (f.picklistOptions || f.options || []).map(optionLabel).filter(Boolean);
@@ -78,6 +82,8 @@ async function run(deps, { apply = false, allowSimilar = false, sleep = (ms) => 
   for (const [name, env, def] of [
     ['Guest Count', 'GHL_FIELD_GUEST_COUNT_ID', { name: 'Guest Count', dataType: 'NUMERICAL' }],
     ['Lead Type', 'GHL_FIELD_LEAD_TYPE_ID', { name: 'Lead Type', dataType: 'SINGLE_OPTIONS', options: FIELD_OPTIONS.LEAD_TYPE }],
+    // Marketing attribution (attribution.js). All TEXT; first touch wins is enforced by the plan, not the field.
+    ...ATTRIBUTION_FIELD_DEFS.map((name) => [name, `GHL_FIELD_${name.toUpperCase()}_ID`, { name, dataType: 'TEXT' }]),
   ]) {
     const found = findByName(existing, name);
     if (found) {

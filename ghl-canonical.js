@@ -33,6 +33,17 @@ const FIELDS = {
   // skips the field and keeps the value in the contact note instead. ---
   GUEST_COUNT: process.env.GHL_FIELD_GUEST_COUNT_ID || null, // "Guest Count", NUMERICAL
   LEAD_TYPE: process.env.GHL_FIELD_LEAD_TYPE_ID || null, // "Lead Type", SINGLE_OPTIONS
+
+  // --- Part 4: marketing attribution (TEXT), created by scripts/create-ghl-fields.js. Same
+  // rule as Part 3: until the printed IDs are set as GHL_FIELD_<NAME>_ID the plan skips them. ---
+  GCLID: process.env.GHL_FIELD_GCLID_ID || null, // "gclid"
+  UTM_SOURCE: process.env.GHL_FIELD_UTM_SOURCE_ID || null, // "utm_source"
+  UTM_MEDIUM: process.env.GHL_FIELD_UTM_MEDIUM_ID || null, // "utm_medium"
+  UTM_CAMPAIGN: process.env.GHL_FIELD_UTM_CAMPAIGN_ID || null, // "utm_campaign"
+  UTM_TERM: process.env.GHL_FIELD_UTM_TERM_ID || null, // "utm_term"
+  UTM_CONTENT: process.env.GHL_FIELD_UTM_CONTENT_ID || null, // "utm_content"
+  LEAD_CHANNEL: process.env.GHL_FIELD_LEAD_CHANNEL_ID || null, // "lead_channel" (see attribution.js deriveChannel)
+  LEAD_ORIGIN: process.env.GHL_FIELD_LEAD_ORIGIN_ID || null, // "lead_origin": CheckCherry origin ("Online Booking" / "Lead Form")
 };
 
 // Legacy/duplicate field IDs that must NEVER be written by this webhook —
@@ -129,6 +140,8 @@ const TAGS = {
   SOURCE_META: 'source-meta',
   SOURCE_GOOGLE_ADS: 'source-google-ads',
   SOURCE_CHECKCHERRY: 'source-checkcherry',
+  // Added when lead_channel is "Google Ads" (a gclid / gbraid / wbraid proves the click).
+  GOOGLE_ADS: 'google-ads',
   LEAD_NEW: 'new-lead',
   // Applied to EVERY existing contact that inquires again (removed first when already
   // present, so a GHL "Tag Added" trigger fires on every repeat inquiry).

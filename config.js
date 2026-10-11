@@ -31,10 +31,11 @@ const CHECKCHERRY_ATTRIBUTES = {
 // these. As a fallback the mapper also looks for `gclid=...` inside the utm_* values.
 const CLICK_ID_ATTRIBUTES = { gclid: 'gclid', gbraid: 'gbraid', wbraid: 'wbraid' };
 
-// Google Ads offline conversion target. The customer id is fixed; the conversion action
+// Google Ads offline conversion target. The customer id is fixed (if it is reached through a manager account, set
+// GOOGLE_ADS_LOGIN_CUSTOMER_ID to the manager's id); the conversion action
 // id comes from GOOGLE_ADS_CONVERSION_ACTION_ID (must be an "Import from clicks" action).
 const GOOGLE_ADS_CONVERSION = {
-  customerId: '8531627827',
+  customerId: '1545947716', // verified as the account holding the conversion actions (AW-11435337008)
   get conversionActionId() { return String(process.env.GOOGLE_ADS_CONVERSION_ACTION_ID || '').trim(); },
 };
 

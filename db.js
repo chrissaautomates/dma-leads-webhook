@@ -97,7 +97,7 @@ SHAPE_COLUMNS.forEach((col) => {
 
 // Migration: Google Ads click ids captured from the landing page (CheckCherry hidden
 // field / UTM param). Same additive ADD COLUMN approach; fill-only on update.
-const CLICK_ID_COLUMNS = ['gclid', 'gbraid', 'wbraid'];
+const CLICK_ID_COLUMNS = ['gclid', 'gbraid', 'wbraid', 'origin', 'cc_source']; // + CheckCherry's `origin` and free-text `source`
 const columnsForClickIds = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
 CLICK_ID_COLUMNS.forEach((col) => {
   if (!columnsForClickIds.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
@@ -247,12 +247,12 @@ function recordDeletion(email, target, source) {
 const insertLead = db.prepare(`
   INSERT INTO leads (
     target, date_received, source, name, company, email, phone, location, interest,
-    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed, gclid, gbraid, wbraid,
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed, gclid, gbraid, wbraid, origin, cc_source,
     event_date, event_type, guest_count, budget_range, city, secondary_interest, lead_type, marketing_consent, campaign, extra
   )
   VALUES (
     @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
-    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed, @gclid, @gbraid, @wbraid,
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed, @gclid, @gbraid, @wbraid, @origin, @cc_source,
     @event_date, @event_type, @guest_count, @budget_range, @city, @secondary_interest, @lead_type, @marketing_consent, @campaign, @extra
   )
 `);
@@ -271,6 +271,8 @@ const updateLeadFields = db.prepare(`
     gclid = COALESCE(NULLIF(@gclid, ''), gclid),
     gbraid = COALESCE(NULLIF(@gbraid, ''), gbraid),
     wbraid = COALESCE(NULLIF(@wbraid, ''), wbraid),
+    origin = COALESCE(NULLIF(@origin, ''), origin),
+    cc_source = COALESCE(NULLIF(@cc_source, ''), cc_source),
     event_date = COALESCE(NULLIF(@event_date, ''), event_date),
     event_type = COALESCE(NULLIF(@event_type, ''), event_type),
     guest_count = COALESCE(NULLIF(@guest_count, ''), guest_count),
@@ -342,6 +344,7 @@ function shapeParams(data) {
     lead_type: v(data.leadType), marketing_consent: v(data.marketingConsent), campaign: v(data.campaign),
     extra: v(data.extra),
     gclid: v(data.gclid), gbraid: v(data.gbraid), wbraid: v(data.wbraid),
+    origin: v(data.origin), cc_source: v(data.ccSource),
   };
 }
 

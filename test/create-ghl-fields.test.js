@@ -167,19 +167,21 @@ describe('create-ghl-fields: never creates a duplicate field', () => {
   test('creates Guest Count and Lead Type when absent; a second run creates nothing', async () => {
     const g = fakeGhl({ fields: baseFields() });
     const first = await run(g, { apply: true });
-    assert.deepEqual(first.created.map((c) => c.name), ['Guest Count', 'Lead Type']);
+    const ATTR = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin'];
+    assert.deepEqual(first.created.map((c) => c.name), ['Guest Count', 'Lead Type', ...ATTR]);
+    assert.ok(g.state.created.slice(2).every((d) => d.dataType === 'TEXT'));
     assert.deepEqual(g.state.created[1].options, FIELD_OPTIONS.LEAD_TYPE);
     const second = await run(g, { apply: true });
     assert.equal(second.created.length, 0);
-    assert.equal(g.state.created.length, 2);
-    assert.deepEqual(second.existing.map((e) => e.name), ['Guest Count', 'Lead Type']);
+    assert.equal(g.state.created.length, 10);
+    assert.deepEqual(second.existing.map((e) => e.name), ['Guest Count', 'Lead Type', ...ATTR]);
   });
 
   test('an existing field with the same name (any case/spacing) blocks creation and reports its id', async () => {
     const fields = [...baseFields(), { id: 'gc1', name: '  guest   COUNT ', dataType: 'NUMERICAL' }, { id: 'lt1', name: 'Lead Type', dataType: 'TEXT' }];
     const g = fakeGhl({ fields });
     const r = await run(g, { apply: true });
-    assert.equal(g.state.created.length, 0);
+    assert.ok(!g.state.created.some((d) => d.name === 'Guest Count' || d.name === 'Lead Type'));
     assert.deepEqual(r.existing, [{ name: 'Guest Count', id: 'gc1' }, { name: 'Lead Type', id: 'lt1' }]);
   });
 

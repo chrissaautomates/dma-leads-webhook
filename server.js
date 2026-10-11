@@ -209,6 +209,7 @@ app.post('/webhook/google-ads-lead', (req, res) => {
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Leads webhook listening on ${PORT}`));
   console.log(`GHL lead push mode: ${describeMode()}`);
+  require('./google-ads').logSheetsAccount(); // which Google account the Sheets token belongs to
 
   // runFullSync() was previously never actually wired up to run anywhere in
   // production — no automatic trigger here, and no manual trigger in the

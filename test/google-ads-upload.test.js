@@ -117,6 +117,15 @@ test('skips test leads, spam, and (with a gclid) clicks older than 90 days', asy
   assert.equal(calls.length, 0);
 });
 
+test('skips test data: gclid starting with TEST, or utm_campaign "test"', async () => {
+  await uploadLeadConversion(lead({ gclid: 'TEST123' }), ins);
+  await uploadLeadConversion(lead({ submissionId: 'checkcherry:5', gclid: 'tEsT9' }), ins);
+  await uploadLeadConversion(lead({ submissionId: 'checkcherry:6', utmCampaign: ' Test ' }), ins);
+  assert.equal(calls.length, 0);
+  await uploadLeadConversion(lead({ submissionId: 'checkcherry:7', utmCampaign: 'spring_promo' }), ins);
+  assert.equal(appended().length, 1);
+});
+
 test('mapper carries gclid and the created time; the lead row stores the gclid', () => {
   const l = mapCheckCherryLead({ id: 5, attributes: { email: 'k@l.com', gclid: 'G1', created_at: '2026-10-11T01:10:04.185-04:00' } });
   assert.equal(l.gclid, 'G1'); assert.equal(l.createdAtIso, '2026-10-11T01:10:04.185-04:00');

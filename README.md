@@ -257,7 +257,7 @@ Google Sheets). Columns, in order: **A** Google Click ID (gclid, blank if none) 
 **G** SHA-256 of the phone as E.164.
 
 A row is appended only if it has a gclid, an email or a phone, and its Order ID is not already in column E.
-Existing leads are never back-filled; spam and test leads are skipped; a lead with a gclid older than 90 days
+Existing leads are never back-filled; spam and test leads (and test data: a gclid starting with `TEST`, or `utm_campaign` "test") are skipped; a lead with a gclid older than 90 days
 is skipped. Every attempt is logged (`[google-ads] …`) and recorded in `ads_conversions` (`error` is retried
 up to 5 times on later syncs). The gclid is stored on the lead row (`gclid`, `gbraid`, `wbraid`; fill-only).
 The landing page must pass the click id into CheckCherry (a hidden `gclid` field populated from the URL).

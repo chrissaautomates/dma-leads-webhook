@@ -181,6 +181,8 @@ async function uploadLeadConversion(lead, upsertResult) {
     if (!row) { record('rejected', 'no gclid, email or phone'); return log('skipped', 'no gclid, email or phone'); }
     const skip = testLeadReason(lead);
     if (skip) return log('skipped (test lead)', skip);
+    // The owner's own tracking tests (same rule as scripts/backfill-attribution.js).
+    if (/^test/i.test(gclid) || String(lead.utmCampaign || '').trim().toLowerCase() === 'test') return log('skipped (test data)', 'gclid starts with TEST or utm_campaign is "test"');
     if (String(lead.status || '').trim().toLowerCase() === 'spam') return log('skipped (spam)');
     const ageDays = lead.createdAtIso ? (Date.now() - new Date(lead.createdAtIso).getTime()) / 86400000 : 0;
     if (gclid && ageDays > CLICK_WINDOW_DAYS) {

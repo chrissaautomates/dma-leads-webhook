@@ -246,3 +246,28 @@ the next 15-minute cycle.
 ### Local test
 
 `npm test` — GHL is fully mocked; nothing touches a real contact.
+
+## Google Ads offline conversions (CheckCherry leads)
+
+When `syncCheckCherry` inserts a **new** lead that carries a `gclid` / `gbraid` / `wbraid`, `google-ads.js`
+uploads a click conversion to customer `8531627827` (set in `config.js`) using the conversion action in
+`GOOGLE_ADS_CONVERSION_ACTION_ID`, which must be an "Import from clicks" action. The click id is read from the CheckCherry attribute named in `CLICK_ID_ATTRIBUTES`
+(config.js), falling back to a `gclid=…` token inside any `utm_*` value, and is stored on the lead row
+(`gclid`, `gbraid`, `wbraid`; fill-only).
+
+The landing page must pass the click id into CheckCherry: a hidden form field named `gclid` (and
+`gbraid`/`wbraid`) populated from the URL query string.
+
+Every attempt is logged (`[google-ads] …`) and recorded in `ads_conversions` (one row per submission id;
+`uploaded`/`rejected` are final, `error` is retried up to 5 times on later syncs). A click id is never
+uploaded twice, existing leads are never back-filled, test leads and clicks older than 90 days are skipped.
+
+| Env var | Purpose |
+|---|---|
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | OAuth; the refresh token must have the `adwords` scope |
+| `GOOGLE_ADS_DEVELOPER_TOKEN` | **Required** by the Google Ads API |
+| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Manager account id, if the customer is reached through one |
+| `GOOGLE_ADS_API_VERSION` | Default `v23`; bump when Google sunsets it |
+| `GOOGLE_ADS_CONVERSION_ACTION_ID` | **Required.** Id of the "Import from clicks" conversion action |
+| `GOOGLE_ADS_UPLOAD_DRY_RUN=true` | Log what would be uploaded; send and record nothing |
+| `GOOGLE_ADS_UPLOAD_DISABLED=true` | Kill switch |

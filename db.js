@@ -95,6 +95,24 @@ SHAPE_COLUMNS.forEach((col) => {
   if (!columnsNow.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
 });
 
+// Migration: Google Ads click ids captured from the landing page (CheckCherry hidden
+// field / UTM param). Same additive ADD COLUMN approach; fill-only on update.
+const CLICK_ID_COLUMNS = ['gclid', 'gbraid', 'wbraid'];
+const columnsForClickIds = db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name);
+CLICK_ID_COLUMNS.forEach((col) => {
+  if (!columnsForClickIds.includes(col)) db.exec(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`);
+});
+
+// One row per Google Ads offline click conversion attempt, keyed by source submission id
+// ("checkcherry:<id>"). status: 'uploaded' and 'rejected' are terminal (never re-sent);
+// 'error' is transient and retried on a later sync (attempts is capped by the caller).
+// click_id is unique among terminal rows' lookups (see hasAdsConversionForClick) so one
+// click can't be counted twice via two leads.
+db.exec(`CREATE TABLE IF NOT EXISTS ads_conversions (
+  sid TEXT PRIMARY KEY, click_id TEXT, click_type TEXT, status TEXT NOT NULL, detail TEXT,
+  attempts INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
 // Migration: ghl_pushed records whether a lead has been pushed to GHL (see
 // ghl-push.js). NULL = pending (eligible to push); anything else is terminal:
 // 'pushed', 'legacy', 'excluded_barr', 'excluded_source', 'excluded_proposal'.
@@ -229,12 +247,12 @@ function recordDeletion(email, target, source) {
 const insertLead = db.prepare(`
   INSERT INTO leads (
     target, date_received, source, name, company, email, phone, location, interest,
-    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed,
+    status, owner, notes, next_follow_up, utm_source, utm_medium, utm_campaign, utm_content, utm_term, ghl_pushed, gclid, gbraid, wbraid,
     event_date, event_type, guest_count, budget_range, city, secondary_interest, lead_type, marketing_consent, campaign, extra
   )
   VALUES (
     @target, @date_received, @source, @name, @company, @email, @phone, @location, @interest,
-    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed,
+    @status, @owner, @notes, @next_follow_up, @utm_source, @utm_medium, @utm_campaign, @utm_content, @utm_term, @ghl_pushed, @gclid, @gbraid, @wbraid,
     @event_date, @event_type, @guest_count, @budget_range, @city, @secondary_interest, @lead_type, @marketing_consent, @campaign, @extra
   )
 `);
@@ -250,6 +268,9 @@ const updateLeadFields = db.prepare(`
     utm_campaign = COALESCE(NULLIF(@utm_campaign, ''), utm_campaign),
     utm_content = COALESCE(NULLIF(@utm_content, ''), utm_content),
     utm_term = COALESCE(NULLIF(@utm_term, ''), utm_term),
+    gclid = COALESCE(NULLIF(@gclid, ''), gclid),
+    gbraid = COALESCE(NULLIF(@gbraid, ''), gbraid),
+    wbraid = COALESCE(NULLIF(@wbraid, ''), wbraid),
     event_date = COALESCE(NULLIF(@event_date, ''), event_date),
     event_type = COALESCE(NULLIF(@event_type, ''), event_type),
     guest_count = COALESCE(NULLIF(@guest_count, ''), guest_count),
@@ -320,7 +341,22 @@ function shapeParams(data) {
     budget_range: v(data.budgetRange), city: v(data.city), secondary_interest: v(data.secondaryInterest),
     lead_type: v(data.leadType), marketing_consent: v(data.marketingConsent), campaign: v(data.campaign),
     extra: v(data.extra),
+    gclid: v(data.gclid), gbraid: v(data.gbraid), wbraid: v(data.wbraid),
   };
+}
+
+function getAdsConversion(sid) {
+  return db.prepare(`SELECT * FROM ads_conversions WHERE sid = ?`).get(sid);
+}
+// True when a DIFFERENT submission already has a non-error upload for this click id.
+function hasAdsConversionForClick(clickId, exceptSid) {
+  return !!db.prepare(`SELECT 1 FROM ads_conversions WHERE click_id = ? AND sid != ? AND status IN ('uploaded','rejected')`).get(clickId, exceptSid || '');
+}
+function recordAdsConversion({ sid, clickId, clickType, status, detail }) {
+  db.prepare(`INSERT INTO ads_conversions (sid, click_id, click_type, status, detail) VALUES (?,?,?,?,?)
+    ON CONFLICT(sid) DO UPDATE SET status = excluded.status, detail = excluded.detail, click_id = excluded.click_id,
+      click_type = excluded.click_type, attempts = attempts + 1, updated_at = datetime('now')`)
+    .run(sid, clickId, clickType, status, String(detail || '').slice(0, 1000));
 }
 
 function upsertLead(data) {
@@ -537,6 +573,9 @@ function markGhlPushed(id, value) {
 
 module.exports = {
   db,
+  getAdsConversion,
+  hasAdsConversionForClick,
+  recordAdsConversion,
   BARR_PATTERN,
   getGhlState,
   setProposalEmails,

@@ -5,7 +5,8 @@
 const { upsertLead, findLead, computeTarget, setProposalEmails } = require('./db');
 const { pushAfterUpsert, tagProposalSentContacts } = require('./ghl-push');
 const { classifyLabel, parseConsent, toIsoDate } = require('./lead-shape');
-const { CHECKCHERRY_ATTRIBUTES } = require('./config');
+const { CHECKCHERRY_ATTRIBUTES, CLICK_ID_ATTRIBUTES } = require('./config');
+const { uploadLeadConversion } = require('./google-ads');
 
 const status = {};
 
@@ -84,6 +85,25 @@ function strictAttr(attrs, shapeKey, missing) {
 
 const warnedCheckCherry = new Set();
 
+// gclid / gbraid / wbraid for a CheckCherry lead: the configured attribute first, then a
+// `name=value` token inside any utm_* value (landing pages that smuggle it through a UTM).
+function extractClickIds(attrs) {
+  const out = { gclid: '', gbraid: '', wbraid: '' };
+  const utms = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].map((k) => String(attrs[k] || ''));
+  for (const key of Object.keys(out)) {
+    const attr = CLICK_ID_ATTRIBUTES[key];
+    let v = attr && attrs[attr] != null ? String(attrs[attr]).trim() : '';
+    if (!v) {
+      for (const u of utms) {
+        const m = u.match(new RegExp(`(?:^|[?&|;,\\s])${key}[=:]([A-Za-z0-9_-]+)`, 'i'));
+        if (m) { v = m[1]; break; }
+      }
+    }
+    out[key] = v;
+  }
+  return out;
+}
+
 function mapCheckCherryLead(record) {
   const attrs = (record && record.attributes) || record || {};
 
@@ -147,6 +167,9 @@ function mapCheckCherryLead(record) {
     utmCampaign: attrs.utm_campaign || '',
     utmContent: attrs.utm_content || '',
     utmTerm: attrs.utm_term || '',
+    ...extractClickIds(attrs),
+    // Exact created_at timestamp (transient, not stored) for the Ads conversion time.
+    createdAtIso: attrs.created_at || '',
   };
   // One line per lead, never one per attribute; ids only (no personal data in logs).
   // The sync re-reads every open lead each cycle, so warn once per lead per process.
@@ -187,7 +210,10 @@ async function processCheckCherryLeads(records, proposalEmails) {
   for (const record of records) {
     const lead = mapCheckCherryLead(record);
     if (!lead.email && !lead.name) continue; // malformed/unmapped record — never write a junk row
-    await upsertAndPush(lead, { proposalEmails });
+    const result = await upsertAndPush(lead, { proposalEmails });
+    // Google Ads offline conversion for a NEW lead that carries a click id (also retries
+    // earlier transient failures). Never throws; every outcome is logged.
+    await uploadLeadConversion(lead, result);
     total++;
   }
   return total;

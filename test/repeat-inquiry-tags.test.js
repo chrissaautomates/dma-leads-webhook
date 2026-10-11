@@ -616,8 +616,20 @@ describe('2. proposal-requested / quiz-completed are removed then re-added so th
 describe('7. Canadian phone -> Marketing Consent "Yes" (implied), tagged consent-implied-inquiry', () => {
   const CA = '+1 416 204 1234'; const CA_LOCAL = '416-204-1234'; const US = '+1 212 555 1234';
   const consentOf = (body) => field(body, FIELDS.MARKETING_CONSENT);
-  const created = async (over) => { reset(); setEnv(LIVE); await run(newLead(over)); return post().body; };
-  const existingRun = async (cf, over, contactExtra = {}) => { reset(); setEnv(LIVE); const lead = newLead(over); addContact(lead.email, { customFields: cf, ...contactExtra }); await run(lead); return put() ? put().body : { customFields: [] }; };
+  // Implied consent is for CheckCherry leads only (the CheckCherry consent box); the CheckCherry push needs
+  // this cycle's proposal-email set and no settle wait.
+  const LIVE7 = { ...LIVE, GHL_CHECKCHERRY_SETTLE_MINUTES: '0' };
+  const cc = (over) => newLead({ source: 'CheckCherry', ...over });
+  const run7 = (lead) => push.pushAfterUpsert(lead, upsertLead(lead), { proposalEmails: new Set() });
+  const created = async (over, source = 'CheckCherry') => { reset(); setEnv(LIVE7); await run7(newLead({ source, ...over })); return post().body; };
+  const existingRun = async (cf, over, contactExtra = {}) => { reset(); setEnv(LIVE7); const lead = cc(over); addContact(lead.email, { customFields: cf, ...contactExtra }); await run7(lead); return put() ? put().body : { customFields: [] }; };
+
+  test('NOT for Wix, Meta or Google lead-form leads: a Canadian number there leaves consent empty, no tag', async () => {
+    for (const source of ['Wix Form - Quote', 'Meta Ads', 'Google Ads']) {
+      assert.strictEqual(consentOf(await created({ phone: CA }, source)), undefined, source);
+      assert.ok(!tagPosts().includes('consent-implied-inquiry'), source);
+    }
+  });
 
   test('Canadian number, consent empty (new contact) -> "Yes" + consent-implied-inquiry', async () => {
     assert.strictEqual(consentOf(await created({ phone: CA })), 'Yes');
@@ -678,8 +690,8 @@ describe('7. Canadian phone -> Marketing Consent "Yes" (implied), tagged consent
     assert.ok(!tagPosts().includes('consent-implied-inquiry'));
   });
   test('dry run reports it (tag + Marketing Consent set) and writes nothing', async () => {
-    reset(); setEnv({});
-    await run(newLead({ phone: CA }));
+    reset(); setEnv({ GHL_CHECKCHERRY_SETTLE_MINUTES: '0' });
+    await run7(cc({ phone: CA }));
     assert.deepEqual(writes(), []);
     const line = logs.find((l) => l.includes('WOULD CREATE'));
     assert.match(line, /consent-implied-inquiry/);

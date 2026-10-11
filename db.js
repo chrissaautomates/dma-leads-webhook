@@ -153,9 +153,22 @@ db.exec(`CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT
 // so a second submission from the same person only updates the stored row; this table is what
 // lets every NEW submission reach GHL (as a repeat inquiry) exactly once. Additive; written
 // only in live mode.
+const submissionsTableExisted = !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'submissions'`).get();
 db.exec(`CREATE TABLE IF NOT EXISTS submissions (
   sid TEXT PRIMARY KEY, row_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now'))
 )`);
+// BASELINE: the day this table is first created on a database that already holds leads, every
+// submission up to and including that day is treated as already handled (the old code pushed those
+// leads without recording their submission ids; without this, the first sync would re-push each of
+// them once as a "repeat inquiry"). Only strictly later submissions can become repeat inquiries.
+// A fresh/empty database (tests, new installs) gets no baseline.
+if (!submissionsTableExisted && db.prepare(`SELECT COUNT(*) n FROM leads`).get().n > 0) {
+  db.prepare(`INSERT OR IGNORE INTO sync_state (key, value) VALUES ('submissions_baseline_date', ?)`).run(new Date().toISOString().slice(0, 10));
+}
+function getSubmissionsBaselineDate() {
+  const row = db.prepare(`SELECT value FROM sync_state WHERE key = 'submissions_baseline_date'`).get();
+  return row ? row.value : '';
+}
 
 db.exec(`CREATE TABLE IF NOT EXISTS cc_proposal_tags (
   event_id TEXT PRIMARY KEY, email TEXT, outcome TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -576,6 +589,7 @@ function markGhlPushed(id, value) {
 
 module.exports = {
   db,
+  getSubmissionsBaselineDate,
   getAdsConversion,
   hasAdsConversionForClick,
   recordAdsConversion,

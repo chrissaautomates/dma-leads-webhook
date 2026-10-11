@@ -317,6 +317,26 @@ function toPlanBody(lead) {
   };
 }
 
+// Marketing-attribution custom fields are best-effort: if GHL rejects the write (HTTP 400/422, e.g. one
+// bad field id or value), retry ONCE without those fields so the lead still reaches GHL instead of
+// failing the whole contact create/update on every attempt. Any other error (or a rejection that
+// persists without them) is thrown as before.
+function attributionFieldIds() {
+  return new Set(['GCLID', 'UTM_SOURCE', 'UTM_MEDIUM', 'UTM_CAMPAIGN', 'UTM_TERM', 'UTM_CONTENT', 'LEAD_CHANNEL', 'LEAD_ORIGIN']
+    .map((k) => FIELDS[k]).filter(Boolean));
+}
+async function withoutAttributionOnRejection(send, customFields) {
+  try {
+    return await send(customFields);
+  } catch (err) {
+    const attr = attributionFieldIds();
+    const stripped = customFields.filter((f) => !attr.has(f.id));
+    if (!(err && (err.status === 400 || err.status === 422)) || stripped.length === customFields.length) throw err;
+    console.warn(`[ghl-push] GHL rejected the contact write (HTTP ${err.status}); retrying without ${customFields.length - stripped.length} attribution field(s): ${String(err.body || err.message).slice(0, 200)}`);
+    return send(stripped);
+  }
+}
+
 // dryRun: performs only READ calls (duplicate lookup, get contact) so the
 // result reflects what a live run would really do; sends nothing.
 async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
@@ -354,14 +374,14 @@ async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
 
   let contactId;
   if (existing) {
-    await ghl.updateContact(existing.id, {
+    await withoutAttributionOnRejection((customFields) => ghl.updateContact(existing.id, {
       ...plan.contactFields,
       ...fill.contactFields,
-      customFields: [...plan.customFields, ...fill.customFields],
-    });
+      customFields,
+    }), [...plan.customFields, ...fill.customFields]);
     contactId = existing.id;
   } else {
-    const result = await ghl.createContact({ ...plan.contactFields, customFields: plan.customFields });
+    const result = await withoutAttributionOnRejection((customFields) => ghl.createContact({ ...plan.contactFields, customFields }), plan.customFields);
     contactId = result.contact.id;
   }
   // Remove -> add, so a GHL "Tag Added" trigger fires again even when the tag is already there.

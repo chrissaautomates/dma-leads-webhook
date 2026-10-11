@@ -284,8 +284,10 @@ existing contact: only into a blank field, via the same fill-blank logic as ever
 **Google (unverified)**; facebook/instagram/meta => **Meta Ads**; otherwise `utm_source`, or **Direct / Unknown**.
 Spam leads get no attribution.
 
-Setup: `railway run node scripts/create-ghl-fields.js` (dry run) then `--apply` creates the TEXT fields `gclid`,
-`utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`, `lead_channel`, `lead_origin` and prints
+Setup: `railway run node scripts/create-ghl-fields.js` (dry run) then `--apply` creates the TEXT fields `DMA gclid`,
+`DMA utm_source`, `DMA utm_medium`, `DMA utm_campaign`, `DMA utm_term`, `DMA utm_content`, `lead_channel`, `lead_origin`
+(names that collide with GHL standard/attribution fields get a "DMA " prefix; the contacts API cannot set the standard `gclid`)
+and prints
 `GHL_FIELD_GCLID_ID`, `GHL_FIELD_UTM_SOURCE_ID`, ... to set on Railway. Until set, those fields are skipped (the tag still applies).
 
 Backfill (last 60 days, matches by email then phone, never creates contacts):

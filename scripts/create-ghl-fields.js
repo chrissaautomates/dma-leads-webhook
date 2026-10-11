@@ -6,13 +6,14 @@
 //   (--allow-similar: create a field even if one with a similar name exists)
 //
 // (Also creates the 8 attribution TEXT fields: gclid, utm_source, utm_medium, utm_campaign, utm_term,
-// utm_content, lead_channel, lead_origin -> GHL_FIELD_GCLID_ID, GHL_FIELD_UTM_SOURCE_ID, ... .)
+// utm_content, lead_channel, lead_origin -> GHL_FIELD_GCLID_ID, GHL_FIELD_UTM_SOURCE_ID, ... . Names that
+// collide with a GHL standard / attribution field are created as "DMA <name>", e.g. "DMA gclid".)
 // Needs GHL_API_KEY + GHL_LOCATION_ID. This is the one script that works with
 // `railway run` (`railway run node scripts/create-ghl-fields.js`): it only talks to
 // GHL and never opens the leads database, so it doesn't need to run in the container.
 // It:
 //   1. creates "Guest Count" (NUMERICAL) — only if no contact field with that name exists
-//   2. creates "Lead Type" (SINGLE_OPTIONS, FIELD_OPTIONS.LEAD_TYPE) — same check
+//   2. REUSES the existing "DMA Lead Type" field (never creates a Lead Type)
 //   3. adds Glambot / Robotics / LED Tunnel / DMA Engage / Holiday / Headshot to the
 //      DMA_Interest picklist
 // then prints the new field IDs to set as GHL_FIELD_GUEST_COUNT_ID /
@@ -39,6 +40,33 @@ const path = require('path');
 const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
 
 const ATTRIBUTION_FIELD_DEFS = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin'];
+
+// The existing "DMA Lead Type" field is REUSED; a new "Lead Type" field is never created.
+const REUSE_LEAD_TYPE = { name: 'Lead Type', id: 'sbTqxmTIflSJeviCeNnT', env: 'GHL_FIELD_LEAD_TYPE_ID', existingName: 'DMA Lead Type' };
+const GUEST_COUNT_ID = 'b82mrRP4Koh6LT2Wij3V';
+
+// Names GHL reserves for STANDARD contact fields and the attribution (UTM / click-id) fields. A custom
+// field with one of these names is rejected (live: "gclid" -> HTTP 400 "conflicts with the standard
+// field contact.gclid"), and the contacts API cannot set the standard ones (the create/update body has
+// no gclid / attribution members), so a conflicting field is created as "DMA <name>" instead. This list
+// is our best knowledge of GHL's names, not an official one: a 400 conflict on create also falls back to
+// the "DMA " name (see run()).
+const STANDARD_FIELD_NAMES = [
+  // contact
+  'first_name', 'last_name', 'full_name', 'name', 'email', 'phone', 'company_name', 'address1', 'city', 'state',
+  'postal_code', 'country', 'website', 'timezone', 'date_of_birth', 'source', 'tags', 'assigned_to', 'dnd',
+  // attribution (attributionSource / lastAttributionSource)
+  'gclid', 'fbclid', 'msclkid', 'ttclid', 'fbc', 'fbp', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
+  'utm_content', 'utm_keyword', 'utm_id', 'utm_session_source', 'session_source', 'medium', 'medium_id', 'campaign',
+  'campaign_id', 'ad_group_id', 'ad_id', 'referrer', 'referrer_url', 'url', 'user_agent', 'ip', 'ga_client_id',
+];
+const stdKey = (n) => String(n || '').trim().toLowerCase().replace(/^contact\./, '').replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '');
+const STANDARD_KEYS = new Set(STANDARD_FIELD_NAMES.map(stdKey).concat(STANDARD_FIELD_NAMES.map((n) => stdKey(n).replace(/_/g, ''))));
+function standardConflict(name) {
+  const k = stdKey(name);
+  return STANDARD_KEYS.has(k) || STANDARD_KEYS.has(k.replace(/_/g, ''));
+}
+const dmaName = (name) => (/^dma\s/i.test(name) ? name : `DMA ${name}`);
 
 const optionLabel = (o) => (typeof o === 'string' ? o : (o && (o.label || o.value || o.name)) || '');
 const optionsOf = (f) => (f.picklistOptions || f.options || []).map(optionLabel).filter(Boolean);
@@ -79,12 +107,38 @@ async function run(deps, { apply = false, allowSimilar = false, sleep = (ms) => 
   // probable duplicate in spirit: never create over it unless --allow-similar.
   const findSimilar = (fields, name) => fields.find((f) => norm(f.name) !== norm(name) && (norm(f.name).includes(norm(name)) || norm(name).includes(norm(f.name))));
 
-  for (const [name, env, def] of [
-    ['Guest Count', 'GHL_FIELD_GUEST_COUNT_ID', { name: 'Guest Count', dataType: 'NUMERICAL' }],
-    ['Lead Type', 'GHL_FIELD_LEAD_TYPE_ID', { name: 'Lead Type', dataType: 'SINGLE_OPTIONS', options: FIELD_OPTIONS.LEAD_TYPE }],
-    // Marketing attribution (attribution.js). All TEXT; first touch wins is enforced by the plan, not the field.
-    ...ATTRIBUTION_FIELD_DEFS.map((name) => [name, `GHL_FIELD_${name.toUpperCase()}_ID`, { name, dataType: 'TEXT' }]),
-  ]) {
+  // Lead Type: REUSE the existing "DMA Lead Type" field (never create a new one).
+  const lt = existing.find((f) => f.id === REUSE_LEAD_TYPE.id);
+  if (!lt) log(`!! expected the existing "${REUSE_LEAD_TYPE.existingName}" field (id=${REUSE_LEAD_TYPE.id}) was not found in GHL`);
+  else {
+    result.existing.push({ name: REUSE_LEAD_TYPE.name, id: lt.id });
+    log(`"Lead Type": REUSING "${lt.name}" (id=${lt.id}, ${lt.dataType}) -> set ${REUSE_LEAD_TYPE.env}=${lt.id}`);
+    log(`  !! its options [${optionsOf(lt).join(' | ')}] differ from the app's lead types [${FIELD_OPTIONS.LEAD_TYPE.join(' | ')}]; the app writes its own values, so leave ${REUSE_LEAD_TYPE.env} UNSET until a mapping is decided (lead-type tags still work without it)`);
+  }
+
+  const guest = findByName(existing, 'Guest Count');
+  if (guest) {
+    result.existing.push({ name: 'Guest Count', id: guest.id });
+    log(`"Guest Count" already exists: id=${guest.id}  -> set GHL_FIELD_GUEST_COUNT_ID=${guest.id}${guest.id === GUEST_COUNT_ID ? '' : `   !! expected ${GUEST_COUNT_ID}`}`);
+  } else {
+    log(`WOULD CREATE "Guest Count": {"name":"Guest Count","dataType":"NUMERICAL"}`);
+    if (apply) {
+      const again = findByName(await deps.listCustomFields(), 'Guest Count');
+      if (again) { result.existing.push({ name: 'Guest Count', id: again.id }); log(`  "Guest Count" appeared since the first listing: id=${again.id} (not created)`); } else {
+        const created = await deps.createCustomField({ name: 'Guest Count', dataType: 'NUMERICAL' });
+        result.created.push({ name: 'Guest Count', id: created.id });
+        log(`  created id=${created.id}  -> set GHL_FIELD_GUEST_COUNT_ID=${created.id}`);
+      }
+    }
+  }
+
+  // Marketing attribution TEXT fields. A name that collides with a GHL standard / attribution field is
+  // created as "DMA <name>" (the contacts API cannot write the standard fields).
+  for (const key of ATTRIBUTION_FIELD_DEFS) {
+    const env = `GHL_FIELD_${key.toUpperCase()}_ID`;
+    const conflict = standardConflict(key);
+    const name = conflict ? dmaName(key) : key;
+    if (conflict) log(`"${key}" conflicts with a GHL standard field -> using "${name}"`);
     const found = findByName(existing, name);
     if (found) {
       result.existing.push({ name, id: found.id });
@@ -94,10 +148,10 @@ async function run(deps, { apply = false, allowSimilar = false, sleep = (ms) => 
     const similar = findSimilar(existing, name);
     if (similar && !allowSimilar) {
       result.similar = [...(result.similar || []), { name, existingName: similar.name, id: similar.id, dataType: similar.dataType, options: optionsOf(similar) }];
-      log(`NOT CREATING "${name}": a similar field already exists — "${similar.name}" (id=${similar.id}, ${similar.dataType}${optionsOf(similar).length ? `, options: ${optionsOf(similar).join(' | ')}` : ''}). Decide whether to reuse it; pass --allow-similar to create "${name}" anyway.`);
+      log(`NOT CREATING "${name}": a similar field already exists — "${similar.name}" (id=${similar.id}, ${similar.dataType}). Decide whether to reuse it; pass --allow-similar to create "${name}" anyway.`);
       continue;
     }
-    log(`WOULD CREATE "${name}": ${JSON.stringify(def)}`);
+    log(`WOULD CREATE "${name}": ${JSON.stringify({ name, dataType: 'TEXT' })}`);
     if (!apply) continue;
     // Fresh check right before creating, so nothing created meanwhile is duplicated.
     const again = findByName(await deps.listCustomFields(), name);
@@ -106,7 +160,22 @@ async function run(deps, { apply = false, allowSimilar = false, sleep = (ms) => 
       log(`  "${name}" appeared since the first listing: id=${again.id}  -> set ${env}=${again.id} (not created)`);
       continue;
     }
-    const created = await deps.createCustomField(def);
+    let created;
+    try {
+      created = await deps.createCustomField({ name, dataType: 'TEXT' });
+    } catch (err) {
+      // GHL rejected the name as a standard-field conflict our list didn't know: retry once as "DMA <name>".
+      if (err && err.status === 400 && /conflict|standard|reserved|already/i.test(`${err.body || ''} ${err.message}`) && name === key) {
+        const alt = dmaName(key);
+        log(`  GHL rejected "${name}" (${String(err.body || err.message).slice(0, 160)}) -> retrying as "${alt}"`);
+        if (findByName(await deps.listCustomFields(), alt)) throw new Error(`"${alt}" already exists`);
+        created = await deps.createCustomField({ name: alt, dataType: 'TEXT' });
+        result.created.push({ name: alt, id: created.id });
+        log(`  created id=${created.id}  -> set ${env}=${created.id}`);
+        continue;
+      }
+      throw err;
+    }
     result.created.push({ name, id: created.id });
     log(`  created id=${created.id}  -> set ${env}=${created.id}`);
   }
@@ -151,4 +220,4 @@ if (require.main === module) {
     .catch((err) => { console.error(err.message, err.body || ''); process.exit(1); });
 }
 
-module.exports = { run, mergeOptions, optionsOf };
+module.exports = { run, mergeOptions, optionsOf, standardConflict, REUSE_LEAD_TYPE };

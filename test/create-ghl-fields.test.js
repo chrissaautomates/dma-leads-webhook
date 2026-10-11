@@ -152,37 +152,74 @@ describe('create-ghl-fields: never creates a duplicate field', () => {
     assert.deepEqual(sent.slice(-6), NEW_OPTIONS);
   });
 
-  test('a similar existing field ("DMA Lead Type") blocks creating "Lead Type" unless --allow-similar', async () => {
-    const fields = [...baseFields(), { id: 'dlt', name: 'DMA Lead Type', dataType: 'SINGLE_OPTIONS', picklistOptions: ['New Business', 'Other'] }];
-    const g = fakeGhl({ fields });
+  const LT_ID = 'sbTqxmTIflSJeviCeNnT';
+  const withLeadType = () => [...baseFields(), { id: LT_ID, name: 'DMA Lead Type', dataType: 'SINGLE_OPTIONS', picklistOptions: ['New Business', 'Returning Client', 'Agency/Planner', 'Vendor/Referral Partner', 'Other'] }];
+  const ATTR_NAMES = ['DMA gclid', 'DMA utm_source', 'DMA utm_medium', 'DMA utm_campaign', 'DMA utm_term', 'DMA utm_content', 'lead_channel', 'lead_origin'];
+
+  test('Lead Type: the existing "DMA Lead Type" is reused and a new Lead Type is never created', async () => {
+    const g = fakeGhl({ fields: withLeadType() });
     const lines = [];
     const r = await run(g, { apply: true, log: (l) => lines.push(l) });
-    assert.ok(!g.state.created.some((d) => d.name === 'Lead Type'));
-    assert.equal(r.similar[0].id, 'dlt');
-    assert.ok(lines.some((l) => /NOT CREATING "Lead Type".*DMA Lead Type.*New Business/.test(l)));
-    await run(g, { apply: true, allowSimilar: true });
-    assert.ok(g.state.created.some((d) => d.name === 'Lead Type'));
+    assert.ok(!g.state.created.some((d) => /lead type/i.test(d.name)));
+    assert.deepEqual(r.existing.find((e) => e.name === 'Lead Type'), { name: 'Lead Type', id: LT_ID });
+    assert.ok(lines.some((l) => l.includes(`REUSING "DMA Lead Type" (id=${LT_ID}`) && l.includes('GHL_FIELD_LEAD_TYPE_ID')));
+    assert.ok(lines.some((l) => /differ from the app's lead types/.test(l)));
+    const none = await run(fakeGhl({ fields: baseFields() }), { log: (l) => lines.push(l) });
+    assert.ok(none.created.length === 0 && lines.some((l) => /expected the existing "DMA Lead Type"/.test(l)));
   });
 
-  test('creates Guest Count and Lead Type when absent; a second run creates nothing', async () => {
-    const g = fakeGhl({ fields: baseFields() });
+  test('standard / attribution name conflicts are created as "DMA <name>" (dry run reports them too)', async () => {
+    const dry = [];
+    const g0 = fakeGhl({ fields: withLeadType() });
+    await run(g0, { log: (l) => dry.push(l) });
+    assert.equal(g0.state.created.length, 0);
+    ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach((k) => {
+      assert.ok(dry.some((l) => l.includes(`"${k}" conflicts with a GHL standard field -> using "DMA ${k}"`)), k);
+      assert.ok(dry.some((l) => l.startsWith(`WOULD CREATE "DMA ${k}"`)), k);
+    });
+    assert.ok(dry.some((l) => l.startsWith('WOULD CREATE "lead_channel"')) && dry.some((l) => l.startsWith('WOULD CREATE "lead_origin"')));
+    assert.ok(!dry.some((l) => /WOULD CREATE "(gclid|utm_[a-z]+)"/.test(l)));
+  });
+
+  test('creates Guest Count and the attribution fields; a second run creates nothing', async () => {
+    const g = fakeGhl({ fields: withLeadType() });
     const first = await run(g, { apply: true });
-    const ATTR = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin'];
-    assert.deepEqual(first.created.map((c) => c.name), ['Guest Count', 'Lead Type', ...ATTR]);
-    assert.ok(g.state.created.slice(2).every((d) => d.dataType === 'TEXT'));
-    assert.deepEqual(g.state.created[1].options, FIELD_OPTIONS.LEAD_TYPE);
+    assert.deepEqual(first.created.map((c) => c.name), ['Guest Count', ...ATTR_NAMES]);
+    assert.ok(g.state.created.slice(1).every((d) => d.dataType === 'TEXT'));
     const second = await run(g, { apply: true });
     assert.equal(second.created.length, 0);
-    assert.equal(g.state.created.length, 10);
-    assert.deepEqual(second.existing.map((e) => e.name), ['Guest Count', 'Lead Type', ...ATTR]);
+    assert.equal(g.state.created.length, 9);
+    assert.deepEqual(second.existing.map((e) => e.name), ['Lead Type', 'Guest Count', ...ATTR_NAMES]);
+  });
+
+  test('an unknown standard-field conflict (HTTP 400) is retried once as "DMA <name>"', async () => {
+    const g = fakeGhl({ fields: withLeadType() });
+    const realCreate = g.createCustomField;
+    g.createCustomField = async (def) => {
+      if (def.name === 'lead_channel') { const e = new Error('GHL create-custom-field HTTP 400'); e.status = 400; e.body = '"lead_channel" conflicts with the standard field contact.lead_channel'; throw e; }
+      return realCreate(def);
+    };
+    const r = await run(g, { apply: true });
+    assert.ok(r.created.some((c) => c.name === 'DMA lead_channel'));
+    assert.ok(!g.state.created.some((d) => d.name === 'lead_channel'));
+  });
+
+  test('a similar existing field blocks creation unless --allow-similar', async () => {
+    const fields = [...withLeadType(), { id: 'sim', name: 'DMA lead_origin notes', dataType: 'TEXT' }];
+    const g = fakeGhl({ fields });
+    const r = await run(g, { apply: true });
+    assert.ok(!g.state.created.some((d) => d.name === 'lead_origin'));
+    assert.equal(r.similar[0].id, 'sim');
+    await run(g, { apply: true, allowSimilar: true });
+    assert.ok(g.state.created.some((d) => d.name === 'lead_origin'));
   });
 
   test('an existing field with the same name (any case/spacing) blocks creation and reports its id', async () => {
-    const fields = [...baseFields(), { id: 'gc1', name: '  guest   COUNT ', dataType: 'NUMERICAL' }, { id: 'lt1', name: 'Lead Type', dataType: 'TEXT' }];
+    const fields = [...withLeadType(), { id: 'gc1', name: '  guest   COUNT ', dataType: 'NUMERICAL' }, { id: 'g2', name: ' dma GCLID', dataType: 'TEXT' }];
     const g = fakeGhl({ fields });
     const r = await run(g, { apply: true });
-    assert.ok(!g.state.created.some((d) => d.name === 'Guest Count' || d.name === 'Lead Type'));
-    assert.deepEqual(r.existing, [{ name: 'Guest Count', id: 'gc1' }, { name: 'Lead Type', id: 'lt1' }]);
+    assert.ok(!g.state.created.some((d) => d.name === 'Guest Count' || /gclid/i.test(d.name)));
+    assert.deepEqual(r.existing.slice(0, 3), [{ name: 'Lead Type', id: LT_ID }, { name: 'Guest Count', id: 'gc1' }, { name: 'DMA gclid', id: 'g2' }]);
   });
 
   test('a field created between the first listing and the create is not duplicated', async () => {

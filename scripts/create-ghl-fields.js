@@ -6,8 +6,7 @@
 //   (--allow-similar: create a field even if one with a similar name exists)
 //
 // (Also creates the 8 attribution TEXT fields: gclid, utm_source, utm_medium, utm_campaign, utm_term,
-// utm_content, lead_channel, lead_origin -> GHL_FIELD_GCLID_ID, GHL_FIELD_UTM_SOURCE_ID, ... , plus the
-// "greeting" TEXT field (key contact.greeting) -> GHL_FIELD_GREETING_ID. Names that
+// utm_content, lead_channel, lead_origin -> GHL_FIELD_GCLID_ID, GHL_FIELD_UTM_SOURCE_ID, ... . Names that
 // collide with a GHL standard / attribution field are created as "DMA <name>", e.g. "DMA gclid".)
 // Needs GHL_API_KEY + GHL_LOCATION_ID. This is the one script that works with
 // `railway run` (`railway run node scripts/create-ghl-fields.js`): it only talks to
@@ -40,8 +39,7 @@ const fs = require('fs');
 const path = require('path');
 const { FIELDS, FIELD_OPTIONS } = require('../ghl-canonical');
 
-// ('greeting' is not attribution but is the same shape: a plain TEXT field, id handed back as GHL_FIELD_GREETING_ID.)
-const ATTRIBUTION_FIELD_DEFS = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin', 'greeting'];
+const ATTRIBUTION_FIELD_DEFS = ['gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'lead_channel', 'lead_origin'];
 
 // The existing "DMA Lead Type" field is REUSED; a new "Lead Type" field is never created.
 const REUSE_LEAD_TYPE = { name: 'Lead Type', id: 'sbTqxmTIflSJeviCeNnT', env: 'GHL_FIELD_LEAD_TYPE_ID', existingName: 'DMA Lead Type' };

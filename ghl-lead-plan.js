@@ -70,7 +70,7 @@
 const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = require('./ghl-canonical');
 const { parseConsent, toIsoDate, parseGuestCount, isParseArtifact } = require('./lead-shape');
 const { isCanadianPhone } = require('./phone');
-const { cleanFirstName, buildGreeting } = require('./first-name');
+const { cleanFirstName } = require('./first-name');
 const { formTags } = require('./config');
 const { attributionValues, deriveChannel, GOOGLE_ADS_CHANNEL } = require('./attribution');
 
@@ -273,7 +273,7 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   // to `mapped` -> plan.fillBlank, written only into an empty field (event date and
   // guest count: also when newer, see resolveFillBlank). Lead Score / Status are
   // never written to an existing contact, and Owner only fills an empty one.
-  const DIRECT_ON_EXISTING = new Set([FIELDS.LAST_ACTIVITY, FIELDS.INTEREST, FIELDS.GREETING]);
+  const DIRECT_ON_EXISTING = new Set([FIELDS.LAST_ACTIVITY, FIELDS.INTEREST]);
   function setField(id, value, key) {
     if (!id) return; // field not created in GHL yet (see FIELDS.GUEST_COUNT / LEAD_TYPE)
     if (value === undefined || value === null || value === '') return;
@@ -308,10 +308,6 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
       consentImplied = true;
     }
   }
-
-  // --- Greeting: "Hi {FirstName}," / "Hi,". On an existing contact it is only written when
-  // there is a name to build it from, so an existing greeting is never downgraded to "Hi,". ---
-  if (firstName || isNewContact) setField(FIELDS.GREETING, buildGreeting(firstName));
 
   // --- New-lead-only defaults (see design decision #1). Lead Score is
   // intentionally NOT written: blank until real scoring exists. ---

@@ -44,10 +44,6 @@ const FIELDS = {
   UTM_CONTENT: process.env.GHL_FIELD_UTM_CONTENT_ID || null, // "utm_content"
   LEAD_CHANNEL: process.env.GHL_FIELD_LEAD_CHANNEL_ID || null, // "lead_channel" (see attribution.js deriveChannel)
   LEAD_ORIGIN: process.env.GHL_FIELD_LEAD_ORIGIN_ID || null, // "lead_origin": CheckCherry origin ("Online Booking" / "Lead Form")
-
-  // --- Part 5: email greeting (TEXT, key contact.greeting), created by scripts/create-ghl-fields.js.
-  // Same rule as Part 3: until GHL_FIELD_GREETING_ID is set the plan skips it. ---
-  GREETING: process.env.GHL_FIELD_GREETING_ID || null, // "greeting": "Hi {FirstName}," or "Hi,"
 };
 
 // Legacy/duplicate field IDs that must NEVER be written by this webhook —

@@ -154,7 +154,7 @@ describe('create-ghl-fields: never creates a duplicate field', () => {
 
   const LT_ID = 'sbTqxmTIflSJeviCeNnT';
   const withLeadType = () => [...baseFields(), { id: LT_ID, name: 'DMA Lead Type', dataType: 'SINGLE_OPTIONS', picklistOptions: ['New Business', 'Returning Client', 'Agency/Planner', 'Vendor/Referral Partner', 'Other'] }];
-  const ATTR_NAMES = ['DMA gclid', 'DMA utm_source', 'DMA utm_medium', 'DMA utm_campaign', 'DMA utm_term', 'DMA utm_content', 'lead_channel', 'lead_origin', 'greeting'];
+  const ATTR_NAMES = ['DMA gclid', 'DMA utm_source', 'DMA utm_medium', 'DMA utm_campaign', 'DMA utm_term', 'DMA utm_content', 'lead_channel', 'lead_origin'];
 
   test('Lead Type: the existing "DMA Lead Type" is reused and a new Lead Type is never created', async () => {
     const g = fakeGhl({ fields: withLeadType() });
@@ -188,7 +188,7 @@ describe('create-ghl-fields: never creates a duplicate field', () => {
     assert.ok(g.state.created.slice(1).every((d) => d.dataType === 'TEXT'));
     const second = await run(g, { apply: true });
     assert.equal(second.created.length, 0);
-    assert.equal(g.state.created.length, 10);
+    assert.equal(g.state.created.length, 9);
     assert.deepEqual(second.existing.map((e) => e.name), ['Lead Type', 'Guest Count', ...ATTR_NAMES]);
   });
 

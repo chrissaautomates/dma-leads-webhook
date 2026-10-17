@@ -70,6 +70,7 @@
 const { FIELDS, FIELD_OPTIONS, TAGS, INTEREST_MAP, EVENT_TYPE_ALIASES } = require('./ghl-canonical');
 const { parseConsent, toIsoDate, parseGuestCount, isParseArtifact } = require('./lead-shape');
 const { isCanadianPhone } = require('./phone');
+const { cleanFirstName } = require('./first-name');
 const { formTags } = require('./config');
 const { attributionValues, deriveChannel, GOOGLE_ADS_CHANNEL } = require('./attribution');
 
@@ -108,12 +109,12 @@ function matchEventType(value) {
 
 function splitName(body) {
   if (normalize(body.firstName) || normalize(body.lastName)) {
-    return { firstName: normalize(body.firstName), lastName: normalize(body.lastName) };
+    return { firstName: cleanFirstName(normalize(body.firstName)), lastName: normalize(body.lastName) };
   }
   const full = normalize(body.name);
   if (!full) return { firstName: '', lastName: '' };
   const parts = full.split(/\s+/);
-  return { firstName: parts[0] || '', lastName: parts.slice(1).join(' ') };
+  return { firstName: cleanFirstName(parts[0]), lastName: parts.slice(1).join(' ') };
 }
 
 // leadType -> canonical tag, case-insensitive, only when it matches one of
@@ -248,7 +249,9 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   const { firstName, lastName } = splitName(body);
 
   const contactFields = {};
-  if (firstName) contactFields.firstName = firstName;
+  // New contact: always send firstName, '' when missing, never a placeholder. (An existing
+  // contact's standard fields are dropped below, so a real name is never overwritten.)
+  if (firstName || isNewContact) contactFields.firstName = firstName;
   if (lastName) contactFields.lastName = lastName;
   if (normalize(body.email)) contactFields.email = normalize(body.email);
   if (normalize(body.phone)) contactFields.phone = normalize(body.phone);

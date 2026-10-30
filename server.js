@@ -28,6 +28,7 @@ const { toIsoDate } = require('./lead-shape');
 const adminRouter = require('./admin');
 const { runFullSync } = require('./sync');
 const { pushAfterUpsert, describeMode } = require('./ghl-push');
+const { handleIntake: handleBarrIntake } = require('./barr-intake');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -68,6 +69,10 @@ app.post('/webhook/lead', (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+// BuyAndRentRobots lead (supplier signup / renter or buyer inquiry) -> GHL. Its own secret
+// (x-barr-secret, BARR_INTAKE_SECRET), not WEBHOOK_SECRET. See barr-intake.js.
+app.post('/webhook/barr-lead', handleBarrIntake);
 
 function normalizeFieldKey(k) {
   return String(k || '').toLowerCase().replace(/[^a-z0-9]/g, '');

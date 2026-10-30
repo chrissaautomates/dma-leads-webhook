@@ -96,6 +96,25 @@ async function findDuplicateContact({ email, phone }) {
   return (body && body.contact) || null;
 }
 
+// Company-name match, for contacts that have no email. GHL has no exact-match filter on
+// companyName, so this runs the contacts search on the name and keeps only contacts whose
+// companyName equals it exactly (case-insensitive, whitespace collapsed). Oldest match wins.
+// UNVERIFIED against a live call (GET /contacts/?query=): check the first dry run.
+const companyKey = (v) => String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g, ' ');
+
+async function findContactByCompany(company) {
+  const key = companyKey(company);
+  if (!key) return null;
+  const { apiKey, locationId } = getConfig();
+  const params = new URLSearchParams({ locationId, query: String(company).trim(), limit: '100' });
+  const res = await fetchWithTimeout(`${GHL_API_BASE}/contacts/?${params.toString()}`, { headers: authHeaders(apiKey) });
+  if (!res.ok) throw new GhlApiError(`GHL company-search HTTP ${res.status}`, res.status, res.text().slice(0, 500));
+  const body = await res.json();
+  const matches = ((body && body.contacts) || []).filter((c) => companyKey(c.companyName) === key);
+  matches.sort((a, b) => String(a.dateAdded || '').localeCompare(String(b.dateAdded || '')));
+  return matches[0] || null;
+}
+
 // GET /contacts/{id} — the full contact, including tags and customFields.
 // Used to decide whether an existing contact is already "advanced" (see
 // ghl-push.js) before any new-lead tag is applied. Not assumed to be part of
@@ -236,6 +255,8 @@ module.exports = {
   updateCustomField,
   GhlApiError,
   findDuplicateContact,
+  findContactByCompany,
+  companyKey,
   getContact,
   createContact,
   updateContact,

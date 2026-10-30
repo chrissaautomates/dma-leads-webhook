@@ -292,3 +292,25 @@ and prints
 
 Backfill (last 60 days, matches by email then phone, never creates contacts):
 `railway run npm run backfill:attribution` (dry run) / `railway run node scripts/backfill-attribution.js --apply`.
+
+## BuyAndRentRobots intake (`POST /webhook/barr-lead`)
+
+Takes a BuyAndRentRobots lead (`type`: `supplier`, `renter` or `buyer`) and upserts it into GHL
+with the same field mapping as every other source. It does **not** go through the DMA push guard
+(which excludes BuyAndRentRobots on purpose) and never writes the leads database.
+
+- **Auth:** `x-barr-secret` header = `BARR_INTAKE_SECRET`. Unset secret = every request refused (503).
+- **Mode:** dry-run by default (read-only GHL lookups, nothing written). `BARR_INTAKE_LIVE=true` writes.
+  `GHL_PUSH_DISABLED=true` (the existing kill switch) turns it off.
+- **Match:** lowercase email; with no email, exact company name (case/whitespace-insensitive). Never phone.
+  A request needs an email or a company.
+- **Tags:** exactly one of `barr-supplier`, `barr-renter`, `barr-buyer`, plus `barr-event-passed` when `eventDate` is before today. Never `new-lead`, `repeat-inquiry`
+  or any source/interest/lead-type tag; nothing is removed.
+- **Lead Source:** native contact source `BuyAndRentRobots` always; the DMA Lead Source field gets
+  `BuyAndRentRobots` on new contacts only once that option exists in the GHL picklist (add it by hand).
+- **Body:** `type`, `email`, `name`, `phone`, `company`, `city`, `message`, `interest`, `eventType`, `eventDate`,
+  `guestCount`, `budgetRange`, `campaign`, `pageUrl`, `website`. Responses: 200 `{ok, mode, action, contactId, matchedBy, tags}`,
+  400 invalid, 401 bad secret, 502 GHL failed (retry).
+
+Backfill: `node scripts/backfill-barr-leads.js [--file barr_leads_review.csv] [--limit N]` is a dry run;
+add `--commit` to write. Oldest row first, undated rows last; column names are matched by alias.

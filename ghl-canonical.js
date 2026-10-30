@@ -142,6 +142,10 @@ const TAGS = {
   SOURCE_CHECKCHERRY: 'source-checkcherry',
   // Added when lead_channel is "Google Ads" (a gclid / gbraid / wbraid proves the click).
   GOOGLE_ADS: 'google-ads',
+  // BuyAndRentRobots intake (barr-intake.js): the ONLY tag such a lead gets, by type.
+  BARR: { supplier: 'barr-supplier', renter: 'barr-renter', buyer: 'barr-buyer' },
+  // Added on top of the barr-<type> tag when the lead's event date is before today.
+  BARR_EVENT_PASSED: 'barr-event-passed',
   LEAD_NEW: 'new-lead',
   // Applied to EVERY existing contact that inquires again (removed first when already
   // present, so a GHL "Tag Added" trigger fires on every repeat inquiry).

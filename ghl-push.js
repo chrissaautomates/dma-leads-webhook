@@ -339,11 +339,13 @@ async function withoutAttributionOnRejection(send, customFields) {
 
 // dryRun: performs only READ calls (duplicate lookup, get contact) so the
 // result reflects what a live run would really do; sends nothing.
-async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true }) {
+// `lookup(lead)` replaces the default email-then-phone match (BuyAndRentRobots matches on
+// email, else company name); it returns a GHL contact (at least { id }) or null.
+async function pushLeadToGhl(lead, { profile, context = {}, dryRun = true, lookup = null }) {
   const email = String(lead.email || '').trim();
   const phone = String(lead.phone || '').trim();
 
-  const found = await ghl.findDuplicateContact({ email, phone });
+  const found = lookup ? await lookup(lead) : await ghl.findDuplicateContact({ email, phone });
   // Full contact (tags + customFields) — duplicate-search's shape is unverified.
   const existing = found ? ((await ghl.getContact(found.id)) || found) : null;
   const isNewContact = !existing;
@@ -604,6 +606,7 @@ module.exports = {
   classifyContact,
   toPlanBody,
   pushLeadToGhl,
+  describeOutcome,
   pushAfterUpsert,
   tagProposalSentContacts,
   previewLead,

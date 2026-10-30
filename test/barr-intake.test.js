@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 
 const barr = require('../barr-intake');
 const backfill = require('../scripts/backfill-barr-leads');
+const { db } = require('../db');
 const { FIELDS } = require('../ghl-canonical');
 
 let calls = [];
@@ -252,5 +253,61 @@ describe('backfill', () => {
     const put = calls.find((c) => c.method === 'PUT');
     assert.match(put.url, /\/contacts\/new-/);
     assert.deepEqual(tagCalls().flatMap((t) => t.body.tags).sort(), ['barr-buyer', 'barr-renter', 'barr-supplier', 'barr-supplier']);
+  });
+});
+
+describe('dashboard rows', () => {
+  const rows = () => db.prepare(`SELECT * FROM leads WHERE target = 'BARR' ORDER BY id`).all();
+  beforeEach(() => { process.env.BARR_INTAKE_SECRET = 's3cret'; db.exec(`DELETE FROM leads`); });
+
+  test('live: adds a BARR dashboard row that the DMA push can never pick up', async () => {
+    process.env.BARR_INTAKE_LIVE = 'true';
+    const res = await post(supplier({ type: 'renter', message: 'Need a robot', dateReceived: '2026-09-07' }));
+    assert.equal(res.body.dashboard, 'inserted');
+    const [row] = rows();
+    assert.equal(row.email, 'pat@acme-robots.com');
+    assert.equal(row.ghl_pushed, 'excluded_source');
+    assert.equal(row.date_received, '2026-09-07');
+    assert.equal(row.notes, 'Need a robot');
+    assert.match(row.interest, /^Rental Inquiry/);
+  });
+
+  test('dry run writes no dashboard row', async () => {
+    const res = await post(supplier());
+    assert.equal(res.body.dashboard, 'dry-run');
+    assert.equal(rows().length, 0);
+  });
+
+  test('same email twice: one row, and staff-edited notes are kept', async () => {
+    process.env.BARR_INTAKE_LIVE = 'true';
+    await post(supplier({ message: 'first' }));
+    db.exec(`UPDATE leads SET notes = 'staff note', status = 'Contacted'`);
+    const res = await post(supplier({ message: 'second' }));
+    assert.equal(res.body.dashboard, 'updated');
+    assert.equal(rows().length, 1);
+    assert.equal(rows()[0].notes, 'staff note');
+    assert.equal(rows()[0].status, 'Contacted');
+  });
+
+  test('no email: company-only lead is added once, not on every call', async () => {
+    process.env.BARR_INTAKE_LIVE = 'true';
+    await post(supplier({ email: '' }));
+    const res = await post(supplier({ email: '', company: '  ACME robots ' }));
+    assert.equal(res.body.dashboard, 'exists');
+    assert.equal(rows().length, 1);
+  });
+
+  test('dashboardOnly: dashboard row, no GHL calls at all', async () => {
+    process.env.BARR_INTAKE_LIVE = 'true';
+    const res = await post(supplier({ dashboardOnly: true }));
+    assert.equal(res.body.dashboard, 'inserted');
+    assert.deepEqual(calls, []);
+  });
+
+  test('backfill rows carry their own date to the dashboard', async () => {
+    const sent = [];
+    await backfill.runBackfill(backfill.readRows('Date,Type,Email\n2026-01-02,buyer,a@x.com\n').rows,
+      { commit: true, dashboardOnly: true, dashboard: async (t, l) => { sent.push([t, l.dateReceived]); return 'inserted'; }, log: () => {} });
+    assert.deepEqual(sent, [['buyer', '2026-01-02']]);
   });
 });

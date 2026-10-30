@@ -314,3 +314,10 @@ with the same field mapping as every other source. It does **not** go through th
 
 Backfill: `node scripts/backfill-barr-leads.js [--file barr_leads_review.csv] [--limit N]` is a dry run;
 add `--commit` to write. Oldest row first, undated rows last; column names are matched by alias.
+
+**Dashboard.** A live request (`BARR_INTAKE_LIVE=true`) also adds the lead to the `/admin` BuyAndRentRobots tab
+(source `BuyAndRentRobots Website`, `ghl_pushed = excluded_source`, so the DMA push never touches it). Matched on
+email, else company; an existing row keeps its status and notes. `dateReceived` (YYYY-MM-DD) sets the received date.
+`dashboardOnly: true` writes only the dashboard row and nothing to GHL. Backfill:
+`railway run -- node scripts/backfill-barr-leads.js --file x.csv --dashboard-only --dashboard-url https://<host> [--commit]`
+(add `--dashboard-url` without `--dashboard-only` to do GHL and the dashboard together).

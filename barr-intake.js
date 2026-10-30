@@ -12,7 +12,10 @@
 //   - matching on lowercase email; when the lead has no email, on company name.
 //
 // This path does NOT go through the DMA push guard (ghl-push.js assess), whose BuyAndRentRobots
-// exclusion exists to keep these leads out of the DMA funnel. It never writes the leads database.
+// exclusion exists to keep these leads out of the DMA funnel. Live requests also add the lead to
+// the /admin dashboard (BuyAndRentRobots tab) with ghl_pushed = excluded_source, so the 15-minute
+// DMA push can never pick the row up. Email is the dashboard's match key; with no email, company.
+// A body with dashboardOnly:true writes the dashboard row and nothing to GHL (used by the backfill).
 //
 // Env vars:
 //   BARR_INTAKE_SECRET  shared secret, sent as the x-barr-secret header. REQUIRED: unset -> every
@@ -27,6 +30,7 @@ const { pushLeadToGhl, describeOutcome, getPushConfig } = require('./ghl-push');
 const { FIELDS, TAGS } = require('./ghl-canonical');
 const { testLeadReason } = require('./config');
 const { toIsoDate } = require('./lead-shape');
+const { upsertLead, findLead, db } = require('./db');
 
 const TYPES = ['supplier', 'renter', 'buyer'];
 const LEAD_SOURCE = 'BuyAndRentRobots';
@@ -99,6 +103,8 @@ function normalizeLead(body) {
     campaign: pick(b, 'campaign', 'utmCampaign'),
     utmCampaign: pick(b, 'utmCampaign'),
     notes: message,
+    // Real received date (backfill); blank = today.
+    dateReceived: /^\d{4}-\d{2}-\d{2}$/.test(str(b.dateReceived)) ? str(b.dateReceived) : '',
     // Kept in the note, never mapped: the BARR type is not a DMA Lead Type.
     extra: [`BuyAndRentRobots ${type}`, pick(b, 'pageUrl') && `Page: ${pick(b, 'pageUrl')}`, pick(b, 'website') && `Website: ${pick(b, 'website')}`]
       .filter(Boolean).join(' | '),
@@ -202,6 +208,34 @@ async function upsertBarrLead(type, lead, { dryRun = true, seen = null } = {}) {
   };
 }
 
+// --- Dashboard row -----------------------------------------------------------
+
+const DASHBOARD_SOURCE = 'BuyAndRentRobots Website'; // the label the existing site mirror uses; db.js files it under BARR
+
+// -> { action: 'inserted' | 'updated' | 'exists', id, target }
+// A lead already on the dashboard keeps its status and its staff-edited notes (the incoming
+// notes are dropped); a company-only lead already on file is left alone.
+function writeDashboardRow(type, lead) {
+  const row = {
+    source: DASHBOARD_SOURCE,
+    name: lead.name, email: lead.email, phone: lead.phone, company: lead.company,
+    location: lead.city, city: lead.city,
+    interest: [TYPE_LABEL[type], lead.interest].filter(Boolean).join(': '),
+    eventDate: lead.eventDate, eventType: lead.eventType, guestCount: lead.guestCount,
+    budgetRange: lead.budgetRange, campaign: lead.campaign, utmCampaign: lead.utmCampaign,
+    notes: lead.notes,
+    dateReceived: lead.dateReceived || undefined,
+    ghlPushed: 'excluded_source', // never pushed by the DMA sync: this path already handled GHL
+  };
+  if (str(lead.email)) {
+    if (findLead(lead.email, 'BARR')) delete row.notes;
+  } else {
+    const have = db.prepare(`SELECT id FROM leads WHERE target = 'BARR' AND lower(trim(company)) = ? AND email = ''`).get(ghl.companyKey(lead.company));
+    if (have) return { action: 'exists', id: have.id, target: 'BARR' };
+  }
+  return upsertLead(row);
+}
+
 // --- HTTP -------------------------------------------------------------------
 
 async function handleIntake(req, res) {
@@ -218,12 +252,23 @@ async function handleIntake(req, res) {
   const testReason = testLeadReason(lead);
   if (testReason) return res.json({ ok: true, action: 'ignored', reason: testReason });
 
+  const dryRun = mode !== 'live';
+  const tag = dryRun ? '[DRY-RUN]' : '';
+  const dashboardOnly = req.body && (req.body.dashboardOnly === true || req.body.dashboardOnly === 'true');
   try {
-    const out = await upsertBarrLead(type, lead, { dryRun: mode !== 'live' });
-    // Log line carries the email/name like the DMA push's own log lines; the response does not.
-    console.log(`[barr-intake]${mode === 'live' ? '' : '[DRY-RUN]'} ${out.line}`);
-    out.warnings.forEach((w) => console.warn(`[barr-intake] ${w}`));
-    return res.json({ ok: true, mode, action: out.action, contactId: out.contactId, matchedBy: out.matchedBy, tags: out.tags });
+    let out = null;
+    if (!dashboardOnly) {
+      out = await upsertBarrLead(type, lead, { dryRun });
+      // Log line carries the email/name like the DMA push's own log lines; the response does not.
+      console.log(`[barr-intake]${tag} ${out.line}`);
+      out.warnings.forEach((w) => console.warn(`[barr-intake] ${w}`));
+    }
+    // The GHL write has succeeded (or was not asked for). A dashboard failure is logged, never fatal.
+    let dashboard = dryRun ? 'dry-run' : 'failed';
+    if (!dryRun) {
+      try { dashboard = writeDashboardRow(type, lead).action; } catch (err) { console.error('[barr-intake] dashboard row failed:', err.message); }
+    } else console.log(`[barr-intake]${tag} would add/update the dashboard row (${type})`);
+    return res.json({ ok: true, mode, dashboard, ...(out ? { action: out.action, contactId: out.contactId, matchedBy: out.matchedBy, tags: out.tags } : {}) });
   } catch (err) {
     // 502 so the caller knows to retry; nothing is queued here.
     console.error('[barr-intake] GHL upsert failed:', err.message);
@@ -233,5 +278,5 @@ async function handleIntake(req, res) {
 
 module.exports = {
   TYPES, LEAD_SOURCE, eventPassed, checkSecret, intakeMode, normalizeType, normalizeLead, matchKey, upsertBarrLead,
-  handleIntake, resetLeadSourceCache,
+  writeDashboardRow, handleIntake, resetLeadSourceCache,
 };

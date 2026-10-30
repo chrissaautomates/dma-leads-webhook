@@ -61,6 +61,11 @@
 //    writing "Unknown" there would silently downgrade a contact who had given
 //    explicit consent.
 //
+// 8. EXCLUSIVE-TAG PROFILES (profile.exclusiveTags, BuyAndRentRobots intake). Such a
+//    profile applies exactly the tags it lists and nothing else: no new-lead, no
+//    repeat-inquiry, no source-/form-/interest-/lead-type-/consent tags, and nothing is
+//    removed. Fields are mapped exactly as for any other source.
+//
 // 7. FILL-BLANK (plan.fillBlank). For an existing, non-advanced contact the
 //    plan also lists every mapped value as a candidate to fill IF the contact's
 //    field is currently blank (see resolveFillBlank). Never overwrites, never
@@ -216,7 +221,7 @@ function decideNewLead(lead, { isNewContact, profile, context }) {
 // written, not just how it's written.
 //
 // options.profile — { leadSourceOption, sourceTag, nativeSource,
-//   lastActivityLabel, noteLabel, applyNewLead({lead, context}) }
+//   lastActivityLabel, noteLabel, applyNewLead({lead, context}), exclusiveTags? }
 // options.context — { proposal: {known, has}, advancedReason: string|null, reengageReason: string|null,
 //   hasNewLeadTag: bool, hasReengageTag: bool,
 //   proposalEmails: Set|null } — facts about the existing contact / source
@@ -417,6 +422,8 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
   if (!isNewContact) tags.push(TAGS.REPEAT_INQUIRY);
 
   const note = buildNote(body, unmapped, profile.noteLabel, notedGuestCount);
+  const exclusive = profile.exclusiveTags ? [...profile.exclusiveTags] : null;
+  const exclusiveNewLead = { applied: false, reason: `${profile.noteLabel} intake never applies new-lead (exclusive tags only)` };
   unmapped.forEach((u) => warnings.push(`${u.label} "${u.value}" did not match a canonical option — preserved in note only`));
 
   // ADVANCED (skip) or DEAD-DEAL (reengage) existing contact: minimal update —
@@ -433,14 +440,14 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
       secondaryInterestSet: false,
       // No nurture/new-lead tags for these buckets; only the re-engagement tag (dead
       // deals), plus the event tags: repeat inquiry and source-form tags.
-      tags: [...new Set([
+      tags: exclusive || [...new Set([
         ...(reengage && !context.hasReengageTag ? [TAGS.NEWSLETTER_REENGAGEMENT] : []),
         TAGS.REPEAT_INQUIRY, ...formTags(body.formName),
       ])],
-      removeTags: eventTagsToRemove(body, false, context),
+      removeTags: exclusive ? [] : eventTagsToRemove(body, false, context),
       note,
       warnings,
-      newLead,
+      newLead: exclusive ? exclusiveNewLead : newLead,
       route: reengage ? 'reengage' : 'skip',
     };
   }
@@ -453,13 +460,14 @@ function buildLeadPlan(rawBody, { isNewContact, profile, context = {} }) {
     fillBlank: isNewContact ? [] : mapped,
     interestSet,
     secondaryInterestSet,
-    tags: [...new Set(tags)],
-    removeTags,
+    tags: exclusive || [...new Set(tags)],
+    removeTags: exclusive ? [] : removeTags,
     consentImplied,
     note,
     warnings,
-    newLead,
-    route: !isNewContact ? 'repeat-inquiry' : (newLead.applied ? 'new-lead' : 'no-new-lead'),
+    newLead: exclusive ? exclusiveNewLead : newLead,
+    route: exclusive ? (isNewContact ? 'exclusive-create' : 'exclusive-update')
+      : !isNewContact ? 'repeat-inquiry' : (newLead.applied ? 'new-lead' : 'no-new-lead'),
   };
 }
 

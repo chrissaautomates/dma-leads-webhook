@@ -162,6 +162,17 @@ describe('upsert into GHL', () => {
     assert.equal(fieldValue(put, FIELDS.LEAD_SOURCE), undefined, 'Lead Source of an existing contact is never rewritten');
   });
 
+  test('event date before today adds barr-event-passed; today, future or unreadable does not', async () => {
+    process.env.BARR_INTAKE_LIVE = 'true';
+    const today = new Date().toISOString().slice(0, 10);
+    const tagsFor = async (eventDate) => { calls = []; await post(supplier({ type: 'renter', eventDate })); return tagCalls().flatMap((t) => t.body.tags); };
+    assert.deepEqual(await tagsFor('2020-01-01'), ['barr-renter', 'barr-event-passed']);
+    assert.deepEqual(await tagsFor(today), ['barr-renter']);
+    assert.deepEqual(await tagsFor('2999-01-01'), ['barr-renter']);
+    assert.deepEqual(await tagsFor('sometime soon'), ['barr-renter']);
+    assert.deepEqual(await tagsFor(undefined), ['barr-renter']);
+  });
+
   test('an existing advanced DMA contact gets only the barr tag too', async () => {
     process.env.BARR_INTAKE_LIVE = 'true';
     ghl.duplicate = 'c-2';
@@ -198,7 +209,7 @@ describe('upsert into GHL', () => {
 
 describe('backfill', () => {
   const csv = [
-    'Submitted At,Type,Email,Company,Name,Message',
+    'Submitted At,Type,Email,Company,Name,Summary',
     '2026-03-05,buyer,B@x.com,,Bea,"Wants a robot, ASAP"',
     '2026-01-02,supplier,a@x.com,Alpha,Al,',
     ',renter,undated@x.com,,Una,',

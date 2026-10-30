@@ -6,8 +6,9 @@
 // location through the same field mapping as every other source (ghl-lead-plan.js), with:
 //   - Lead Source "BuyAndRentRobots" (DMA Lead Source field, new contacts only) and the native
 //     contact source "BuyAndRentRobots";
-//   - exactly ONE tag: barr-supplier, barr-renter or barr-buyer. Never new-lead, repeat-inquiry,
-//     a source-/interest-/lead-type tag or any DMA funnel tag (profile.exclusiveTags);
+//   - exactly ONE tag: barr-supplier, barr-renter or barr-buyer, plus barr-event-passed when the
+//     lead's event date is before today (so sales can filter them out). Never new-lead,
+//     repeat-inquiry, a source-/interest-/lead-type tag or any DMA funnel tag (profile.exclusiveTags);
 //   - matching on lowercase email; when the lead has no email, on company name.
 //
 // This path does NOT go through the DMA push guard (ghl-push.js assess), whose BuyAndRentRobots
@@ -141,12 +142,19 @@ async function leadSourceOptionExists(now = Date.now()) {
 }
 const resetLeadSourceCache = () => { leadSourceOptionCache = null; };
 
-function profileFor(type, { leadSourceOption }) {
+// ISO event date (YYYY-MM-DD) strictly before today (UTC). Anything unreadable is not "passed".
+function eventPassed(lead, now = new Date()) {
+  const d = str(lead && lead.eventDate);
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) && d < now.toISOString().slice(0, 10);
+}
+
+function profileFor(type, { leadSourceOption, passed = false }) {
+  const tags = passed ? [TAGS.BARR[type], TAGS.BARR_EVENT_PASSED] : [TAGS.BARR[type]];
   return {
     key: 'barr',
     leadSourceOption, // null while the picklist option is missing: the plan then skips the field
     sourceTag: TAGS.BARR[type],
-    exclusiveTags: [TAGS.BARR[type]],
+    exclusiveTags: tags,
     nativeSource: LEAD_SOURCE,
     lastActivityLabel: `BuyAndRentRobots ${TYPE_LABEL[type]}`,
     noteLabel: `BuyAndRentRobots ${type}`,
@@ -164,7 +172,7 @@ async function upsertBarrLead(type, lead, { dryRun = true, seen = null } = {}) {
   const { kind, key } = matchKey(lead);
   const mapKey = `${kind}:${key}`;
   const leadSourceOption = (await leadSourceOptionExists()) ? LEAD_SOURCE : null;
-  const profile = profileFor(type, { leadSourceOption });
+  const profile = profileFor(type, { leadSourceOption, passed: eventPassed(lead) });
 
   // A key already created earlier in a DRY run has no contact id to look up: it is, by
   // definition, an update of the contact that run would have created.
@@ -224,6 +232,6 @@ async function handleIntake(req, res) {
 }
 
 module.exports = {
-  TYPES, LEAD_SOURCE, checkSecret, intakeMode, normalizeType, normalizeLead, matchKey, upsertBarrLead,
+  TYPES, LEAD_SOURCE, eventPassed, checkSecret, intakeMode, normalizeType, normalizeLead, matchKey, upsertBarrLead,
   handleIntake, resetLeadSourceCache,
 };

@@ -304,7 +304,7 @@ with the same field mapping as every other source. It does **not** go through th
   `GHL_PUSH_DISABLED=true` (the existing kill switch) turns it off.
 - **Match:** lowercase email; with no email, exact company name (case/whitespace-insensitive). Never phone.
   A request needs an email or a company.
-- **Tags:** exactly one of `barr-supplier`, `barr-renter`, `barr-buyer`. Never `new-lead`, `repeat-inquiry`
+- **Tags:** exactly one of `barr-supplier`, `barr-renter`, `barr-buyer`, plus `barr-event-passed` when `eventDate` is before today. Never `new-lead`, `repeat-inquiry`
   or any source/interest/lead-type tag; nothing is removed.
 - **Lead Source:** native contact source `BuyAndRentRobots` always; the DMA Lead Source field gets
   `BuyAndRentRobots` on new contacts only once that option exists in the GHL picklist (add it by hand).

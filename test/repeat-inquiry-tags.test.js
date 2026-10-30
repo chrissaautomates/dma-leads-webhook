@@ -61,7 +61,9 @@ function setEnv(env) {
 beforeEach(() => { reset(); logs = []; setEnv({}); delete process.env.CHECKCHERRY_API_KEY; db.exec('DELETE FROM proposal_emails; DELETE FROM sync_state; DELETE FROM cc_proposal_tags;'); });
 
 let seq = 0;
-const newLead = (over = {}) => { seq += 1; return { source: 'Meta Ads', name: `Jane ${seq}`, email: `rep${seq}@example.com`, interest: 'Glambot', dateReceived: '2026-10-05', ...over }; };
+// Relative to today: a dry run only looks back 14 days (ghl-push.js), so a fixed date goes stale and fails.
+const RECENT = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+const newLead = (over = {}) => { seq += 1; return { source: 'Meta Ads', name: `Jane ${seq}`, email: `rep${seq}@example.com`, interest: 'Glambot', dateReceived: RECENT, ...over }; };
 const run = async (lead) => push.pushAfterUpsert(lead, upsertLead(lead));
 
 // ============================ A. repeat inquiry ==============================

@@ -958,7 +958,7 @@ describe('BuyAndRentRobots keywords in the new shape fields are still caught', (
   const { computeTarget } = require('../db');
   for (const field of ['extra', 'eventType', 'secondaryInterest', 'leadType', 'budgetRange']) {
     test(`keyword in ${field}: routed to BARR and never pushed`, async () => {
-      const lead = newLead({ source: 'Wix Form - Quote', [field]: 'looking at a humanoid robot' });
+      const lead = newLead({ source: 'Meta Ads', [field]: 'looking at a humanoid robot' });
       assert.equal(computeTarget(lead), 'BARR');
       assert.equal(push.isBarrLead(lead, null), true);
       assert.equal(await push.pushAfterUpsert(lead, insert(lead)), 'excluded_barr');
@@ -968,6 +968,19 @@ describe('BuyAndRentRobots keywords in the new shape fields are still caught', (
   test('a keyword only in campaign or location is excluded from the push (safe direction) but does not re-route the row', () => {
     assert.equal(push.isBarrLead({ source: 'Meta Ads', campaign: 'BuyAndRentRobots spring' }, null), true);
     assert.equal(computeTarget({ source: 'Meta Ads', campaign: 'BuyAndRentRobots spring' }), 'DMA');
+  });
+  test('Digital Mirror homepage / Contact Us Wix forms mentioning "humanoid" stay DMA and are not excluded', () => {
+    for (const source of ['Wix Form - Digital Mirror Homepage', 'Wix Form - Contact Us Form', 'Wix Form - Toronto Form']) {
+      const lead = newLead({ source, interest: 'Humanoid robot at our gala', extra: 'humanoid' });
+      assert.equal(computeTarget(lead), 'DMA');
+      assert.equal(push.isBarrLead(lead, null), false);
+    }
+  });
+  test('a Wix source is never BARR, even when the stored row already says target BARR', () => {
+    const lead = newLead({ source: 'Wix Form - Digital Mirror Homepage', interest: 'Humanoid robot' });
+    assert.equal(push.isBarrLead(lead, { target: 'BARR' }), false);
+    // ...but a non-Wix source on a BARR row is still excluded
+    assert.equal(push.isBarrLead(newLead({ source: 'Meta Ads' }), { target: 'BARR' }), true);
   });
   test('ordinary DMA robotics interest is not BARR', () => {
     assert.equal(push.isBarrLead({ source: 'Wix Form - X', interest: 'Robotics, Glambot' }, null), false);
@@ -1037,7 +1050,7 @@ describe('BARR exclusion config (config.js) and the CheckCherry scan scope', () 
   });
 
   test('other sources still scan notes (unchanged)', () => {
-    assert.equal(push.isBarrLead({ source: 'Wix Form - X', notes: 'we want a humanoid' }, null), true);
+    assert.equal(push.isBarrLead({ source: 'Website Chat', notes: 'we want a humanoid' }, null), true);
     assert.equal(push.isBarrLead({ source: 'Meta Ads', notes: 'we want a humanoid' }, null), true);
   });
 

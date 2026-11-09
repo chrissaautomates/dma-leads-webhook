@@ -306,6 +306,12 @@ const updateLeadFields = db.prepare(`
 // — DMA sells robotics/Glambot too.
 const BARR_PATTERN = /humanoid|robot rental|buyandrentrobots/i;
 
+// Every form on DMA's Wix site (sync.js labels them "Wix Form - <name>") is always DMA,
+// even if the visitor's text says "humanoid" etc. None of the site's forms is a
+// BuyAndRentRobots form; only the BARR site's own intake (POST /webhook/barr-lead) and
+// genuine BuyAndRentRobots sources produce BARR.
+const DMA_WIX_SOURCE = /^Wix Form - /i;
+
 // Exposed so callers can compute the target a lead would land in before
 // they actually upsert it (e.g. to look up its current row first).
 //
@@ -331,6 +337,7 @@ function computeTarget(data) {
     const dateReceived = data.dateReceived || new Date().toISOString().slice(0, 10);
     if (dateReceived >= '2026-01-01') return 'CHATLEAD';
   }
+  if (DMA_WIX_SOURCE.test(source)) return 'DMA';
   // Same text the old folded `interest` carried (every submitted answer), so a
   // row's target doesn't change now that answers live in separate fields.
   const text = [data.interest, data.secondaryInterest, data.eventType, data.budgetRange, data.guestCount, data.leadType, data.extra]
@@ -594,6 +601,7 @@ module.exports = {
   hasAdsConversionForClick,
   recordAdsConversion,
   BARR_PATTERN,
+  DMA_WIX_SOURCE,
   getGhlState,
   setProposalEmails,
   getProposalState,

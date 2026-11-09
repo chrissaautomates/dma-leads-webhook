@@ -29,7 +29,7 @@ const { buildLeadPlan, resolveFillBlank, mergeInterestWithExisting, customFieldV
 const { formNameFromSource, isParseArtifact } = require('./lead-shape');
 const { testLeadReason, barrExclusionReason } = require('./config');
 const { FIELDS, TAGS, ADVANCED_TAGS, DEAD_DEAL_TAGS, REENGAGE_STATUSES, CC_PROPOSAL_SENT_STATUSES } = require('./ghl-canonical');
-const { BARR_PATTERN, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission, getSubmissionsBaselineDate } = require('./db');
+const { BARR_PATTERN, DMA_WIX_SOURCE, getGhlState, markGhlPushed, getProposalState, hasProposalEmail, getProposalTagOutcome, recordProposalTag, hasSubmission, recordSubmission, getSubmissionsBaselineDate } = require('./db');
 
 // --- Config / modes ---------------------------------------------------------
 
@@ -137,6 +137,8 @@ function normEmail(v) {
 // straight to their own tabs before the keyword check, so `target` alone can't
 // be trusted to reveal a BARR lead. Over-excluding is the safe direction here.
 function isBarrLead(lead, row) {
+  // DMA's own Wix forms are always DMA, whatever keywords the text contains.
+  if (DMA_WIX_SOURCE.test(lead.source || '')) return false;
   if (row && row.target === 'BARR') return true;
   if (barrExclusionReason(lead)) return true; // config.js BARR_EXCLUSION (source / campaign), exclusion only
 
